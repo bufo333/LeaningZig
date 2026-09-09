@@ -1,0 +1,663 @@
+<section id="ch25">
+<h2>25. comptime</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn the idea that makes Zig different from every language you have used so far: the compiler can run your code. You will see what "known at compile time" means, the <code>comptime</code> keyword on values, blocks and parameters, the special types <code>comptime_int</code> and <code>comptime_float</code>, types as ordinary values, <code>inline for</code> and <code>inline while</code>, compile-time string concatenation, tables computed while compiling, <code>@compileError</code>, <code>@compileLog</code>, the evaluation quota, and why Zig has no macros and no preprocessor.</p>
+
+<h3 id="ch25-1">25.1 Two worlds</h3>
+<p>Every value in a Zig program lives in one of two worlds. Either the compiler knows it while it is compiling, or it will only exist when the program runs. The literal <code>12</code> is in the first world; a number typed by the user is in the second. Most languages keep these worlds far apart: constants on one side, everything else on the other, and a separate macro or template language for anything in between. Zig instead lets ordinary functions run in either world, and gives you one keyword, <code>comptime</code>, to insist on the first.</p>
+<p class="file">a_two_worlds.zig</p>
+<pre><code>const std = @import("std");
+
+fn square(x: u32) u32 {
+    return x * x;
+}
+
+pub fn main() void {
+    const a = square(12); // the compiler knows 12, so it can run square now
+    const b = comptime square(12); // ...and this insists that it does
+
+    var input: u32 = 12;
+    input += 1; // now the compiler cannot know the value
+    const c = square(input); // so this runs when the program runs
+
+    std.debug.print("{d} {d} {d}\n", .{ a, b, c });
+    std.debug.print("{s} {s} {s}\n", .{ @typeName(@TypeOf(a)), @typeName(@TypeOf(b)), @typeName(@TypeOf(c)) });
+}</code></pre>
+<pre class="term">144 144 169
+u32 u32 u32</pre>
+<p><code>square</code> is a normal function; nothing about it says "compile time". The first call has a constant argument, so the compiler <em>may</em> evaluate it early (and in practice does). The second call is marked <code>comptime</code>, so the compiler <em>must</em> evaluate it, and it would be an error if it could not. The third call has an argument that depends on a mutated variable, so it necessarily happens at run time. All three produce a <code>u32</code>; the world a value comes from does not change its type, only when it was computed.</p>
+<p>The rule that decides the world is simple. A value is comptime-known if it is a literal, a <code>const</code> initialised from comptime-known values, the result of calling a function with comptime-known arguments, or anything marked <code>comptime</code>. A <code>var</code> is never comptime-known once it has been mutated at run time, and anything read from outside the program (arguments, files, the clock) is runtime by nature.</p>
+
+<h3 id="ch25-2">25.2 comptime_int and comptime_float</h3>
+<p>What type does the literal <code>12</code> have before you assign it anywhere? Not <code>i32</code>, not <code>u8</code>; in Zig it is <code>comptime_int</code>, an integer of unlimited size that exists only in the compiler.</p>
+<p class="file">b_literal_types.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const n = 1 &lt;&lt; 40; // no annotation: comptime_int, any size
+    const big = 1 &lt;&lt; 100; // far bigger than u64; fine, it is not a machine integer
+    const f = 2.5; // comptime_float
+
+    std.debug.print("{s} {s} {s}\n", .{ @typeName(@TypeOf(n)), @typeName(@TypeOf(big)), @typeName(@TypeOf(f)) });
+    std.debug.print("{d}\n", .{big});
+
+    const fits: u8 = 200; // comptime_int coerces when it fits
+    std.debug.print("{d}\n", .{fits});
+}</code></pre>
+<pre class="term">comptime_int comptime_int comptime_float
+1267650600228229401496703205376
+200</pre>
+<p><code>1 &lt;&lt; 100</code> is a perfectly good <code>comptime_int</code>: it never has to fit in a register because it never reaches the CPU. When a comptime value is stored into a typed location, it coerces to that type if it fits, which is why <code>const fits: u8 = 200</code> works with no cast. If it does not fit, the compiler says so:</p>
+<p class="file">b_overflow.zig</p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    const x: u8 = 200 + 100; // both sides known: checked at compile time
+    std.debug.print("{d}\n", .{x});
+}</code></pre>
+<pre class="term">b_overflow.zig:3:23: error: type 'u8' cannot represent integer value '300'
+    const x: u8 = 200 + 100; // both sides known: checked at compile time
+                  ~~~~^~~~~</pre>
+<p>This is the same overflow check you met in <a href="#ch04">Chapter 4</a>, but caught before the program exists. The rule to remember: arithmetic on comptime-known values is checked by the compiler; arithmetic on runtime values is checked by the safety mode. Both refuse to let <code>300</code> into a <code>u8</code>; they just complain at different moments.</p>
+
+<h3 id="ch25-3">25.3 comptime blocks, comptime var and the quota</h3>
+<p class="file">c_comptime_var.zig</p>
+<pre><code>const std = @import("std");
+
+fn fib(n: u32) u64 {
+    return if (n &lt; 2) n else fib(n - 1) + fib(n - 2);
+}
+
+pub fn main() void {
+    // A comptime block: everything in it runs in the compiler.
+    const fib15 = comptime blk: {
+        @setEvalBranchQuota(100_000); // recursion needs more than the default 1000 branches
+        break :blk fib(15);
+    };
+
+    // comptime var: a variable that exists only during compilation.
+    comptime var total = 0;
+    inline for (.{ 1, 2, 3, 4 }) |v| total += v;
+
+    std.debug.print("fib(15) = {d}, total = {d}\n", .{ fib15, total });
+    std.debug.print("{s}\n", .{@typeName(@TypeOf(total))});
+}</code></pre>
+<pre class="term">fib(15) = 610, total = 10
+comptime_int</pre>
+<p>A <code>comptime</code> block (or a labelled block with <code>break :blk</code>, as here) runs entirely in the compiler; the result is baked into the binary as a constant, so <code>fib(15)</code> costs nothing at run time. A <code>comptime var</code> is a variable that only the compiler can see and change; the loop that adds to <code>total</code> is unrolled and the final value, <code>10</code>, is what the program contains. Its type stays <code>comptime_int</code>.</p>
+<p>The compiler is not an infinitely patient interpreter. To stop a mistaken infinite loop from hanging your build, each compile-time evaluation gets a budget of one thousand "backward branches" (loop iterations and recursive calls). Exceed it and you get this:</p>
+<p class="file">c_quota.zig</p>
+<pre><code>fn slow() u32 {
+    var s: u32 = 0;
+    for (0..5000) |i| s +%= @intCast(i);
+    return s;
+}
+pub fn main() void {
+    const v = comptime slow();
+    @import("std").debug.print("{d}\n", .{v});
+}</code></pre>
+<pre class="term">c_quota.zig:3:5: error: evaluation exceeded 1000 backwards branches
+    for (0..5000) |i| s +%= @intCast(i);
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+c_quota.zig:3:5: note: use @setEvalBranchQuota() to raise the branch limit from 1000
+c_quota.zig:7:28: note: called at comptime here
+    const v = comptime slow();
+                       ~~~~^~</pre>
+<p>The fix is what the note says: call <code>@setEvalBranchQuota(n)</code> inside the scope being evaluated, with a number comfortably above what you need. In <code>c_comptime_var.zig</code> the call sits inside the block, before the recursive <code>fib</code> starts. It is not a global setting; it applies to the evaluation it appears in.</p>
+
+<h3 id="ch25-4">25.4 Types are values</h3>
+<p>At compile time, a type is just another value. It has a type of its own, <code>type</code>, and you can store it in a constant, pick it with an <code>if</code>, put it in an array, or pass it to a function. This single fact is the whole foundation of generics in Zig, which <a href="#ch26">Chapter 26</a> builds on.</p>
+<p class="file">d_types_are_values.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const T = u16; // a type stored in a constant
+    const x: T = 65535;
+
+    const Wide = if (@sizeOf(usize) == 8) u64 else u32; // chosen by an if, at compile time
+    const y: Wide = 1;
+
+    const types = [_]type{ u8, i32, f64, bool }; // an array of types
+    inline for (types) |Ty| std.debug.print("{s}: {d} bytes\n", .{ @typeName(Ty), @sizeOf(Ty) });
+
+    std.debug.print("{d} {d} {s}\n", .{ x, y, @typeName(Wide) });
+}</code></pre>
+<pre class="term">u8: 1 bytes
+i32: 4 bytes
+f64: 8 bytes
+bool: 1 bytes
+65535 1 u64</pre>
+<p>The one restriction is that a <code>type</code> value only exists at compile time. You cannot make a runtime <code>if</code> choose between two types, and you cannot use a runtime integer as an array length, because the compiler has to lay out memory before the program runs:</p>
+<p class="file">d_runtime_type.zig</p>
+<pre><code>pub fn main() void {
+    var n: u32 = 3;
+    n += 1;
+    const a = [n]u8{ 0, 0, 0, 0 }; // an array length must be known at compile time
+    _ = a;
+}</code></pre>
+<pre class="term">d_runtime_type.zig:4:16: error: unable to resolve comptime value
+    const a = [n]u8{ 0, 0, 0, 0 }; // an array length must be known at compile time
+               ^
+d_runtime_type.zig:4:16: note: types must be comptime-known</pre>
+<p>The message "types must be comptime-known" is one you will see often while learning. It always means the same thing: something that shapes memory or code (an array length, a type, a field name) depended on a runtime value. The fix is either to make the value comptime (a constant, a <code>comptime</code> parameter) or to use a runtime structure (a slice, an <code>ArrayList</code>) instead.</p>
+
+<h3 id="ch25-5">25.5 inline for and inline while</h3>
+<p>A normal <code>for</code> loop is one piece of code that runs many times. An <code>inline for</code> is many pieces of code, one per iteration, generated by the compiler; the loop variable is a compile-time constant inside each copy. That is what lets each copy have a different <em>type</em>.</p>
+<p class="file">e_inline.zig</p>
+<pre><code>const std = @import("std");
+
+const Difficulty = enum { easy, hard };
+const Config = struct { seed: u64, days: u32, difficulty: Difficulty, ironman: bool };
+
+pub fn main() void {
+    const cfg: Config = .{ .seed = 42, .days = 30, .difficulty = .hard, .ironman = true };
+
+    // Walk the fields of a struct. The loop body is copied once per field,
+    // and in each copy `f.name` and `f.type` are constants.
+    inline for (@typeInfo(Config).@"struct".fields) |f| {
+        std.debug.print("{s: &lt;5} : {s: &lt;12} = {any}\n", .{ f.name, @typeName(f.type), @field(cfg, f.name) });
+    }
+
+    // A tuple of mixed types: only an inline loop can handle each element by its own type.
+    const mixed = .{ 1, 2.5, "three", false };
+    inline for (mixed, 0..) |v, i| std.debug.print("{d}: {s}\n", .{ i, @typeName(@TypeOf(v)) });
+
+    // inline while, with a comptime counter.
+    comptime var i = 0;
+    inline while (i &lt; 3) : (i += 1) std.debug.print("unrolled {d}\n", .{i});
+}</code></pre>
+<pre class="term">seed  : u64          = 42
+days  : u32          = 30
+difficulty : e_inline.Difficulty = .hard
+ironman : bool         = true
+0: comptime_int
+1: comptime_float
+2: *const [5:0]u8
+3: bool
+unrolled 0
+unrolled 1
+unrolled 2</pre>
+<p>The first loop is the most useful pattern in this chapter. <code>@typeInfo(Config).@"struct".fields</code> is a compile-time array describing the fields; <code>f.name</code> is a string, <code>f.type</code> is a type, and <code>@field(cfg, f.name)</code> reads the field by name. Because the loop is inline, <code>@field</code> gets a constant name each time and the whole thing compiles to four plain field reads. A runtime <code>for</code> could not do this: there is no such thing as a runtime field name. <a href="#ch27">Chapter 27</a> is entirely about this kind of reflection.</p>
+<p>The second loop walks a tuple whose elements have four different types. Only <code>inline for</code> can do that, because each iteration is compiled separately with its own <code>@TypeOf(v)</code>. The third shows <code>inline while</code> with a <code>comptime var</code> counter, which is how you unroll a fixed count of iterations.</p>
+<div class="note">Use <code>inline</code> loops when you need to, not for speed. Each iteration is a separate copy of the code, so an <code>inline for</code> over a thousand elements produces a thousand copies of the body. The compiler is also perfectly capable of unrolling ordinary loops when that is faster. Reach for <code>inline</code> when the loop variable has to be comptime: field names, types, tuple elements.</div>
+
+<h3 id="ch25-6">25.6 Building strings in the compiler</h3>
+<p><code>++</code> concatenates arrays and slices, and <code>**</code> repeats them. Both need the operands' lengths to be known at compile time, because the result is a fixed-size array.</p>
+<p class="file">f_concat.zig</p>
+<pre><code>const std = @import("std");
+
+const prefix = "IRON";
+const name = prefix ++ " " ++ "LEDGER"; // concatenation happens in the compiler
+const banner = "=" ** name.len; // repetition too
+
+fn withUnit(comptime label: []const u8) []const u8 {
+    return label ++ " (tons)"; // label must be comptime for ++ to work
+}
+
+pub fn main() void {
+    std.debug.print("{s}\n{s}\n", .{ name, banner });
+    std.debug.print("{s}\n", .{withUnit("weight")});
+    std.debug.print("{s}\n", .{@typeName(@TypeOf(name))});
+}</code></pre>
+<pre class="term">IRON LEDGER
+===========
+weight (tons)
+*const [11:0]u8</pre>
+<p>The result type, <code>*const [11:0]u8</code>, tells the story: a pointer to an eleven-byte, zero-terminated array that the compiler wrote into the binary. Nothing happens at run time. The <code>withUnit</code> function only works because its parameter is <code>comptime</code>; drop that keyword and <code>label ++ " (tons)"</code> fails because the compiler no longer knows how long <code>label</code> is. This is the exact device the tuning checker in IRON LEDGER uses to build dotted field paths.</p>
+<p>The precise rule is about lengths, not contents. An array with runtime contents can still be concatenated, because its length is part of its type:</p>
+<p class="file">f_concat_array.zig</p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    var user: [8]u8 = "runtime!".*; // an array: its LENGTH is part of the type
+    user[0] = 'R'; // its contents are decided at runtime
+    const s = "value: " ++ user; // allowed: 7 + 8 bytes, the compiler knows the size
+    std.debug.print("{s} ({s})\n", .{ s, @typeName(@TypeOf(s)) });
+}</code></pre>
+<pre class="term">value: Runtime! (*const [15:0]u8)</pre>
+<p>A slice with a runtime length cannot:</p>
+<p class="file">f_concat_bad.zig</p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    var len: usize = 3;
+    len += 1;
+    const user: []const u8 = "runtime"[0..len]; // a slice whose length is a runtime value
+    const s = "value: " ++ user;
+    std.debug.print("{s}\n", .{s});
+}</code></pre>
+<pre class="term">f_concat_bad.zig:6:28: error: unable to resolve comptime value
+    const s = "value: " ++ user;
+                           ^~~~
+f_concat_bad.zig:6:28: note: slice being concatenated must be comptime-known</pre>
+<p>For runtime strings you use the tools of <a href="#ch21">Chapter 21</a> and <a href="#ch23">Chapter 23</a>: an <code>ArrayList(u8)</code>, <code>allocPrint</code> or <code>bufPrint</code>. For compile-time strings you use <code>++</code> and <code>std.fmt.comptimePrint</code>.</p>
+
+<h3 id="ch25-7">25.7 Tables computed at compile time</h3>
+<p>Whenever you find yourself writing a table of magic numbers by hand, ask whether the compiler could write it for you. It can, with an ordinary loop inside a block that initialises a constant.</p>
+<p class="file">g_table.zig</p>
+<pre><code>const std = @import("std");
+
+/// The 2d6 probability table, in tenths of a percent, computed by the compiler.
+const two_d6_permille: [13]u16 = blk: {
+    var t: [13]u16 = @splat(0);
+    for (1..7) |a| {
+        for (1..7) |b| t[a + b] += 1;
+    }
+    for (&amp;t) |*e| e.* = @intCast(@as(u32, e.*) * 1000 / 36);
+    break :blk t;
+};
+
+/// A CRC-8 lookup table: 256 entries, each needing 8 inner steps.
+fn crc8Table() [256]u8 {
+    @setEvalBranchQuota(10_000); // 256 * 8 loop iterations exceed the default
+    var t: [256]u8 = undefined;
+    for (&amp;t, 0..) |*e, i| {
+        var c: u8 = @intCast(i);
+        for (0..8) |_| c = if (c &amp; 0x80 != 0) (c &lt;&lt; 1) ^ 0x07 else c &lt;&lt; 1;
+        e.* = c;
+    }
+    return t;
+}
+const crc_table = crc8Table();
+
+fn crc8(bytes: []const u8) u8 {
+    var c: u8 = 0;
+    for (bytes) |b| c = crc_table[c ^ b];
+    return c;
+}
+
+comptime {
+    // Sanity checks that run in the compiler. A failure is a build error.
+    std.debug.assert(two_d6_permille[7] == 166);
+    std.debug.assert(two_d6_permille[2] == two_d6_permille[12]);
+    std.debug.assert(crc_table[0] == 0);
+}
+
+pub fn main() void {
+    std.debug.print("P(7) = {d}.{d}%  P(12) = {d}.{d}%\n", .{
+        two_d6_permille[7] / 10, two_d6_permille[7] % 10,
+        two_d6_permille[12] / 10, two_d6_permille[12] % 10,
+    });
+    std.debug.print("crc8(\"123456789\") = 0x{x}\n", .{crc8("123456789")});
+}</code></pre>
+<pre class="term">P(7) = 16.6%  P(12) = 2.7%
+crc8("123456789") = 0xf4</pre>
+<p>Both tables are written into the executable as data; <code>crc8</code> at run time is a loop with one table lookup per byte. Notice the ordinary <code>for</code> loops and an ordinary <code>var</code> inside the initialiser: because the whole block is evaluated by the compiler, they are compile-time loops and variables without any special keyword. The <code>@setEvalBranchQuota</code> in <code>crc8Table</code> is needed because 256 times 8 iterations is more than a thousand.</p>
+<p>The top-level <code>comptime { ... }</code> block is a container-level assertion. Its <code>std.debug.assert</code> calls run during compilation, and a false one is a build error with a location, which is a cheap way to check that a table came out right, that a struct is the size you expect, or that two constants agree.</p>
+
+<h3 id="ch25-8">25.8 @compileError and @compileLog</h3>
+<p><code>@compileError("message")</code> stops the build with your message, if the compiler ever reaches it. Put it behind a comptime condition and you have a custom compile-time check with a readable diagnostic.</p>
+<p class="file">h_compile_error.zig</p>
+<pre><code>const std = @import("std");
+
+const Tuning = struct { max_lance: u8 = 4, repair_hours: u32 = 20 };
+const t: Tuning = .{};
+
+comptime {
+    if (t.max_lance &gt; 12) @compileError("a lance cannot have more than 12 units");
+    if (@sizeOf(Tuning) &gt; 64) @compileError("Tuning grew past a cache line");
+}
+
+fn checkedShift(comptime bits: u8, value: u32) u32 {
+    if (bits &gt;= 32) @compileError("shift amount " ++ std.fmt.comptimePrint("{d}", .{bits}) ++ " is too large for u32");
+    return value &lt;&lt; bits;
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{checkedShift(4, 1)});
+}</code></pre>
+<pre class="term">16</pre>
+<p>With <code>bits = 4</code> the program builds and prints 16. Change the call to <code>checkedShift(40, 1)</code>:</p>
+<p class="file">h_compile_error_bad.zig</p>
+<pre><code>const std = @import("std");
+fn checkedShift(comptime bits: u8, value: u32) u32 {
+    if (bits &gt;= 32) @compileError("shift amount " ++ std.fmt.comptimePrint("{d}", .{bits}) ++ " is too large for u32");
+    return value &lt;&lt; bits;
+}
+pub fn main() void {
+    std.debug.print("{d}\n", .{checkedShift(40, 1)});
+}</code></pre>
+<pre class="term">h_compile_error_bad.zig:3:21: error: shift amount 40 is too large for u32
+    if (bits &gt;= 32) @compileError("shift amount " ++ std.fmt.comptimePrint("{d}", .{bits}) ++ " is too large for u32");
+                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    main: h_compile_error_bad.zig:7:44</pre>
+<p>The message was assembled with <code>++</code> and <code>comptimePrint</code>, so it names the actual offending value. This pattern, "a <code>comptime</code> parameter, a check, a <code>@compileError</code> with a helpful message", is how generic code in <a href="#ch26">Chapter 26</a> says which types it accepts.</p>
+<p><code>@compileLog(values...)</code> is the compile-time <code>print</code>. It prints its arguments during compilation, then deliberately fails the build so you do not ship it by accident:</p>
+<p class="file">i_compile_log.zig</p>
+<pre><code>const std = @import("std");
+const table = blk: {
+    var t: [4]u32 = undefined;
+    for (&amp;t, 0..) |*e, i| e.* = @intCast(i * i * i);
+    break :blk t;
+};
+pub fn main() void {
+    @compileLog("table is", table, @sizeOf(@TypeOf(table)));
+    std.debug.print("{any}\n", .{table});
+}</code></pre>
+<pre class="term">i_compile_log.zig:8:5: error: found compile log statement
+    @compileLog("table is", table, @sizeOf(@TypeOf(table)));
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Compile Log Output:
+@as(*const [8:0]u8, "table is"), @as([4]u32, .{ 0, 1, 8, 27 }), @as(comptime_int, 16)</pre>
+<p>Use it when you cannot work out what the compiler thinks a comptime value or type is. Remove it when you are done.</p>
+
+<h3 id="ch25-9">25.9 Why there are no macros</h3>
+<p>C has a preprocessor; C++ has templates; Rust has two macro systems; Lisp has real macros. Zig has none of these, and the reason is everything above. A macro is a program that writes program text. Zig lets you run the language itself while compiling, with the same syntax, the same functions, the same debugger-visible values. There is no second language to learn, no text substitution to reason about, and every error is reported in terms of real code with real types. Conditional compilation is an <code>if</code> on a comptime value. Generics are functions that take types. Lookup tables are loops. Type-dependent behaviour is a <code>switch</code> on <code>@typeInfo</code>. The cost of this design is that comptime code must be pure and finite (hence the quota) and cannot do I/O; the benefit is that "what does this expand to?" is never a question you have to ask.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The RNG module sizes an array by the number of enum members, so that adding a stream to the enum grows the array (<code>game/src/sim/rng.zig</code>):
+<pre><code>pub const Stream = enum(u8) {
+    generation, market, maintenance, acquisition, battle, events, medical, travel,
+    const count = @typeInfo(Stream).@"enum".fields.len;
+};
+
+pub const Rng = struct {
+    prngs: [Stream.count]std.Random.DefaultPrng,
+    ...
+};</code></pre>
+The tuning sanity test in <code>game/src/domain/tuning.zig</code> is 25.5 and 25.6 together: a recursive function with <code>comptime T: type</code> and <code>comptime name: []const u8</code> parameters walks a nested struct with <code>inline for</code>, building the dotted path of each field with <code>name ++ "." ++ f.name</code>, so that a bad knob is reported as <code>t.person.share_profit_default_bp</code>. Because the type and the name are comptime, the recursion is entirely resolved during compilation; only the integer comparisons survive into the test binary. And the SQLite binding's <code>else =&gt; @compileError("unsupported bind type " ++ @typeName(T))</code> is 25.8: try to bind a type it does not understand and the build stops with the type's name.</div>
+
+<h3 id="ch25-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 25.1 · Powers of two <span class="level">warm-up</span></h4>
+  <p>Fill a <code>[64]u64</code> table of powers of two in a compile-time block, add a container-level <code>comptime</code> assertion on it, and write <code>ceilLog2(n) ?u6</code> that searches the table at run time. Name the file: <code>exercises/25-comptime/ex1_powers.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 25, exercise 1: a table computed by the compiler.
+//! Run with:  zig test ex1_powers.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// powers[i] == 2^i for i in 0..64, filled in at compile time.
+const powers: [64]u64 = blk: {
+    var t: [64]u64 = undefined;
+    for (&amp;t, 0..) |*e, i| e.* = @as(u64, 1) &lt;&lt; @intCast(i);
+    break :blk t;
+};
+
+// Checks that run while compiling; a failure is a build error, not a test failure.
+comptime {
+    std.debug.assert(powers[0] == 1);
+    std.debug.assert(powers[63] == 1 &lt;&lt; 63);
+}
+
+/// The smallest i such that 2^i &gt;= n, or null if n is 0 or too large.
+fn ceilLog2(n: u64) ?u6 {
+    if (n == 0) return null;
+    for (powers, 0..) |p, i| {
+        if (p &gt;= n) return @intCast(i);
+    }
+    return null;
+}
+
+test "table" {
+    try std.testing.expectEqual(@as(u64, 1024), powers[10]);
+    try std.testing.expectEqual(@as(u64, 1 &lt;&lt; 40), powers[40]);
+}
+
+test "ceilLog2" {
+    try std.testing.expectEqual(@as(?u6, 0), ceilLog2(1));
+    try std.testing.expectEqual(@as(?u6, 3), ceilLog2(8));
+    try std.testing.expectEqual(@as(?u6, 4), ceilLog2(9));
+    try std.testing.expectEqual(@as(?u6, null), ceilLog2(0));
+    try std.testing.expectEqual(@as(?u6, null), ceilLog2(std.math.maxInt(u64)));
+}
+
+test "the table is a compile-time constant" {
+    // If this were not comptime-known, the array length below would not compile.
+    const n = comptime powers[3];
+    const arr: [n]u8 = @splat(7);
+    try std.testing.expectEqual(@as(usize, 8), arr.len);
+}</code></pre>
+  <p>The last test proves the table is a true constant: only a comptime-known value can be an array length. Note that a doc comment (<code>///</code>) may not sit on a <code>comptime</code> block; use a plain <code>//</code> comment.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 25.2 · Sieve <span class="level">practice</span></h4>
+  <p>Compute <code>is_prime: [1000]bool</code> with a sieve of Eratosthenes at compile time (you will need <code>@setEvalBranchQuota</code>), write <code>primesBelow(n)</code>, and make <code>prime_count</code> a compile-time constant usable as an array length. Name the file: <code>exercises/25-comptime/ex2_sieve.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 25, exercise 2: a sieve of Eratosthenes at compile time.
+//! Run with:  zig test ex2_sieve.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const limit = 1000;
+
+/// is_prime[n] is true when n is prime, for n &lt; limit. Built by the compiler.
+const is_prime: [limit]bool = blk: {
+    @setEvalBranchQuota(20_000); // the nested loops need more than the default
+    var t: [limit]bool = @splat(true);
+    t[0] = false;
+    t[1] = false;
+    var i: usize = 2;
+    while (i * i &lt; limit) : (i += 1) {
+        if (!t[i]) continue;
+        var j = i * i;
+        while (j &lt; limit) : (j += i) t[j] = false;
+    }
+    break :blk t;
+};
+
+/// How many primes are below `n` (n &lt;= limit)?
+fn primesBelow(n: usize) usize {
+    var count: usize = 0;
+    for (is_prime[0..n]) |p| {
+        if (p) count += 1;
+    }
+    return count;
+}
+
+/// Computed once, at compile time, from the table. The loop runs `limit` times,
+/// which is over the default quota, so raise it for this evaluation.
+const prime_count = blk: {
+    @setEvalBranchQuota(2000);
+    break :blk primesBelow(limit);
+};
+
+test "small primes" {
+    try std.testing.expect(is_prime[2]);
+    try std.testing.expect(is_prime[97]);
+    try std.testing.expect(!is_prime[1]);
+    try std.testing.expect(!is_prime[91]); // 7 * 13
+}
+
+test "counts" {
+    try std.testing.expectEqual(@as(usize, 25), primesBelow(100));
+    try std.testing.expectEqual(@as(usize, 168), prime_count);
+}
+
+test "prime_count is usable as an array length" {
+    const arr: [prime_count]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 168), arr.len);
+}</code></pre>
+  <p>Two quotas: one for the sieve itself and one for the thousand-iteration count. Each is set inside the evaluation it serves. The same <code>primesBelow</code> function runs in the compiler for <code>prime_count</code> and at run time in the first test.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 25.3 · Walking fields <span class="level">practice</span></h4>
+  <p>Write <code>sumIntFields(anytype)</code> that adds up every integer field of a struct (remember that fields of an anonymous literal are <code>comptime_int</code>), <code>boolFieldCount(comptime T)</code> that counts <code>bool</code> fields at compile time, and <code>firstFieldOfType(T, Wanted)</code> returning a field name or null. Name the file: <code>exercises/25-comptime/ex3_fields.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 25, exercise 3: inline for over struct fields.
+//! Run with:  zig test ex3_fields.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Sum every integer field of a struct; skip fields of other types.
+/// Fields of an anonymous literal like .{ .a = 1 } have type comptime_int, so accept that too.
+fn sumIntFields(value: anytype) i64 {
+    const T = @TypeOf(value);
+    var total: i64 = 0;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        switch (@typeInfo(f.type)) {
+            .int, .comptime_int =&gt; total += @field(value, f.name),
+            else =&gt; {},
+        }
+    }
+    return total;
+}
+
+/// How many fields of type `bool` does the struct type T have? Computed at compile time.
+fn boolFieldCount(comptime T: type) usize {
+    comptime var n: usize = 0;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (f.type == bool) n += 1;
+    }
+    return n;
+}
+
+/// The name of the first field whose type is `Wanted`, or null.
+fn firstFieldOfType(comptime T: type, comptime Wanted: type) ?[]const u8 {
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (f.type == Wanted) return f.name;
+    }
+    return null;
+}
+
+const Unit = struct { tons: u32, armor: u16, name: []const u8, destroyed: bool, salvage: bool, bv: i32 };
+
+test "sum" {
+    const u: Unit = .{ .tons = 100, .armor = 300, .name = "Atlas", .destroyed = false, .salvage = true, .bv = -5 };
+    try std.testing.expectEqual(@as(i64, 395), sumIntFields(u));
+    try std.testing.expectEqual(@as(i64, 3), sumIntFields(.{ .a = 1, .b = 2 }));
+}
+
+test "counts at compile time" {
+    const n = comptime boolFieldCount(Unit);
+    const flags: [n]bool = @splat(false);
+    try std.testing.expectEqual(@as(usize, 2), flags.len);
+}
+
+test "first field of type" {
+    try std.testing.expectEqualStrings("armor", (comptime firstFieldOfType(Unit, u16)).?);
+    try std.testing.expectEqualStrings("destroyed", (comptime firstFieldOfType(Unit, bool)).?);
+    try std.testing.expect(comptime firstFieldOfType(Unit, f64) == null);
+}</code></pre>
+  <p>Everything that depends on a field's type or name happens inside <code>inline for</code>, where <code>f</code> is a constant. <code>f.type == bool</code> is a comparison of two type values, which is legal exactly because types are values.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 25.4 · Labels <span class="level">practice</span></h4>
+  <p>Write three functions that return compile-time strings: <code>label(name, unit)</code> using <code>++</code> and a <code>@compileError</code> for an empty name, <code>header(text, width)</code> that pads with <code>" " ** n</code>, and <code>version(major, minor, patch)</code> using <code>comptimePrint</code>. Name the file: <code>exercises/25-comptime/ex4_labels.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 25, exercise 4: strings built by the compiler.
+//! Run with:  zig test ex4_labels.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// "weight (tons)" from ("weight", "tons"); "weight" alone when unit is empty.
+/// An empty name is a compile error.
+fn label(comptime name: []const u8, comptime unit: []const u8) []const u8 {
+    if (name.len == 0) @compileError("label needs a name");
+    if (unit.len == 0) return name;
+    return name ++ " (" ++ unit ++ ")";
+}
+
+/// A column header: the label left-aligned and padded with spaces to `width`,
+/// all decided at compile time.
+fn header(comptime text: []const u8, comptime width: usize) []const u8 {
+    if (text.len &gt;= width) return text;
+    return text ++ (" " ** (width - text.len));
+}
+
+/// "v0.16.0" from three numbers.
+fn version(comptime major: u32, comptime minor: u32, comptime patch: u32) []const u8 {
+    return std.fmt.comptimePrint("v{d}.{d}.{d}", .{ major, minor, patch });
+}
+
+test "label" {
+    try std.testing.expectEqualStrings("weight (tons)", label("weight", "tons"));
+    try std.testing.expectEqualStrings("name", label("name", ""));
+}
+
+test "header" {
+    try std.testing.expectEqualStrings("tons      ", header("tons", 10));
+    try std.testing.expectEqualStrings("battle value", header("battle value", 5));
+    try std.testing.expectEqual(@as(usize, 10), header("tons", 10).len);
+}
+
+test "version" {
+    try std.testing.expectEqualStrings("v0.16.0", version(0, 16, 0));
+    // The result is a compile-time constant, so it can size an array.
+    const n = comptime version(1, 2, 3).len;
+    const arr: [n]u8 = @splat('x');
+    try std.testing.expectEqual(@as(usize, 6), arr.len);
+}</code></pre>
+  <p>All parameters are <code>comptime</code>, so the functions cannot be called with runtime strings, which is the point: the results are constants. In the last test the call is prefixed with <code>comptime</code> so that <code>.len</code> can size an array.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 25.5 · Enum tables <span class="level">challenge</span></h4>
+  <p>Write <code>names(comptime E: type)</code> returning an array of every tag name, <code>values(E)</code> returning the matching enum values, <code>longestName(E)</code> for column sizing, and <code>fromName(E, text)</code> that does a runtime lookup through the compile-time tables (it must work for enums with explicit values). Name the file: <code>exercises/25-comptime/ex5_enum_names.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 25, exercise 5: tables derived from an enum at compile time.
+//! Run with:  zig test ex5_enum_names.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// An array of every tag name of enum E, in declaration order.
+fn names(comptime E: type) [@typeInfo(E).@"enum".fields.len][]const u8 {
+    const fields = @typeInfo(E).@"enum".fields;
+    var out: [fields.len][]const u8 = undefined;
+    inline for (fields, 0..) |f, i| out[i] = f.name;
+    return out;
+}
+
+/// Every value of E, in declaration order, matching names(E) index for index.
+fn values(comptime E: type) [@typeInfo(E).@"enum".fields.len]E {
+    const fields = @typeInfo(E).@"enum".fields;
+    var out: [fields.len]E = undefined;
+    inline for (fields, 0..) |f, i| out[i] = @enumFromInt(f.value);
+    return out;
+}
+
+/// The length of the longest tag name, for sizing a column.
+fn longestName(comptime E: type) usize {
+    comptime var best: usize = 0;
+    inline for (@typeInfo(E).@"enum".fields) |f| best = @max(best, f.name.len);
+    return best;
+}
+
+/// Look a value up by name at runtime, using the compile-time table.
+fn fromName(comptime E: type, text: []const u8) ?E {
+    const table = comptime names(E);
+    const vals = comptime values(E);
+    for (table, vals) |n, v| {
+        if (std.mem.eql(u8, n, text)) return v;
+    }
+    return null;
+}
+
+const Role = enum { pilot, tech, medic, quartermaster };
+const Weather = enum(u8) { clear = 1, rain = 5, storm = 9 };
+
+test "names" {
+    const n = names(Role);
+    try std.testing.expectEqual(@as(usize, 4), n.len);
+    try std.testing.expectEqualStrings("pilot", n[0]);
+    try std.testing.expectEqualStrings("quartermaster", n[3]);
+}
+
+test "longest" {
+    const w = comptime longestName(Role);
+    const col: [w]u8 = @splat(' ');
+    try std.testing.expectEqual(@as(usize, 13), col.len);
+    try std.testing.expectEqual(@as(usize, 5), comptime longestName(Weather));
+}
+
+test "fromName with explicit values" {
+    try std.testing.expectEqual(@as(?Weather, .storm), fromName(Weather, "storm"));
+    try std.testing.expectEqual(@as(?Weather, null), fromName(Weather, "snow"));
+    try std.testing.expectEqual(@as(?Role, .medic), fromName(Role, "medic"));
+}</code></pre>
+  <p>The array length in the return type, <code>[@typeInfo(E).@"enum".fields.len][]const u8</code>, is itself a compile-time expression. <code>fromName</code> builds both tables with <code>comptime</code> and then does an ordinary runtime loop over them; you cannot index <code>fields[i]</code> with a runtime <code>i</code> because <code>fields</code> only exists in the compiler. (The standard library has <code>std.meta.stringToEnum</code> for this job.)</p></details>
+</div>
+
+<h3 id="ch25-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is the type of the literal <code>42</code> before it is assigned anywhere? <details class="answer"><summary>Answer</summary><code>comptime_int</code>: an unbounded integer that exists only in the compiler and coerces to any integer type it fits in.</details></li>
+  <li>What does the <code>comptime</code> keyword in front of an expression guarantee? <details class="answer"><summary>Answer</summary>That the expression is evaluated by the compiler; if it cannot be, compilation fails. The result is a constant baked into the binary.</details></li>
+  <li>Why must an array length be comptime-known? <details class="answer"><summary>Answer</summary>The length is part of the array's type, and the compiler lays out memory and generates code from types before the program runs. For runtime lengths use a slice or an <code>ArrayList</code>.</details></li>
+  <li>When do you need <code>inline for</code> rather than <code>for</code>? <details class="answer"><summary>Answer</summary>When the loop variable must be comptime-known inside the body: iterating struct fields, types, or tuple elements of different types. Not for performance.</details></li>
+  <li>What does "evaluation exceeded 1000 backwards branches" mean and how do you fix it? <details class="answer"><summary>Answer</summary>A compile-time evaluation looped or recursed more than the default quota. Call <code>@setEvalBranchQuota(n)</code> inside that evaluation with a larger <code>n</code>.</details></li>
+  <li>Can <code>++</code> join a string literal to a slice read from a file at run time? <details class="answer"><summary>Answer</summary>No; its operands need comptime-known lengths. Use an <code>ArrayList(u8)</code>, <code>allocPrint</code> or <code>bufPrint</code> for runtime strings.</details></li>
+  <li>What is the difference between <code>@compileError</code> and <code>@compileLog</code>? <details class="answer"><summary>Answer</summary><code>@compileError</code> fails the build with your message when reached; <code>@compileLog</code> prints values during compilation for debugging and also fails the build so it cannot be left in.</details></li>
+  <li>Why does Zig not need a preprocessor or a template language? <details class="answer"><summary>Answer</summary>Because ordinary Zig code can run at compile time, with types as values: conditional compilation is an <code>if</code>, generics are functions returning types, and tables are loops.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Values are either comptime-known or runtime; <code>comptime</code> forces the first world, and literals, constants and pure calls on constants already live there.</li>
+<li><code>comptime_int</code> and <code>comptime_float</code> are unbounded literal types that coerce when they fit; overflow is a compile error.</li>
+<li><code>comptime</code> blocks, <code>comptime var</code>, and <code>@setEvalBranchQuota</code> for evaluations beyond a thousand branches.</li>
+<li>Types are values of type <code>type</code>; array lengths, types and field names must be comptime-known.</li>
+<li><code>inline for</code> and <code>inline while</code> unroll with a comptime loop variable, which is what field walking and mixed tuples need.</li>
+<li><code>++</code> and <code>**</code> build strings in the compiler from operands with known lengths; <code>comptimePrint</code> formats there.</li>
+<li>Tables are loops inside constant initialisers; container-level <code>comptime {}</code> blocks hold build-time assertions.</li>
+<li><code>@compileError</code> gives custom diagnostics; <code>@compileLog</code> prints while compiling.</li>
+</ul></div>
+</section>

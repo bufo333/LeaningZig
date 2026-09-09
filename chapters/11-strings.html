@@ -1,0 +1,602 @@
+<section id="ch11">
+<h2>11. Strings</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn that Zig has no string type, and why that turns out to be fine. A string is a slice of bytes, <code>[]const u8</code>, and everything you want to do with one (compare, search, trim, split, change case, build, parse) is a function in <code>std.mem</code>, <code>std.ascii</code> or <code>std.fmt</code>. You will also learn where bytes and characters part ways, and how to build text into a buffer you own.</p>
+
+<h3 id="ch11-1">11.1 A string is a slice of bytes</h3>
+<p>Start with a literal and ask Zig what it is:</p>
+<p class="file">literal.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const name = "Kai Allard";
+    std.debug.print("{s}\n", .{name});
+    std.debug.print("type: {any}\n", .{@TypeOf(name)});
+    std.debug.print("len: {d}\n", .{name.len});
+    std.debug.print("first byte: {d} ('{c}')\n", .{ name[0], name[0] });
+    const s: []const u8 = name; // the everyday string type
+    std.debug.print("as slice: {any}\n", .{@TypeOf(s)});
+}</code></pre>
+<pre class="term">Kai Allard
+type: *const [10:0]u8
+len: 10
+first byte: 75 ('K')
+as slice: []const u8</pre>
+<p><code>*const [10:0]u8</code>: a pointer to a constant array of ten bytes with a zero after them (<a href="#ch10">Chapter 10</a> covered the sentinel). Ten bytes, not ten characters; for plain ASCII text those are the same, and 11.8 covers when they are not. <code>name[0]</code> is the byte 75, which <code>{c}</code> shows as the letter K.</p>
+<p>The literal's pointer-to-array type coerces to <code>[]const u8</code>, and that is the type you will write on every string parameter and most string variables. When people say "a Zig string" they mean <code>[]const u8</code>: a read-only slice of bytes, with a length, and no promise about what the bytes mean.</p>
+<p>There is no <code>String</code> class with methods. Instead, there are free functions that take slices. Because every one of them takes the element type as its first argument, you will type <code>u8</code> a lot: <code>std.mem.eql(u8, a, b)</code>. Those functions also work on slices of <code>u32</code> or of structs, which is the reason for the parameter; strings are just the common case.</p>
+
+<h3 id="ch11-2">11.2 Comparing</h3>
+<p>The first thing every newcomer tries is <code>==</code>:</p>
+<p class="file">nostring.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var buf: [5]u8 = undefined;
+    @memcpy(&amp;buf, "lance");
+    const typed: []const u8 = &amp;buf;
+    std.debug.print("{}\n", .{typed == "lance"});
+}</code></pre>
+<pre class="term">nostring.zig:7:37: error: cannot compare strings with ==
+    std.debug.print("{}\n", .{typed == "lance"});
+                              ~~~~~~^~~~~~~~~~</pre>
+<p>The compiler has a special message for it. The reason is the same as for arrays in <a href="#ch09">Chapter 9</a>: comparing contents is a loop, and Zig does not hide loops behind operators. Use <code>std.mem.eql</code>:</p>
+<p class="file">compare.zig</p>
+<pre><code>const std = @import("std");
+
+fn isQuit(cmd: []const u8) bool {
+    return std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q");
+}
+
+pub fn main() void {
+    std.debug.print("{} {} {}\n", .{ isQuit("quit"), isQuit("q"), isQuit("quit ") });
+    std.debug.print("{}\n", .{std.ascii.eqlIgnoreCase("QUIT", "quit")});
+    std.debug.print("{any}\n", .{std.mem.order(u8, "alpha", "bravo")});
+}</code></pre>
+<pre class="term">true true false
+true
+.lt</pre>
+<p><code>eql</code> is exact: <code>"quit "</code> with a trailing space is not <code>"quit"</code>. For a case-blind comparison use <code>std.ascii.eqlIgnoreCase</code>. For ordering (sorting names, say) <code>std.mem.order</code> returns <code>.lt</code>, <code>.eq</code> or <code>.gt</code>, comparing byte by byte.</p>
+
+<h3 id="ch11-3">11.3 Searching</h3>
+<p>Prefixes, suffixes and substrings all live in <code>std.mem</code>. The functions that search for a position return an optional <code>?usize</code>: an index, or <code>null</code> for not found. You will meet optionals properly in <a href="#ch15">Chapter 15</a>; for now, <code>{?}</code> prints one, and <code>if (x) |k| ... else ...</code> unwraps one.</p>
+<p class="file">search.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const path = "data/units/atlas.zon";
+    std.debug.print("{}\n", .{std.mem.startsWith(u8, path, "data/")});
+    std.debug.print("{}\n", .{std.mem.endsWith(u8, path, ".zon")});
+    std.debug.print("{?}\n", .{std.mem.indexOf(u8, path, "units")});
+    std.debug.print("{?}\n", .{std.mem.indexOf(u8, path, "mek")});
+    std.debug.print("{?}\n", .{std.mem.indexOfScalar(u8, path, '/')});
+    std.debug.print("{?}\n", .{std.mem.lastIndexOfScalar(u8, path, '/')});
+    // The classic: the file name after the last slash.
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |k| path[k + 1 ..] else path;
+    std.debug.print("{s}\n", .{base});
+    std.debug.print("{d}\n", .{std.mem.count(u8, path, "/")});
+}</code></pre>
+<pre class="term">true
+true
+5
+null
+4
+10
+atlas.zon
+2</pre>
+<p><code>indexOf</code> finds a substring; <code>indexOfScalar</code> and <code>lastIndexOfScalar</code> find a single byte from the front or from the back. The <code>base</code> line is the guide's own idiom for a file name: find the last slash, and slice from one past it. If there is no slash the whole path is the name. <code>count</code> tells you how many times a needle appears.</p>
+
+<h3 id="ch11-4">11.4 Trimming and splitting</h3>
+<p>User input arrives with spaces and newlines around it. <code>std.mem.trim</code> takes the set of bytes to strip as its third argument:</p>
+<p class="file">trim.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const raw = "   hire Kai mekwarrior  \n";
+    const t = std.mem.trim(u8, raw, " \n");
+    std.debug.print("[{s}]\n", .{t});
+    std.debug.print("[{s}]\n", .{std.mem.trimStart(u8, raw, " ")});
+    std.debug.print("[{s}]\n", .{std.mem.trimEnd(u8, raw, " \n")});
+}</code></pre>
+<pre class="term">[hire Kai mekwarrior]
+[hire Kai mekwarrior  
+]
+[   hire Kai mekwarrior]</pre>
+<p>Trimming returns a smaller slice of the same memory; nothing is copied. <code>trimStart</code> and <code>trimEnd</code> do one side only.</p>
+<p>To take a line apart into words there are two iterators, and the difference between them matters:</p>
+<p class="file">tokenize.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const line = "hire   Kai  mekwarrior";
+
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    while (it.next()) |word| {
+        std.debug.print("[{s}] ", .{word});
+    }
+    std.debug.print("\n", .{});
+
+    var sp = std.mem.splitScalar(u8, line, ' ');
+    while (sp.next()) |piece| {
+        std.debug.print("[{s}] ", .{piece});
+    }
+    std.debug.print("\n", .{});
+
+    var csv = std.mem.splitScalar(u8, "3025,1,1", ',');
+    const year = csv.next().?;
+    const month = csv.next().?;
+    std.debug.print("year={s} month={s} rest={s}\n", .{ year, month, csv.rest() });
+}</code></pre>
+<pre class="term">[hire] [Kai] [mekwarrior] 
+[hire] [] [] [Kai] [] [mekwarrior] 
+year=3025 month=1 rest=1</pre>
+<p><code>tokenizeScalar</code> treats any run of the delimiter as one break and never yields an empty piece: three words from <code>"hire   Kai  mekwarrior"</code>. <code>splitScalar</code> yields exactly one piece per delimiter, empty ones included, which is what you want for a fixed format like a comma-separated record, where an empty field means something. Both are used with <code>while (it.next()) |piece|</code>, the same loop shape you will use for every iterator in the standard library.</p>
+<p>The <code>.?</code> after <code>csv.next()</code> says "I know there is a value; crash if not". It is fine for a demonstration; real code checks. Two more useful methods:</p>
+<p class="file">tokenize2.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var it = std.mem.tokenizeScalar(u8, "newlance 1st Recon Lance", ' ');
+    const verb = it.next().?;
+    const rest = it.rest();
+    std.debug.print("verb=[{s}] rest=[{s}]\n", .{ verb, rest });
+    var seq = std.mem.tokenizeSequence(u8, "a, b, c", ", ");
+    while (seq.next()) |p| std.debug.print("&lt;{s}&gt;", .{p});
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">verb=[newlance] rest=[1st Recon Lance]
+&lt;a&gt;&lt;b&gt;&lt;c&gt;</pre>
+<p><code>it.rest()</code> hands you everything not yet consumed, which is how a command parser takes one verb and leaves the rest of the line as a free-form name. <code>tokenizeSequence</code> splits on a multi-byte separator.</p>
+
+<h3 id="ch11-5">11.5 Characters: <code>std.ascii</code></h3>
+<p>Because a byte is just a <code>u8</code>, single-character questions are functions on <code>u8</code>, gathered in <code>std.ascii</code>:</p>
+<p class="file">ascii.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const c: u8 = 'k';
+    std.debug.print("{c} {c}\n", .{ std.ascii.toUpper(c), std.ascii.toLower('K') });
+    std.debug.print("{} {} {} {}\n", .{
+        std.ascii.isDigit('7'),
+        std.ascii.isAlphabetic('7'),
+        std.ascii.isWhitespace('\t'),
+        std.ascii.isAlphanumeric('_'),
+    });
+    var buf: [16]u8 = undefined;
+    const up = std.ascii.upperString(&amp;buf, "atlas");
+    std.debug.print("{s}\n", .{up});
+    std.debug.print("{}\n", .{std.ascii.eqlIgnoreCase("Atlas", "ATLAS")});
+    std.debug.print("{?}\n", .{std.ascii.indexOfIgnoreCase("Kitty Terminal", "term")});
+}</code></pre>
+<pre class="term">K k
+true false true false
+ATLAS
+true
+6</pre>
+<p><code>isDigit</code>, <code>isAlphabetic</code>, <code>isWhitespace</code>, <code>isAlphanumeric</code>, <code>toUpper</code>, <code>toLower</code>: the names are what you would guess. <code>upperString</code> writes an upper-cased copy into a buffer you provide, which brings us to the question of where new strings live.</p>
+
+<h3 id="ch11-6">11.6 Building strings into a buffer</h3>
+<p>Everything so far returned slices of existing text. To make <em>new</em> text you need memory to put it in, and in Zig you say where. The simplest place is an array on the stack, and the simplest tool is <code>std.fmt.bufPrint</code>, which is <code>print</code> aimed at a buffer:</p>
+<p class="file">bufprint.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var buf: [64]u8 = undefined;
+    const s = try std.fmt.bufPrint(&amp;buf, "order {s} hq:{d}", .{ "advance", 3 });
+    std.debug.print("{s} (len {d})\n", .{ s, s.len });
+    std.debug.print("{any} {any}\n", .{ @TypeOf(s), @TypeOf(&amp;buf) });
+
+    // Build in steps with a fixed writer.
+    var w = std.Io.Writer.fixed(&amp;buf);
+    try w.print("{d}", .{3025});
+    try w.writeByte('-');
+    try w.print("{d:0&gt;2}", .{1});
+    try w.writeAll("-01");
+    std.debug.print("{s}\n", .{w.buffered()});
+}</code></pre>
+<pre class="term">order advance hq:3 (len 18)
+[]u8 *[64]u8
+3025-01-01</pre>
+<p><code>bufPrint</code> returns a <code>[]u8</code> slice of the buffer holding exactly what it wrote. The buffer is <code>[64]u8</code>; the result is eighteen bytes long. Keep the buffer alive as long as you use the slice, and remember it is the same rule as in <a href="#ch10">Chapter 10</a>: a slice of a local buffer cannot be returned from the function that owns the buffer. The usual design is for the caller to pass the buffer in, exactly as <code>bufPrint</code> itself does.</p>
+<p>For building in several steps, wrap the buffer in a fixed writer. <code>print</code>, <code>writeByte</code> and <code>writeAll</code> append; <code>buffered()</code> gives back the slice written so far. This is the same <code>std.Io.Writer</code> interface as stdout in <a href="#ch02">Chapter 2</a>, pointed at memory instead of a file.</p>
+<p>What if the buffer is too small? <code>bufPrint</code> returns an error, which is why the function above is <code>!void</code> and the call has <code>try</code>:</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var buf: [8]u8 = undefined;
+    const s = try std.fmt.bufPrint(&amp;buf, "{s} {s}", .{ "hello", "world" });
+    std.debug.print("{s}\n", .{s});
+}</code></pre>
+<pre class="term">error: NoSpaceLeft
+&lt;zig&gt;/lib/std/Io/Writer.zig:2321:50: in fixedDrain (bufprint_small)
+                if (pattern.len &gt; remaining.len) return error.WriteFailed;</pre>
+<p><code>error: NoSpaceLeft</code>. No overflow, no truncation you did not ask for. When you cannot know the size in advance, the answer is an allocator and <code>std.fmt.allocPrint</code>, which returns a string of exactly the right length that you later free. That arrives in <a href="#ch21">Chapter 21</a> and <a href="#ch23">Chapter 23</a>; until then, buffers.</p>
+<p>Replacing a substring follows the same pattern, an output buffer you supply, with a helper to tell you how large it must be:</p>
+<p class="file">replace.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    const src = "1st Lance / 2nd Lance";
+    var out: [64]u8 = undefined;
+    const n = std.mem.replace(u8, src, "Lance", "Company", &amp;out);
+    const size = std.mem.replacementSize(u8, src, "Lance", "Company");
+    std.debug.print("{d} replacements, {d} bytes: {s}\n", .{ n, size, out[0..size] });
+}</code></pre>
+<pre class="term">2 replacements, 25 bytes: 1st Company / 2nd Company</pre>
+
+<h3 id="ch11-7">11.7 Literals are read-only; copies are not</h3>
+<p>A literal lives in the program's read-only data. You cannot write into it:</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lit = "atlas";
+    lit[0] = 'A';
+    std.debug.print("{s}\n", .{lit});
+}</code></pre>
+<pre class="term">mutate_lit.zig:5:8: error: cannot assign to constant
+    lit[0] = 'A';
+    ~~~^~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>To change text, copy it into an array you own first. <code>lit.*</code> dereferences the pointer-to-array, and assigning an array copies it:</p>
+<p class="file">mutate.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lit = "atlas";
+    var copy: [5]u8 = lit.*; // copy the bytes out of the literal
+    copy[0] = 'A';
+    std.debug.print("{s} {s}\n", .{ lit, &amp;copy });
+}</code></pre>
+<pre class="term">atlas Atlas</pre>
+<p>This is the same const rule as for slices: a <code>[]const u8</code> may look at bytes, a <code>[]u8</code> may change them, and a literal only ever gives you the former.</p>
+
+<h3 id="ch11-8">11.8 Multi-line literals</h3>
+<p>Long text uses a line-comment-like syntax. Each line starts with <code>\\</code>, and the newlines between lines are part of the string; the final line has no trailing newline.</p>
+<p class="file">multiline.zig</p>
+<pre><code>const std = @import("std");
+
+const banner =
+    \\IRON LEDGER
+    \\  a mercenary company simulator
+    \\  "no floats in the ledger"
+;
+
+pub fn main() void {
+    std.debug.print("{s}\n", .{banner});
+    std.debug.print("{d} bytes, {d} newlines\n", .{ banner.len, std.mem.count(u8, banner, "\n") });
+}</code></pre>
+<pre class="term">IRON LEDGER
+  a mercenary company simulator
+  "no floats in the ledger"
+71 bytes, 2 newlines</pre>
+<p>Nothing inside a <code>\\</code> line is escaped, so quotes and backslashes can appear as they are. IRON LEDGER's splash screen and its ASCII-art mek are multi-line literals in <code>src/tui/splash.zig</code>.</p>
+
+<h3 id="ch11-9">11.9 Bytes are not characters</h3>
+<p>All of the above treats a string as bytes. Text is stored in UTF-8, where ASCII characters are one byte each and everything else is two to four. Zig does not hide this:</p>
+<p class="file">utf8.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    const word = "Mëk";
+    std.debug.print("{s}: {d} bytes\n", .{ word, word.len });
+    for (word) |b| std.debug.print("{x} ", .{b});
+    std.debug.print("\n", .{});
+
+    const n = try std.unicode.utf8CountCodepoints(word);
+    std.debug.print("{d} code points\n", .{n});
+
+    var it = (try std.unicode.Utf8View.init(word)).iterator();
+    while (it.nextCodepoint()) |cp| std.debug.print("U+{X:0&gt;4} ", .{cp});
+    std.debug.print("\n", .{});
+
+    const cp = try std.unicode.utf8Decode(word[1..3]); // the two bytes of ë
+    std.debug.print("{d}\n", .{cp});
+}</code></pre>
+<pre class="term">Mëk: 4 bytes
+4d c3 ab 6b 
+3 code points
+U+004D U+00EB U+006B 
+235</pre>
+<p><code>"Mëk"</code> is four bytes and three <em>code points</em>. <code>len</code> counts bytes, always. The <code>ë</code> is the pair <code>c3 ab</code>. To count or walk characters, use <code>std.unicode</code>: <code>utf8CountCodepoints</code> counts, <code>Utf8View</code> iterates one code point at a time, and <code>utf8Decode</code> turns the bytes of one character into its number (235 is U+00EB).</p>
+<p>The rule that keeps you safe: byte functions like <code>indexOf</code> and <code>eql</code> are fine on UTF-8, because a valid UTF-8 sequence never appears by accident inside another. What is not fine is slicing at an arbitrary byte offset (you may cut a character in half) and calling <code>std.ascii.toUpper</code> on non-ASCII bytes (it leaves them alone, which is correct but not what you meant). The terminal client in IRON LEDGER reads keys as <code>u21</code> code points for exactly this reason.</p>
+
+<h3 id="ch11-10">11.10 Parsing numbers</h3>
+<p>The last everyday string job is turning text into a number, and it can fail:</p>
+<p class="file">parse.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    const n = try std.fmt.parseInt(u32, "3025", 10);
+    const f = try std.fmt.parseFloat(f64, "1.5");
+    std.debug.print("{d} {d}\n", .{ n + 1, f * 2 });
+    const bad = std.fmt.parseInt(u32, "30x5", 10);
+    std.debug.print("{!}\n", .{bad});
+}</code></pre>
+<pre class="term">3026 3
+error.InvalidCharacter</pre>
+<p><code>parseInt</code> takes the target type, the text and the base. Invalid text is an error, not zero and not a crash; <code>{!}</code> prints either the value or the error name. <a href="#ch16">Chapter 16</a> shows how to handle these errors properly; <a href="#ch23">Chapter 23</a> covers the rest of <code>std.fmt</code>.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The command-line parser is nothing but this chapter's functions applied in order. A line becomes a token iterator, the first token is compared against known verbs with <code>std.mem.eql</code>, the rest is parsed or trimmed:
+<pre><code>// src/sim/cli.zig
+pub fn parseCommand(verb: []const u8, tokens: *std.mem.TokenIterator(u8, .scalar)) ParseError!?Command {
+    const eq = std.mem.eql;
+    if (eq(u8, verb, "admit")) return .{ .admit = @enumFromInt(try num(u32, tokens.next())) };
+    if (eq(u8, verb, "shares")) return .{ .set_shares_pct = try num(u8, tokens.next()) };
+    if (eq(u8, verb, "newlance")) {
+        const site = try parseSite(try need(tokens.next()));
+        var name = std.mem.trim(u8, tokens.rest(), " ");
+        // ...
+    }
+    return null; // not a verb we know
+}</code></pre>
+<p><code>const eq = std.mem.eql;</code> is a small trick to shorten a function you call twenty times in a row. Elsewhere, <code>std.mem.startsWith(u8, token, "hq:")</code> recognises references like <code>hq:3</code> (<code>src/main.zig</code>), and the terminal-detection code uses <code>std.ascii.indexOfIgnoreCase</code> to spot <code>"iterm"</code> in an environment variable regardless of case (<code>src/tui/emblem.zig</code>). Every one of those functions takes a <code>[]const u8</code> and returns a slice or an optional index; there is no string object anywhere in the 31,000 lines.</p></div>
+
+<h3 id="ch11-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 11.1 · String predicates <span class="level">warm-up</span></h4>
+  <p>Write <code>isQuit</code> (trim, then case-insensitive match against three words), <code>isNumber</code> (all digits, at least one) and <code>isHqRef</code> (the form <code>hq:&lt;digits&gt;</code>). Name the file: <code>exercises/11-strings/ex1_predicates.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 11, exercise 1: string predicates.
+//! Run with:  zig test ex1_predicates.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// True when the command is one of the quit words, ignoring case and
+/// surrounding whitespace.
+fn isQuit(cmd: []const u8) bool {
+    const t = std.mem.trim(u8, cmd, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(t, "quit") or std.ascii.eqlIgnoreCase(t, "q") or
+        std.ascii.eqlIgnoreCase(t, "exit");
+}
+
+/// True when every byte is a decimal digit and there is at least one.
+fn isNumber(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+/// True when `s` looks like "hq:&lt;digits&gt;".
+fn isHqRef(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "hq:") and isNumber(s["hq:".len..]);
+}
+
+test "isQuit" {
+    try std.testing.expect(isQuit("quit"));
+    try std.testing.expect(isQuit("  Q\n"));
+    try std.testing.expect(isQuit("EXIT"));
+    try std.testing.expect(!isQuit("quit now"));
+    try std.testing.expect(!isQuit(""));
+}
+
+test "isNumber" {
+    try std.testing.expect(isNumber("3025"));
+    try std.testing.expect(isNumber("0"));
+    try std.testing.expect(!isNumber(""));
+    try std.testing.expect(!isNumber("30x5"));
+    try std.testing.expect(!isNumber("-1"));
+}
+
+test "isHqRef" {
+    try std.testing.expect(isHqRef("hq:1"));
+    try std.testing.expect(isHqRef("hq:42"));
+    try std.testing.expect(!isHqRef("hq:"));
+    try std.testing.expect(!isHqRef("co:1"));
+    try std.testing.expect(!isHqRef("hq"));
+}</code></pre>
+  <p><code>s["hq:".len..]</code> slices past the prefix using the literal's own length, so the two cannot drift apart. <code>isNumber</code> rejects the empty string explicitly; without that check an empty input would loop zero times and return <code>true</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 11.2 · Taking a command line apart <span class="level">practice</span></h4>
+  <p>Using the tokenizer and splitter, write <code>verb</code>, <code>wordCount</code>, <code>args</code> (the rest of the line after the verb, trimmed) and <code>parseDate</code>, which turns <code>"3025-1-1"</code> into three numbers and rejects the wrong number of pieces. Name the file: <code>exercises/11-strings/ex2_tokens.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 11, exercise 2: taking a command line apart.
+//! Run with:  zig test ex2_tokens.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// The first whitespace-separated word, or "" when there is none.
+fn verb(line: []const u8) []const u8 {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    return it.next() orelse "";
+}
+
+/// Number of whitespace-separated words.
+fn wordCount(line: []const u8) usize {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    var n: usize = 0;
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+/// Everything after the first word, trimmed. "" if there is nothing.
+fn args(line: []const u8) []const u8 {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    _ = it.next();
+    return std.mem.trim(u8, it.rest(), " ");
+}
+
+/// Parse "YYYY-MM-DD" into three numbers. Any other shape is an error.
+fn parseDate(s: []const u8) ![3]u16 {
+    var it = std.mem.splitScalar(u8, s, '-');
+    var out: [3]u16 = undefined;
+    for (&amp;out) |*slot| {
+        const piece = it.next() orelse return error.BadDate;
+        slot.* = try std.fmt.parseInt(u16, piece, 10);
+    }
+    if (it.next() != null) return error.BadDate;
+    return out;
+}
+
+test "verb" {
+    try std.testing.expectEqualStrings("hire", verb("hire Kai mekwarrior"));
+    try std.testing.expectEqualStrings("day", verb("   day"));
+    try std.testing.expectEqualStrings("", verb("   "));
+}
+
+test "wordCount" {
+    try std.testing.expectEqual(@as(usize, 3), wordCount("hire Kai mekwarrior"));
+    try std.testing.expectEqual(@as(usize, 3), wordCount("  hire   Kai  mekwarrior "));
+    try std.testing.expectEqual(@as(usize, 0), wordCount(""));
+}
+
+test "args" {
+    try std.testing.expectEqualStrings("Kai mekwarrior", args("hire Kai mekwarrior"));
+    try std.testing.expectEqualStrings("1st Recon Lance", args("newlance   1st Recon Lance  "));
+    try std.testing.expectEqualStrings("", args("day"));
+}
+
+test "parseDate" {
+    try std.testing.expectEqual([3]u16{ 3025, 1, 1 }, try parseDate("3025-1-1"));
+    try std.testing.expectEqual([3]u16{ 3026, 12, 31 }, try parseDate("3026-12-31"));
+    try std.testing.expectError(error.BadDate, parseDate("3025-1"));
+    try std.testing.expectError(error.BadDate, parseDate("3025-1-1-1"));
+    try std.testing.expectError(error.InvalidCharacter, parseDate("3025-x-1"));
+}</code></pre>
+  <p><code>it.next() orelse ""</code> turns "no token" into the empty string. <code>parseDate</code> uses <code>splitScalar</code>, not <code>tokenizeScalar</code>, because a missing field should be an error rather than silently skipped; after three pieces it checks that nothing is left.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 11.3 · Building strings into a buffer <span class="level">practice</span></h4>
+  <p>Write <code>fullName</code> with one <code>bufPrint</code>, <code>shoutWords</code> with a fixed writer (normalising spaces and upper-casing), and <code>money</code>, which inserts thousands separators. Every function takes the output buffer as a parameter and returns a slice of it. Name the file: <code>exercises/11-strings/ex3_build.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 11, exercise 3: building strings into a buffer.
+//! Run with:  zig test ex3_build.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// "Last, First" into buf.
+fn fullName(buf: []u8, first: []const u8, last: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}, {s}", .{ last, first });
+}
+
+/// The words of `line` joined by a single space, upper-cased, into buf.
+fn shoutWords(buf: []u8, line: []const u8) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    var first = true;
+    while (it.next()) |word| {
+        if (!first) try w.writeByte(' ');
+        first = false;
+        for (word) |c| try w.writeByte(std.ascii.toUpper(c));
+    }
+    return w.buffered();
+}
+
+/// A C-bills amount with thousands separators: 1234567 -&gt; "1,234,567".
+fn money(buf: []u8, amount: u64) ![]const u8 {
+    var digits: [20]u8 = undefined;
+    const d = try std.fmt.bufPrint(&amp;digits, "{d}", .{amount});
+    var w = std.Io.Writer.fixed(buf);
+    for (d, 0..) |c, i| {
+        const remaining = d.len - i;
+        if (i != 0 and remaining % 3 == 0) try w.writeByte(',');
+        try w.writeByte(c);
+    }
+    return w.buffered();
+}
+
+test "fullName" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Allard, Kai", try fullName(&amp;buf, "Kai", "Allard"));
+}
+
+test "fullName refuses a too-small buffer" {
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, fullName(&amp;buf, "Kai", "Allard"));
+}
+
+test "shoutWords" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("HIRE KAI NOW", try shoutWords(&amp;buf, "  hire   kai now "));
+    try std.testing.expectEqualStrings("", try shoutWords(&amp;buf, ""));
+}
+
+test "money" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0", try money(&amp;buf, 0));
+    try std.testing.expectEqualStrings("999", try money(&amp;buf, 999));
+    try std.testing.expectEqualStrings("1,000", try money(&amp;buf, 1000));
+    try std.testing.expectEqualStrings("1,234,567", try money(&amp;buf, 1234567));
+}</code></pre>
+  <p><code>money</code> first prints the digits into a small scratch array, then copies them out one at a time, inserting a comma whenever the number of digits still to come is a multiple of three. The second <code>fullName</code> test shows the buffer-too-small case turning into <code>error.NoSpaceLeft</code>, which <code>expectError</code> checks for.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 11.4 · Bytes are not characters <span class="level">challenge</span></h4>
+  <p>Write <code>charCount</code> (code points, not bytes), <code>takeChars</code> (the first <code>n</code> code points as a slice, never cutting a character), and <code>reverseAscii</code>, which refuses non-ASCII input rather than scrambling it. Name the file: <code>exercises/11-strings/ex4_utf8.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 11, exercise 4: bytes are not characters (challenge).
+//! Run with:  zig test ex4_utf8.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Number of code points, or error.Utf8InvalidStartByte for malformed input.
+fn charCount(s: []const u8) !usize {
+    return std.unicode.utf8CountCodepoints(s);
+}
+
+/// The first `n` code points of `s` (fewer if s is shorter), as a slice of s.
+/// Never cuts a multi-byte character in half.
+fn takeChars(s: []const u8, n: usize) ![]const u8 {
+    var view = try std.unicode.Utf8View.init(s);
+    var it = view.iterator();
+    var taken: usize = 0;
+    while (taken &lt; n) : (taken += 1) {
+        if (it.nextCodepointSlice() == null) break;
+    }
+    return s[0..it.i];
+}
+
+/// Reverse a string byte-by-byte into buf. Only valid for ASCII input,
+/// so refuse anything with a byte &gt;= 0x80.
+fn reverseAscii(buf: []u8, s: []const u8) ![]const u8 {
+    for (s) |c| {
+        if (c &gt;= 0x80) return error.NotAscii;
+    }
+    for (s, 0..) |c, i| buf[s.len - 1 - i] = c;
+    return buf[0..s.len];
+}
+
+test "charCount" {
+    try std.testing.expectEqual(@as(usize, 3), try charCount("Mëk"));
+    try std.testing.expectEqual(@as(usize, 4), "Mëk".len);
+    try std.testing.expectEqual(@as(usize, 0), try charCount(""));
+    try std.testing.expectError(error.Utf8InvalidStartByte, charCount("\xff"));
+}
+
+test "takeChars" {
+    try std.testing.expectEqualStrings("Më", try takeChars("Mëk", 2));
+    try std.testing.expectEqualStrings("Mëk", try takeChars("Mëk", 10));
+    try std.testing.expectEqualStrings("", try takeChars("Mëk", 0));
+}
+
+test "reverseAscii" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("salta", try reverseAscii(&amp;buf, "atlas"));
+    try std.testing.expectError(error.NotAscii, reverseAscii(&amp;buf, "Mëk"));
+}</code></pre>
+  <p><code>Utf8View.iterator()</code> keeps a byte offset in its <code>i</code> field; after stepping <code>n</code> code points, <code>s[0..it.i]</code> is a slice that ends on a character boundary. The test also documents that <code>"Mëk".len</code> is 4 while the character count is 3.</p></details>
+</div>
+
+<h3 id="ch11-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is the type of a string literal, and what does it coerce to? <details class="answer"><summary>Answer</summary><code>*const [N:0]u8</code>, a pointer to a zero-terminated constant byte array. It coerces to <code>[]const u8</code>, and to <code>[:0]const u8</code> if you want to keep the sentinel.</details></li>
+  <li>How do you compare two strings for equality? <details class="answer"><summary>Answer</summary><code>std.mem.eql(u8, a, b)</code>. <code>==</code> is a compile error ("cannot compare strings with ==").</details></li>
+  <li>What is the difference between <code>tokenizeScalar</code> and <code>splitScalar</code> on <code>"a,,b"</code> with <code>','</code>? <details class="answer"><summary>Answer</summary><code>tokenizeScalar</code> yields <code>a</code> and <code>b</code>; <code>splitScalar</code> yields <code>a</code>, an empty string, and <code>b</code>.</details></li>
+  <li>What does <code>std.mem.indexOf</code> return when the needle is absent? <details class="answer"><summary>Answer</summary><code>null</code>. Its return type is <code>?usize</code>, an optional index.</details></li>
+  <li>Why can a function not return the result of <code>bufPrint</code> into a local buffer? <details class="answer"><summary>Answer</summary>The result is a slice of the local array, which ceases to exist when the function returns. Let the caller pass the buffer in, or allocate.</details></li>
+  <li>What is <code>"Mëk".len</code>? <details class="answer"><summary>Answer</summary>4. <code>len</code> counts bytes; <code>ë</code> takes two bytes in UTF-8. <code>std.unicode.utf8CountCodepoints</code> gives 3.</details></li>
+  <li>Does <code>std.mem.trim</code> copy the string? <details class="answer"><summary>Answer</summary>No. It returns a shorter slice into the same bytes.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>There is no string type. A string is <code>[]const u8</code>; a literal is <code>*const [N:0]u8</code> and coerces to it.</li>
+<li>Compare with <code>std.mem.eql</code> or <code>std.ascii.eqlIgnoreCase</code>; order with <code>std.mem.order</code>.</li>
+<li>Search with <code>startsWith</code>, <code>endsWith</code>, <code>indexOf</code>, <code>indexOfScalar</code>, <code>lastIndexOfScalar</code>, <code>count</code>; positions come back as <code>?usize</code>.</li>
+<li>Trim with <code>std.mem.trim</code>; split with <code>tokenizeScalar</code> (collapses runs) or <code>splitScalar</code> (exact fields); <code>rest()</code> gives the remainder.</li>
+<li><code>std.ascii</code> has the per-byte helpers; <code>upperString</code> and friends write into a buffer you provide.</li>
+<li>Build new text with <code>std.fmt.bufPrint</code> or a fixed <code>std.Io.Writer</code> into a caller-owned buffer; too small is <code>error.NoSpaceLeft</code>. <code>allocPrint</code> comes with allocators.</li>
+<li>Literals are read-only; copy with <code>lit.*</code> to modify. Multi-line literals use <code>\\</code>.</li>
+<li><code>len</code> counts bytes. Use <code>std.unicode</code> when characters matter.</li>
+</ul></div>
+</section>

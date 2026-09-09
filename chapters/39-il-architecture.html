@@ -1,0 +1,244 @@
+<section id="ch39">
+<h2>39. The architecture in one picture</h2>
+<p class="goals"><strong>In this chapter</strong> you meet IRON LEDGER as a whole before you read any of its parts. You will learn the one rule the entire program is built around, see how the source tree enforces that rule, and learn the two doors through which every other part of the program talks to the simulation. By the end you will know where to look for anything.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> This chapter leans on <a href="#ch30">Chapter 30</a> (files, imports and modules: every Zig file is a struct, and a module has one root file), <a href="#ch31">Chapter 31</a> (the build system: <code>addModule</code>, <code>addExecutable</code>, <code>root_module</code>, build options), and <a href="#ch33">Chapter 33</a> (the <code>std.Io</code> value that all real-world I/O needs in 0.16). If <code>b.addAnonymousImport</code> or <code>init.io</code> look unfamiliar, skim those chapters first. Everything else here is prose and a map.</div>
+
+<h3 id="ch39-1">39.1 What you are about to read</h3>
+<p>IRON LEDGER is a single-player BattleTech mercenary-company simulator. You are the commander of an outfit, not a pilot: every screen is a roster, a ledger, a map or a report, and battles are resolved by the simulation from the state you prepared beforehand (training, maintenance, supply, morale). The whole thing is about 31,500 lines of Zig 0.16 with no libraries beyond the system's SQLite. It was built in stages over a few weeks by one person and a coding assistant, and its history is visible in the comments: many of them say which stage introduced a rule and why.</p>
+<p>That size is the point of Part 5. A 200-line example program cannot show you how a language feels at scale; a 31,000-line one can. Every chapter from here to the end takes one slice of the program, shows you the real code, tells you which functions to open and in what order, and gives you exercises that you carry out inside the repository with the compiler and the test suite as your safety net.</p>
+<p>Before you start, run the suite once in a copy of the game so that you know what green looks like:</p>
+<pre class="term">$ cp -r game /tmp/il &amp;&amp; cd /tmp/il
+$ zig build test --summary all
+Build Summary: 10/10 steps succeeded; 246/247 tests passed (1 skipped)</pre>
+<p>Work in the copy. The exercises in Part 5 ask you to change the game, and a copy lets you experiment without fear. (The original guide this Part is adapted from was written at an earlier commit with 224 tests; the count has since grown, and a few numbers in the guide's prose have drifted. This book was checked against the source as it stands today, commit <code>8958001</code>.)</p>
+
+<h3 id="ch39-2">39.2 The source tree</h3>
+<p>Here is the whole repository at the directory level, with the one distinction that matters marked on the right:</p>
+<pre class="term">src/
+├── domain/     entities and rule tables: person, unit, chassis, contract, hq, tuning …   (pure)
+├── sim/        state, the daily tick, commands, queries, battle, medical, personnel …    (pure)
+├── econ/       finance, markets, logistics                                               (pure)
+├── gen/        company and person generators                                             (pure)
+├── persist/    sqlite.zig (C binding) and store.zig (save/load, migrations)              (I/O)
+├── tui/        term.zig, screen.zig, app.zig, emblem.zig, png.zig, music.zig, splash.zig, paths.zig  (I/O)
+├── root.zig    the `game` module: re-exports everything above except tui/
+└── main.zig    the executable: flags, the REPL, the demo, and the hand-off to tui/app.zig
+data/
+├── chassis.zon  planets.zon  parts.zon
+└── tables/      tuning.zon meklab.zon names.zon ranks.zon awards.zon abilities.zon
+                 rat.zon factions.zon scenarios.zon terrain.zon difficulty.zon</pre>
+<p>Four directories are marked <em>pure</em>. That word has a precise meaning here, stated in the game's <code>ARCHITECTURE.md</code> and repeated in <code>CLAUDE.md</code> as a hard rule:</p>
+<blockquote><p>Sim core (<code>src/domain</code>, <code>src/sim</code>, <code>src/econ</code>, <code>src/gen</code>) is pure and deterministic: no I/O, no wall clock, no global mutable state.</p></blockquote>
+<p>Given the same starting seed and the same sequence of player commands, two runs of the simulation produce byte-for-byte identical state. Everything else in the program's design is a consequence of wanting that to be true and wanting it to <em>stay</em> true as the code grows. Keep the rule in mind as you read; each of the next chapters will show you one thing it forces.</p>
+
+<h3 id="ch39-3">39.3 How a directory becomes a promise</h3>
+<p>A rule in a document is only a wish. What makes this one hold is the module layout in <code>build.zig</code>. <a href="#ch31">Chapter 31</a> taught you that a Zig program is one or more <em>modules</em>, each a tree of files with a single root. IRON LEDGER has two:</p>
+<div class="file">build.zig (trimmed; the real file is heavily commented)</div>
+<pre><code>const mod = b.addModule("game", .{
+    .root_source_file = b.path("src/root.zig"),
+    .target = target,
+});
+// … the .zon data files are attached to `mod` here (Chapter 40) …
+mod.link_libc = true;
+mod.linkSystemLibrary("sqlite3", .{});
+
+const exe = b.addExecutable(.{
+    .name = "game",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &amp;.{
+            .{ .name = "game", .module = mod },
+        },
+    }),
+});
+b.installArtifact(exe);</code></pre>
+<p>The library module <code>game</code> is rooted at <code>src/root.zig</code>, and the executable is rooted at <code>src/main.zig</code>, which imports the library by the name given in the <code>.imports</code> list. Now look at what <code>root.zig</code> re-exports:</p>
+<div class="file">src/root.zig (the shape; some lines omitted)</div>
+<pre><code>//! Module root for the simulation core. See ARCHITECTURE.md.
+//! The core is pure and deterministic: no I/O, no wall clock, no globals.
+
+const std = @import("std");
+
+// domain/ — entities
+pub const types = @import("domain/types.zig");
+pub const person = @import("domain/person.zig");
+pub const unit = @import("domain/unit.zig");
+pub const chassis = @import("domain/chassis.zig");
+pub const tuning = @import("domain/tuning.zig");
+// … fifteen more domain files …
+
+// sim/ — state, time, randomness, events, battle resolution
+pub const state = @import("sim/state.zig");
+pub const tick = @import("sim/tick.zig");
+pub const commands = @import("sim/commands.zig");
+pub const queries = @import("sim/queries.zig");
+pub const cli = @import("sim/cli.zig");
+// …
+
+// persist/ — SQLite save files (Stage 11)
+pub const sqlite = @import("persist/sqlite.zig");
+pub const store = @import("persist/store.zig");
+
+// econ/, gen/ …
+
+test {
+    std.testing.refAllDecls(@This());
+}</code></pre>
+<p>There is no <code>tui</code> line. The terminal client lives outside the <code>game</code> module entirely; it is part of the executable's module, reached from <code>main.zig</code> with <code>@import("tui/app.zig")</code>. That means the simulation cannot import the client even by accident, because the file is not in its module. The dependency points one way.</p>
+<p>The purity rule has a second, quieter enforcement that <a href="#ch33">Chapter 33</a> prepared you for. In Zig 0.16, anything that touches the outside world needs an <code>std.Io</code> value: opening a file, reading the clock, spawning a process. The executable receives one in <code>main</code> and hands it to the client and to the save store. It never hands one to the simulation. A function in <code>src/sim</code> that wanted to read the time would have no <code>io</code> to read it with. As the original guide put it: purity is not a promise in a comment; it is a parameter that is not there.</p>
+<div class="try"><strong>Try it.</strong> In your copy of the game, run
+<pre class="term">$ grep -rlE 'std\.Io|std\.posix|std\.fs\.|Clock\.now|std\.time' src/sim src/domain src/econ src/gen</pre>
+It prints nothing. Now run the same search over <code>src/tui src/persist src/main.zig</code> and you get eight files. That is the boundary, visible from the shell.</div>
+<p>One exception is worth knowing about now so it does not surprise you later: <code>persist/</code> is inside the <code>game</code> module (so tests can round-trip a campaign through SQLite), but it does I/O. It talks to the C library directly rather than through <code>std.Io</code>, which is why the grep above does not flag it. The store is not part of the simulation; it reads a <code>GameState</code> and writes one, and nothing in <code>sim/</code> imports it.</p>
+
+<h3 id="ch39-4">39.4 The picture</h3>
+<p><code>ARCHITECTURE.md</code> draws the layers like this:</p>
+<pre class="term">┌─────────────────────────────────────────────────────┐
+│  Frontends: CLI (REPL, demo) and the terminal client │
+└──────────────────────┬──────────────────────────────┘
+                       │ Commands in / Queries out
+┌──────────────────────▼──────────────────────────────┐
+│  Simulation core (pure, deterministic)              │
+│   sim/    clock, daily pipeline, events, autoresolve│
+│   domain/ person, unit, part, force, contract, hq   │
+│   econ/   finance, markets, logistics network       │
+│   gen/    company/person/name generation            │
+├─────────────────────────────────────────────────────┤
+│  data/   static game data loaded from .zon files    │
+├─────────────────────────────────────────────────────┤
+│  persist/  SQLite save files, schema migrations     │
+└─────────────────────────────────────────────────────┘</pre>
+<p>Read the arrow in the middle carefully, because it names the two doors. A frontend changes the simulation by building a <code>Command</code> value (a tagged union, <a href="#ch14">Chapter 14</a>) and passing it to <code>commands.execute</code>. A frontend reads the simulation by calling a function in <code>queries.zig</code>, which returns plain data: formatted strings plus the IDs a key handler will need. There is a third, smaller door shared by both frontends: <code>cli.parseCommand</code> turns a typed line of text into a <code>Command</code>, so a verb added for the REPL works in the terminal client's <code>:</code> line for free.</p>
+<p>Here is that hand-off in the executable's <code>main</code>, which is the only place in the program that sees all three layers at once:</p>
+<div class="file">src/main.zig</div>
+<pre><code>pub fn main(init: std.process.Init) !void {
+    var gs = game.state.GameState.init(init.gpa, .{ .seed = 3025 });
+    defer gs.deinit();
+
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.next(); // exe name
+    var repl = false;
+    var tui = false;
+    var ascii = false;
+    var no_splash = false;
+    var no_music = false;
+    var data_dir: ?[]const u8 = null;
+    var store_arg: ?[:0]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--repl")) repl = true;
+        if (std.mem.eql(u8, arg, "--tui")) tui = true;
+        if (std.mem.eql(u8, arg, "--ascii")) ascii = true;
+        if (std.mem.eql(u8, arg, "--no-splash")) no_splash = true;
+        if (std.mem.eql(u8, arg, "--no-music")) no_music = true;
+        if (std.mem.eql(u8, arg, "--store")) store_arg = args.next() orelse store_arg;
+        if (std.mem.eql(u8, arg, "--data")) data_dir = args.next() orelse data_dir;
+    }
+
+    // Without --store the save lives beside the binary in a source tree and
+    // in the per-user data directory for an installed copy (tui/paths.zig).
+    const store_path = store_arg orelse
+        try paths.defaultStore(init.io, init.arena.allocator(), init.environ_map);
+
+    if (tui) {
+        try @import("tui/app.zig").run(init.io, init.gpa, init.environ_map, store_path,
+            .{ .ascii = ascii, .no_splash = no_splash, .no_music = no_music, .data_dir = data_dir });
+    } else if (repl) {
+        try runRepl(&amp;gs, init.io, init.gpa, store_path);
+    } else {
+        try runDemo(&amp;gs);
+    }
+}</code></pre>
+<p>Compare this with the <code>main</code> you wrote in <a href="#ch32">Chapter 32</a>: the same <code>std.process.Init</code>, the same argument iterator, the same pattern of flags. What is new is only the scale of what it hands off to. Notice also where <code>init.io</code> goes: into the client and the REPL, both of which need files and a terminal, and not into <code>GameState.init</code>, which gets an allocator and a seed.</p>
+
+<h3 id="ch39-5">39.5 Four consequences of the one rule</h3>
+<p>Each of the next chapters is, at bottom, a study of one thing the purity rule forces. Here they are in one place so you can see the shape of Part 5:</p>
+<ul>
+<li><strong>Randomness is a value inside the state.</strong> There is no global random generator. <code>GameState</code> carries a bag of seeded generators, one per subsystem, and every dice roll names the stream it draws from. <a href="#ch41">Chapter 41</a>.</li>
+<li><strong>Time is an integer.</strong> The campaign clock is <code>day_index: u32</code>, days since the campaign began. The calendar date exists too, but only so it can be printed and so that "the first of the month" is easy to detect. Nobody reads a wall clock. <a href="#ch43">Chapter 43</a>.</li>
+<li><strong>Money is an integer.</strong> Every amount is a 64-bit count of C-bills, every multiplier is basis points, and there is not one floating-point number in the rules. Two machines produce the same balance to the C-bill. <a href="#ch45">Chapter 45</a>.</li>
+<li><strong>The state is one tree with one owner.</strong> A single arena allocator owns every allocation a campaign makes and frees them all in one call, so the domain code has no destructors and no use-after-free. <a href="#ch41">Chapter 41</a>.</li>
+</ul>
+<p>The payoff for all of it is a single test in <a href="#ch49">Chapter 49</a>: two campaigns, same seed, same script, must hash identically. It is cheap, it runs on every build, and it catches a whole class of bugs (an unordered hash map iteration, a stray PRNG, a wall-clock read) that would otherwise surface as "saved games replay differently after an update".</p>
+
+<h3 id="ch39-6">39.6 A note on reading large code</h3>
+<p>You will not read all 31,000 lines and you should not try. The files are long because the game is detailed, not because the code is dense: <code>queries.zig</code> is four thousand lines mostly because there are many screens, each of which formats many columns. The skill to practise in Part 5 is <em>navigating</em>: opening a file, finding the top-level declarations with a search for <code>pub fn</code> or <code>pub const</code>, reading one function end to end, and following one call into another file when you need to.</p>
+<p>Two habits help. First, every file opens with a <code>//!</code> comment saying what it is and, by house rule, which MekHQ class it mirrors; read that before anything else. Second, the test blocks at the bottom of each file are the best documentation of what the code is <em>for</em>; a test named "tier upgrade: refusals keep the money" tells you the rule and the bug it once had in one line.</p>
+
+<h3 id="ch39-reading">Guided reading</h3>
+<p>Open these in order. Each is short; the whole list is twenty minutes.</p>
+<ol>
+<li><code>ARCHITECTURE.md</code>, sections 1 and 4 only (the design pillars and the layer diagram). Note the phrase "pure and deterministic" and the list of player actions as commands.</li>
+<li><code>CLAUDE.md</code>, the "Hard rules" list. These are the rules the exercises in Part 5 will ask you to respect; most of them will make more sense after the chapter that covers them.</li>
+<li><code>build.zig</code>, skipping the long comments on first read. Find <code>addModule("game"</code>, the <code>data_files</code> table, <code>linkSystemLibrary("sqlite3"</code>, and the <code>test</code> step. Notice that the test step also depends on the install step: a green test run means the client compiled too, and the comment above it records the day that stopped being true by accident.</li>
+<li><code>src/root.zig</code>, top to bottom. Count the re-exports (there are more than forty) and confirm that none of them mentions <code>tui</code>. Read the small <code>dataProvenance</code> function in the middle: it is the first real function of the codebase you meet, and it uses only things you learned in <a href="#ch21">Chapter 21</a> and <a href="#ch23">Chapter 23</a>.</li>
+<li><code>src/main.zig</code>, the <code>main</code> function and the small <code>test</code> block above it that pulls the <code>tui/</code> files into the executable's test build. Skim <code>runDemo</code> to see what a scripted campaign looks like: it is nothing but <code>execute</code> calls and prints.</li>
+</ol>
+
+<h3 id="ch39-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 39.1 · Prove the boundary from the shell <span class="level">warm-up</span></h4>
+<p>Without reading any code, use <code>grep</code> to find every file in <code>src/</code> that mentions <code>std.Io</code> or <code>std.posix</code>, and every file that mentions <code>commands.execute</code>. From the two lists, write one sentence describing which directories do I/O and which directories may change the simulation.</p>
+<details class="answer"><summary>Solution</summary>
+<pre class="term">$ grep -rlE 'std\.Io|std\.posix' src
+src/tui/emblem.zig
+src/tui/term.zig
+src/tui/music.zig
+src/tui/app.zig
+src/tui/paths.zig
+src/tui/png.zig
+src/tui/screen.zig
+src/main.zig
+$ grep -rl 'commands.execute' src
+src/main.zig
+src/tui/app.zig
+src/persist/store.zig
+src/sim/commands.zig
+src/sim/queries.zig
+src/sim/…  (a handful of sim files, all inside test blocks)</pre>
+<p>I/O happens only in <code>src/tui</code> and <code>src/main.zig</code> (plus the C calls in <code>src/persist</code>, which are not <code>std.Io</code>). Outside of tests, the simulation is changed only from <code>main.zig</code> and <code>tui/app.zig</code>, and always through <code>commands.execute</code>. Nearly every hit in <code>src/sim</code> and <code>src/persist</code> is inside a <code>test</code> block driving a small campaign, or in a helper those tests share.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 39.2 · A test that guards the boundary <span class="level">practice</span></h4>
+<p>Add a test at the bottom of <code>src/root.zig</code> that uses reflection (<a href="#ch27">Chapter 27</a>) to check two things: the module root has at least forty public declarations, and it has no declaration named <code>tui</code>. Run <code>zig build test</code>.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "the module root re-exports at least forty namespaces" {
+    const decls = @typeInfo(@This()).@"struct".decls;
+    try std.testing.expect(decls.len &gt;= 40);
+    // The client is not one of them: the core cannot reach the terminal.
+    try std.testing.expect(!@hasDecl(@This(), "tui"));
+}</code></pre>
+<p><code>@This()</code> is the struct that is <code>root.zig</code> itself (every file is a struct, <a href="#ch30">Chapter 30</a>). <code>@typeInfo(...).@"struct".decls</code> lists its public declarations at compile time, so <code>decls.len</code> is a constant. <code>@hasDecl</code> is the direct way to ask about one name. If someone later adds <code>pub const tui = @import("tui/app.zig");</code> to the root, this test fails and names the reason.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 39.3 · Trace one command from the shell to the state <span class="level">practice</span></h4>
+<p>Starting from <code>runDemo</code> in <code>src/main.zig</code>, follow the very first <code>execute</code> call (<code>.create_commander</code>) as far as you can into the simulation using only "find the definition" jumps. List the files you pass through, in order, and stop when you reach the function that actually creates the commander.</p>
+<details class="answer"><summary>Solution</summary>
+<ol>
+<li><code>src/main.zig</code>: <code>runDemo</code> calls <code>game.commands.execute(gs, .{ .create_commander = … })</code>.</li>
+<li><code>src/sim/commands.zig</code>: <code>execute</code> switches on the union; the <code>.create_commander</code> arm refuses a start year outside 3000 to 3060 (<code>Error.BadYear</code>), sets the calendar year, calls <code>gs.createCommander(c.name, c.origin, c.profession)</code>, names the outfit after the commander if it still has the placeholder name, and opens the markets.</li>
+<li><code>src/sim/state.zig</code>: <code>GameState.createCommander</code> refuses a second commander, picks the home world with <code>planet_mod.weightedPickByFaction(&amp;self.rng, origin.key())</code> (a dice roll from the state's own generator bag, <a href="#ch41">Chapter 41</a>), builds a regional HQ with eight starter facilities, recruits its back-office staff with <code>recruitGenerated</code>, and hands it founding capital through <code>transferFunds</code>.</li>
+<li>Along the way it reaches into <code>src/domain/commander.zig</code> (the <code>Faction</code> and <code>Profession</code> enums), <code>src/domain/planet.zig</code> (the star map) and <code>src/domain/hq.zig</code> (the HQ struct and its facilities).</li>
+</ol>
+<p>The point of the exercise is the shape of the path: an executable file, then the one <code>execute</code> switch, then a method on <code>GameState</code>, then the domain. You will see that same shape for every command in <a href="#ch42">Chapter 42</a>.</p></details>
+</div>
+
+<h3 id="ch39-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>Name the two modules in <code>build.zig</code> and the root file of each. <details class="answer"><summary>Answer</summary>The library module <code>game</code>, rooted at <code>src/root.zig</code>, and the executable's module, rooted at <code>src/main.zig</code>, which imports <code>game</code> by name.</details></li>
+<li>Why can code in <code>src/sim</code> not open a file, even if a programmer tried? <details class="answer"><summary>Answer</summary>Opening a file in 0.16 requires an <code>std.Io</code> value. <code>main</code> passes <code>init.io</code> only to the client and the REPL; no function in the simulation core receives one, so there is nothing to call <code>openFile</code> with.</details></li>
+<li>What are the two doors between a frontend and the simulation? <details class="answer"><summary>Answer</summary><code>commands.execute(gs, cmd)</code> to change state, and the functions in <code>queries.zig</code> to read it as formatted rows plus IDs. (<code>cli.parseCommand</code> is a helper that produces commands from text; it does not touch state.)</details></li>
+<li>Where does the terminal client live, and why is that placement significant? <details class="answer"><summary>Answer</summary>In <code>src/tui/</code>, which is not re-exported by <code>root.zig</code>; it belongs to the executable's module. The simulation therefore cannot import it, so the dependency can only point from client to core.</details></li>
+<li>List the four consequences of the determinism rule that later chapters cover. <details class="answer"><summary>Answer</summary>Randomness lives inside the state as named streams; time is an integer day counter; money is integer C-bills with basis-point multipliers; the state is one tree owned by one arena.</details></li>
+<li>Which test summarises the whole architecture, and what does it assert? <details class="answer"><summary>Answer</summary>The golden-master test in <code>commands.zig</code>: two campaigns with the same seed and the same command script must produce the same <code>gs.hash()</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>IRON LEDGER is organised around one rule: the simulation core is a pure, deterministic function of its seed and its command history.</li>
+<li>The rule is enforced by the module layout (<code>tui/</code> is outside the <code>game</code> module) and by the absence of an <code>std.Io</code> parameter anywhere in the core.</li>
+<li>Frontends change state only through <code>commands.execute</code> and read it only through <code>queries.*</code>; <code>cli.parseCommand</code> is shared by both frontends.</li>
+<li>Randomness, time, money and memory ownership are each shaped by the rule; the golden-master test guards it.</li>
+<li>Read large code by navigating, not by scanning: file header comments and test names tell you what things are for.</li>
+</ul></div>
+</section>

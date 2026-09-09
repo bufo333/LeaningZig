@@ -1,0 +1,567 @@
+<section id="ch09">
+<h2>9. Arrays</h2>
+<p class="goals"><strong>In this chapter</strong> you will meet Zig's simplest collection: the fixed-length array. You will learn how its length is part of its type, how indexing is checked, how to loop over it, build it with repetition and concatenation, nest it, copy it, compare it, and pass it to functions. Arrays are the ground that slices (<a href="#ch10">Chapter 10</a>) and strings (<a href="#ch11">Chapter 11</a>) stand on, so this chapter is slow on purpose.</p>
+
+<h3 id="ch09-1">9.1 A fixed number of things</h3>
+<p>An array is a block of values of one type, sitting next to each other in memory, whose count is fixed when the program is compiled. A lance in BattleTech is four meks; their tonnages fit in a four-element array of bytes.</p>
+<p class="file">basics.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lance: [4]u8 = .{ 55, 65, 70, 50 }; // tonnage of four meks
+    std.debug.print("first: {d}\n", .{lance[0]});
+    std.debug.print("last: {d}\n", .{lance[3]});
+    std.debug.print("length: {d}\n", .{lance.len});
+}</code></pre>
+<pre class="term">first: 55
+last: 50
+length: 4</pre>
+<p>Read the type <code>[4]u8</code> as "four <code>u8</code>". The number is part of the type: <code>[4]u8</code> and <code>[5]u8</code> are different types, as different as <code>u8</code> and <code>i32</code>. That is the single most important fact about arrays in Zig, and most of this chapter follows from it.</p>
+<p>Elements are numbered from zero. <code>lance[0]</code> is the first, <code>lance[3]</code> the last. <code>lance.len</code> is the count, and because the count is in the type, the compiler knows it without looking at the data.</p>
+<p>The initialiser <code>.{ 55, 65, 70, 50 }</code> is an anonymous list literal; it takes the type <code>[4]u8</code> from the declaration. When the type is not written anywhere, spell the element type and let Zig count for you with <code>[_]</code>:</p>
+<p class="file">infer.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a = [_]u8{ 55, 65, 70, 50 }; // type is [4]u8, length counted for you
+    const b = [4]u8{ 55, 65, 70, 50 }; // same thing, spelled out
+    std.debug.print("{any}\n", .{@TypeOf(a)});
+    std.debug.print("{any}\n", .{@TypeOf(b)});
+    std.debug.print("{any}\n", .{a});
+}</code></pre>
+<pre class="term">[4]u8
+[4]u8
+{ 55, 65, 70, 50 }</pre>
+<p><code>[_]u8{ ... }</code> is what you will write most of the time. It is the same array; you have only asked the compiler to count the elements. <code>@TypeOf</code> confirms both are <code>[4]u8</code>. Printing an array with <code>{any}</code> gives you the braces-and-commas form, which is handy while learning.</p>
+<div class="note"><strong>Coming from Python or JavaScript?</strong> A Python list or JS array grows and shrinks and can hold mixed types. A Zig array is closer to a C array or a NumPy fixed-shape buffer: one type, one size, chosen up front. The growable kind exists too, it is called <code>ArrayList</code> and needs an allocator (<a href="#ch21">Chapter 21</a>). Zig makes you choose, because the growable one costs heap memory and the fixed one costs nothing.</div>
+
+<h3 id="ch09-2">9.2 Indexing is checked</h3>
+<p>What happens if you ask for <code>lance[4]</code> in a four-element array? In C you get whatever bytes happen to sit after the array, silently. In Zig you get stopped. When the index is a plain number the compiler catches it before the program exists:</p>
+<p class="file">bounds_ct.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lance = [_]u8{ 55, 65, 70, 50 };
+    std.debug.print("{d}\n", .{lance[4]});
+}</code></pre>
+<pre class="term">bounds_ct.zig:5:38: error: index 4 outside array of length 4
+    std.debug.print("{d}\n", .{lance[4]});
+                                     ^
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>When the index is only known while running, the check happens then. Here is a loop with the classic off-by-one bug, <code>&lt;=</code> instead of <code>&lt;</code>:</p>
+<p class="file">bounds.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lance = [_]u8{ 55, 65, 70, 50 };
+    var i: usize = 0;
+    while (i &lt;= lance.len) : (i += 1) {
+        std.debug.print("mek {d}: {d} tons\n", .{ i, lance[i] });
+    }
+}</code></pre>
+<pre class="term">mek 0: 55 tons
+mek 1: 65 tons
+mek 2: 70 tons
+mek 3: 50 tons
+thread 5967202 panic: index out of bounds: index 4, len 4
+ch09/bounds.zig:7:59: in main (bounds)
+        std.debug.print("mek {d}: {d} tons\n", .{ i, lance[i] });
+                                                          ^
+&lt;zig&gt;/lib/std/start.zig:698:59: in callMain (bounds)
+    if (fn_info.params.len == 0) return wrapMain(root.main());
+                                                          ^
+???:?:?: in start (/usr/lib/dyld)</pre>
+<p>Four lines print, then the program <em>panics</em>: it stops with a message and a stack trace instead of reading memory that is not yours. <code>index 4, len 4</code> says exactly what went wrong, and the first trace line names your file and column. This runtime check is on in the default Debug build and in ReleaseSafe; ReleaseFast turns it off for speed. While learning, leave it on.</p>
+<div class="warn"><strong>Index type is <code>usize</code>.</strong> The variable <code>i</code> above is declared <code>usize</code>, an unsigned integer as wide as a memory address. Array indexes must be <code>usize</code>; if you try to index with an <code>i32</code> or a <code>u8</code> the compiler asks you to cast it with <code>@intCast</code>. Declare loop counters that index arrays as <code>usize</code> from the start and you avoid the whole conversation.</div>
+
+<h3 id="ch09-3">9.3 Looping over an array</h3>
+<p>You met <code>for</code> in <a href="#ch06">Chapter 6</a>. Its most common job is walking an array, and it never goes out of bounds because it reads the length from the type:</p>
+<p class="file">iter.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lance = [_]u8{ 55, 65, 70, 50 };
+
+    var total: u32 = 0;
+    for (lance) |tons| {
+        total += tons;
+    }
+    std.debug.print("total tonnage: {d}\n", .{total});
+
+    for (lance, 0..) |tons, i| {
+        std.debug.print("slot {d}: {d} tons\n", .{ i, tons });
+    }
+}</code></pre>
+<pre class="term">total tonnage: 240
+slot 0: 55 tons
+slot 1: 65 tons
+slot 2: 70 tons
+slot 3: 50 tons</pre>
+<p>The first loop captures each element as <code>tons</code>. The second adds <code>0..</code> as a second thing to iterate, which yields the index alongside the element; <code>i</code> is a <code>usize</code> here without you saying so. Note that <code>total</code> is a <code>u32</code>, not a <code>u8</code>: four bytes can add up past 255, and Zig would panic on the overflow rather than wrap (<a href="#ch04">Chapter 4</a>). Choose the accumulator type with the sum in mind, not the elements.</p>
+<p>To change elements as you go, you need two things: a <code>var</code> array, and a loop over <code>&amp;array</code> that captures a <em>pointer</em> to each element:</p>
+<p class="file">mutate.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var armor = [_]u8{ 10, 10, 10 };
+    armor[1] = 3; // one element
+    for (&amp;armor) |*a| { // every element, through a pointer
+        a.* += 1;
+    }
+    std.debug.print("{any}\n", .{armor});
+}</code></pre>
+<pre class="term">{ 11, 4, 11 }</pre>
+<p><code>for (&amp;armor) |*a|</code> reads: for each element of the array behind this pointer, give me a pointer <code>a</code> to it. <code>a.*</code> is the element itself; <code>a.* += 1</code> changes it in place. Without the <code>&amp;</code> and the <code>*</code>, <code>a</code> would be a <em>copy</em> of each element and changing it would do nothing to the array. Pointers get their own chapter (<a href="#ch18">Chapter 18</a>); for now, memorise this shape.</p>
+<p>And if the array is a <code>const</code>, nothing can change it:</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const armor = [_]u8{ 10, 10, 10 };
+    armor[1] = 3;
+    std.debug.print("{any}\n", .{armor});
+}</code></pre>
+<pre class="term">mutate_const.zig:5:10: error: cannot assign to constant
+    armor[1] = 3;
+    ~~~~~^~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+
+<h3 id="ch09-4">9.4 Arrays of arrays</h3>
+<p>An array's element type can itself be an array. That gives you grids, boards and tables with no extra machinery.</p>
+<p class="file">multi.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    // A 3-by-3 board: three rows, each a row of three bytes.
+    var board: [3][3]u8 = .{
+        .{ '.', '.', '.' },
+        .{ '.', 'X', '.' },
+        .{ '.', '.', '.' },
+    };
+    board[0][2] = 'O';
+
+    for (board) |row| {
+        for (row) |cell| std.debug.print("{c}", .{cell});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("rows: {d}, cols: {d}\n", .{ board.len, board[0].len });
+}</code></pre>
+<pre class="term">..O
+.X.
+...
+rows: 3, cols: 3</pre>
+<p>Read <code>[3][3]u8</code> from the outside in: three of (three <code>u8</code>). <code>board[1]</code> is a whole row, itself a <code>[3]u8</code>; <code>board[1][1]</code> is the byte in the middle. The nested literal mirrors the type, one <code>.{ ... }</code> per row. The outer <code>for</code> hands you each row and the inner one each cell.</p>
+<p>The <code>{c}</code> format prints a <code>u8</code> as a character rather than a number, which is why the board looks like a board.</p>
+
+<h3 id="ch09-5">9.5 Building arrays: <code>**</code> and <code>++</code></h3>
+<p>Two operators work on arrays when their contents are known at compile time. <code>**</code> repeats an array, and <code>++</code> joins two arrays end to end.</p>
+<p class="file">repeat.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const zeros = [_]u32{0} ** 6; // six zeros
+    const ab = [_]u8{ 'a', 'b' } ** 3; // a b a b a b
+    const joined = [_]u8{ 1, 2 } ++ [_]u8{ 3, 4, 5 };
+    std.debug.print("{any}\n", .{zeros});
+    std.debug.print("{s}\n", .{&amp;ab});
+    std.debug.print("{any} len {d}\n", .{ joined, joined.len });
+    const line = "-" ** 20;
+    std.debug.print("{s}\n", .{line});
+}</code></pre>
+<pre class="term">{ 0, 0, 0, 0, 0, 0 }
+ababab
+{ 1, 2, 3, 4, 5 } len 5
+--------------------</pre>
+<p><code>[_]u32{0} ** 6</code> is the idiom for "an array of six zeros", and you will see it in IRON LEDGER for counters. <code>++</code> produces a new array whose length is the sum. Both need the operands to be compile-time known; you cannot <code>++</code> two arrays that were filled in at runtime (for that you copy into a buffer, which <a href="#ch10">Chapter 10</a> shows).</p>
+<p>The last line shows that string literals are arrays too, so <code>"-" ** 20</code> builds a twenty-dash line at compile time. This is a favourite for drawing borders.</p>
+
+<h3 id="ch09-6">9.6 <code>undefined</code>: reserve now, fill later</h3>
+<p>Sometimes you want the space for an array but do not have the values yet, because a later loop or a formatting call will write them. Initialise with <code>undefined</code>:</p>
+<p class="file">undef.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var buf: [8]u8 = undefined; // reserved, but holds garbage until written
+    for (&amp;buf, 0..) |*b, i| {
+        b.* = @intCast('a' + i);
+    }
+    std.debug.print("{s}\n", .{&amp;buf});
+}</code></pre>
+<pre class="term">abcdefgh</pre>
+<p><code>undefined</code> means "I promise to write this before I read it". Zig does not zero the memory for you; in Debug builds it fills it with the byte <code>0xAA</code> so that a forgotten write shows up as obvious garbage rather than a lucky zero. You will use <code>var buf: [N]u8 = undefined;</code> constantly as scratch space for building text.</p>
+<p>The <code>@intCast</code> on <code>'a' + i</code> is needed because <code>i</code> is a <code>usize</code>, so the sum is a <code>usize</code>, and the element type is <code>u8</code>. The cast says "I know this fits"; in Debug it checks.</p>
+<div class="warn"><strong>Reading <code>undefined</code> is a bug, not an error.</strong> The compiler cannot always tell that you read before writing. If your output contains repeated <code>170</code> (that is <code>0xAA</code>) where you expected real values, look for an <code>undefined</code> array that a code path forgot to fill.</div>
+
+<h3 id="ch09-7">9.7 Assignment copies</h3>
+<p>An array is a value, like an integer. Assigning it, or passing it to a function, copies all of it.</p>
+<p class="file">copy.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const original = [_]u8{ 1, 2, 3 };
+    var copy = original; // a full copy, not a reference
+    copy[0] = 99;
+    std.debug.print("original: {any}\n", .{original});
+    std.debug.print("copy:     {any}\n", .{copy});
+}</code></pre>
+<pre class="term">original: { 1, 2, 3 }
+copy:     { 99, 2, 3 }</pre>
+<p>If you are used to Python, where <code>b = a</code> makes two names for one list, this is the opposite. There is no sharing unless you ask for it with a pointer or a slice. For small arrays this is exactly what you want; for a <code>[1_000_000]u8</code> it is a million bytes moved, and you would pass a pointer instead (next section).</p>
+
+<h3 id="ch09-8">9.8 Comparing arrays</h3>
+<p>There is no <code>==</code> for arrays:</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a = [_]u8{ 1, 2, 3 };
+    const b = [_]u8{ 1, 2, 3 };
+    std.debug.print("{}\n", .{a == b});
+}</code></pre>
+<pre class="term">eql_op.zig:6:33: error: operator == not allowed for type '[3]u8'
+    std.debug.print("{}\n", .{a == b});
+                              ~~^~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>Zig keeps operators for things that are one machine instruction, or close to it; comparing a hundred elements is a loop, so it is a function. The function is <code>std.mem.eql</code>, and it takes the element type first, then two arrays by reference:</p>
+<p class="file">eql.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a = [_]u8{ 1, 2, 3 };
+    const b = [_]u8{ 1, 2, 3 };
+    const c = [_]u8{ 1, 2, 4 };
+    std.debug.print("a == b: {}\n", .{std.mem.eql(u8, &amp;a, &amp;b)});
+    std.debug.print("a == c: {}\n", .{std.mem.eql(u8, &amp;a, &amp;c)});
+    // Arrays of the same type can also be compared with == directly? Let's see.
+}</code></pre>
+<pre class="term">a == b: true
+a == c: false</pre>
+<p>The <code>&amp;</code> matters: <code>std.mem.eql</code> takes slices, and <code>&amp;array</code> turns an array into a slice of the whole thing. That coercion is the bridge to the next chapter. In tests, <code>std.testing.expectEqual</code> compares two arrays element by element, so <code>expectEqual([3]u8{ 1, 2, 3 }, arr)</code> works there without <code>eql</code>.</p>
+
+<h3 id="ch09-9">9.9 Passing arrays to functions</h3>
+<p>Because the length is part of the type, a function parameter of type <code>[4]u8</code> accepts exactly four-element arrays and nothing else. And because arrays are values, the function receives a copy.</p>
+<p class="file">pass.zig</p>
+<pre><code>const std = @import("std");
+
+fn sumByValue(xs: [4]u8) u32 {
+    var t: u32 = 0;
+    for (xs) |x| t += x;
+    return t;
+}
+
+fn bumpByValue(xs: [4]u8) void {
+    var local = xs;
+    local[0] += 1; // changes the copy only
+}
+
+fn bumpByPointer(xs: *[4]u8) void {
+    xs[0] += 1; // changes the caller's array
+}
+
+pub fn main() void {
+    var lance = [_]u8{ 55, 65, 70, 50 };
+    std.debug.print("sum: {d}\n", .{sumByValue(lance)});
+    bumpByValue(lance);
+    std.debug.print("after by value:   {any}\n", .{lance});
+    bumpByPointer(&amp;lance);
+    std.debug.print("after by pointer: {any}\n", .{lance});
+}</code></pre>
+<pre class="term">sum: 240
+after by value:   { 55, 65, 70, 50 }
+after by pointer: { 56, 65, 70, 50 }</pre>
+<p>Three things to notice. <code>sumByValue</code> reads its copy; that is fine and cheap for four bytes. <code>bumpByValue</code> changes its copy and the caller sees nothing: parameters are immutable in Zig, so it had to copy into a <code>var</code> first, and that <code>var</code> dies at the closing brace. <code>bumpByPointer</code> takes <code>*[4]u8</code>, a pointer to a four-byte array, and the caller passes <code>&amp;lance</code>; writing through the pointer changes the original.</p>
+<p>The rule of thumb: take arrays <em>by value</em> when the function only reads and the array is small; take <code>*[N]T</code> when the function must modify the caller's array; and, most of the time, take a <em>slice</em> so the length is not baked into the signature at all. Here is the wall you hit otherwise:</p>
+<pre><code>const std = @import("std");
+
+fn sum(xs: [4]u8) u32 {
+    var t: u32 = 0;
+    for (xs) |x| t += x;
+    return t;
+}
+
+pub fn main() void {
+    const three = [_]u8{ 1, 2, 3 };
+    std.debug.print("{d}\n", .{sum(three)});
+}</code></pre>
+<pre class="term">pass_wrong_len.zig:11:36: error: expected type '[4]u8', found '[3]u8'
+    std.debug.print("{d}\n", .{sum(three)});
+                                   ^~~~~
+pass_wrong_len.zig:11:36: note: destination has length 4
+pass_wrong_len.zig:11:36: note: source has length 3
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>A <code>sum</code> that works on four elements but not three is not much of a <code>sum</code>. The fix is to declare the parameter as <code>[]const u8</code>, a slice, and that is the subject of <a href="#ch10">Chapter 10</a>.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> Fixed arrays show up wherever the count is a rule of the game rather than a fact about the data. The hangar report counts units by quality with six counters, one per quality grade, built with <code>**</code> and indexed by an enum's integer value:
+<pre><code>// src/main.zig
+var quality_counts = [_]u32{0} ** 6;
+var broken_slots: u32 = 0;
+var uit = gs.units.iterator();
+while (uit.next()) |entry| {
+    quality_counts[@intFromEnum(entry.value_ptr.quality)] += 1;
+    for (entry.value_ptr.slots.items) |s| {
+        if (s.condition != .ok) broken_slots += 1;
+    }
+}</code></pre>
+<p>The terminal client keeps its tab names and the year picker as arrays of compile-time constants (<code>src/tui/app.zig</code>): <code>const start_years = [_]u16{ 3015, 3020, 3025, 3028, 3030 };</code> and a <code>[_][]const u8</code> of ten tab labels. An emblem editor holds a 3-by-8 character grid as <code>[3][8]u8</code>, filled with spaces by <code>@splat</code>, exactly the array-of-arrays shape from 9.4. None of these can ever have the wrong length, because the length is the type.</p></div>
+
+<h3 id="ch09-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 9.1 · Array statistics <span class="level">warm-up</span></h4>
+  <p>Implement <code>heaviest</code>, <code>total</code> and <code>indexOf</code> over a <code>[4]u8</code>. Pay attention to the result type of <code>total</code>. Name the file: <code>exercises/09-arrays/ex1_stats.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 09, exercise 1: array statistics.
+//! Run with:  zig test ex1_stats.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// The heaviest value in the array.
+fn heaviest(tons: [4]u8) u8 {
+    var best: u8 = 0;
+    for (tons) |t| {
+        if (t &gt; best) best = t;
+    }
+    return best;
+}
+
+/// The sum of all values. Note the wider result type: four u8 can exceed 255.
+fn total(tons: [4]u8) u32 {
+    var sum: u32 = 0;
+    for (tons) |t| sum += t;
+    return sum;
+}
+
+/// Index of the first element equal to `needle`, or the array length if absent.
+fn indexOf(tons: [4]u8, needle: u8) usize {
+    for (tons, 0..) |t, i| {
+        if (t == needle) return i;
+    }
+    return tons.len;
+}
+
+test "heaviest" {
+    try std.testing.expectEqual(@as(u8, 70), heaviest(.{ 55, 65, 70, 50 }));
+    try std.testing.expectEqual(@as(u8, 100), heaviest(.{ 100, 20, 20, 20 }));
+}
+
+test "total does not overflow" {
+    try std.testing.expectEqual(@as(u32, 240), total(.{ 55, 65, 70, 50 }));
+    try std.testing.expectEqual(@as(u32, 1020), total(.{ 255, 255, 255, 255 }));
+}
+
+test "indexOf" {
+    const lance = [_]u8{ 55, 65, 70, 50 };
+    try std.testing.expectEqual(@as(usize, 2), indexOf(lance, 70));
+    try std.testing.expectEqual(@as(usize, 4), indexOf(lance, 99));
+}</code></pre>
+  <p><code>total</code> accumulates into a <code>u32</code>; the second test adds four 255s, which would panic with integer overflow in a <code>u8</code>. <code>indexOf</code> returns <code>tons.len</code> as a "not found" marker; <a href="#ch15">Chapter 15</a> will replace that with an optional.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 9.2 · Reverse in place <span class="level">practice</span></h4>
+  <p>Write <code>reverse</code>, which takes a pointer to a five-element array and reverses it in place, and <code>reversed</code>, which takes the array by value and returns a reversed copy without touching the original. Name the file: <code>exercises/09-arrays/ex2_reverse.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 09, exercise 2: reverse in place, through a pointer.
+//! Run with:  zig test ex2_reverse.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Reverse the array the pointer refers to. The caller sees the change.
+fn reverse(xs: *[5]i32) void {
+    var i: usize = 0;
+    var j: usize = xs.len - 1;
+    while (i &lt; j) : ({
+        i += 1;
+        j -= 1;
+    }) {
+        const tmp = xs[i];
+        xs[i] = xs[j];
+        xs[j] = tmp;
+    }
+}
+
+/// Return a reversed copy; the caller's array is untouched.
+fn reversed(xs: [5]i32) [5]i32 {
+    var out = xs;
+    reverse(&amp;out);
+    return out;
+}
+
+test "reverse mutates through the pointer" {
+    var xs = [_]i32{ 1, 2, 3, 4, 5 };
+    reverse(&amp;xs);
+    try std.testing.expectEqual([5]i32{ 5, 4, 3, 2, 1 }, xs);
+}
+
+test "reversed leaves the original alone" {
+    const xs = [_]i32{ 1, 2, 3, 4, 5 };
+    const ys = reversed(xs);
+    try std.testing.expectEqual([5]i32{ 1, 2, 3, 4, 5 }, xs);
+    try std.testing.expectEqual([5]i32{ 5, 4, 3, 2, 1 }, ys);
+}
+
+test "reversing twice is the identity" {
+    var xs = [_]i32{ 9, -1, 0, 7, 3 };
+    reverse(&amp;xs);
+    reverse(&amp;xs);
+    try std.testing.expect(std.mem.eql(i32, &amp;xs, &amp;[_]i32{ 9, -1, 0, 7, 3 }));
+}</code></pre>
+  <p>Through a <code>*[5]i32</code> you can index directly, <code>xs[i]</code>, without dereferencing first; Zig does that for you on pointers to arrays. <code>reversed</code> reuses <code>reverse</code> on its local copy, which is the usual way to get a by-value version of an in-place function.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 9.3 · A battle grid <span class="level">practice</span></h4>
+  <p>Build a <code>[4][6]u8</code> grid of <code>'.'</code> characters, place markers into it through a pointer, count markers, and render one row as text into a caller-supplied buffer. Name the file: <code>exercises/09-arrays/ex3_grid.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 09, exercise 3: a hex-less battle grid.
+//! Run with:  zig test ex3_grid.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const rows = 4;
+const cols = 6;
+const Grid = [rows][cols]u8;
+
+/// A grid full of '.' characters.
+fn emptyGrid() Grid {
+    return [_][cols]u8{[_]u8{'.'} ** cols} ** rows;
+}
+
+/// Place marker `m` at (r, c). Out-of-range coordinates are a bug; let Zig panic.
+fn place(g: *Grid, r: usize, c: usize, m: u8) void {
+    g[r][c] = m;
+}
+
+/// Count how many cells hold marker `m`.
+fn count(g: Grid, m: u8) usize {
+    var n: usize = 0;
+    for (g) |row| {
+        for (row) |cell| {
+            if (cell == m) n += 1;
+        }
+    }
+    return n;
+}
+
+/// Write row `r` into `buf` and return it as text (for printing).
+fn rowText(g: Grid, r: usize, buf: *[cols]u8) []const u8 {
+    buf.* = g[r];
+    return buf;
+}
+
+test "empty grid is all dots" {
+    const g = emptyGrid();
+    try std.testing.expectEqual(@as(usize, rows * cols), count(g, '.'));
+    try std.testing.expectEqual(@as(usize, 0), count(g, 'M'));
+}
+
+test "placing markers" {
+    var g = emptyGrid();
+    place(&amp;g, 0, 0, 'M');
+    place(&amp;g, 3, 5, 'M');
+    place(&amp;g, 1, 2, 'T');
+    try std.testing.expectEqual(@as(usize, 2), count(g, 'M'));
+    try std.testing.expectEqual(@as(usize, 1), count(g, 'T'));
+    try std.testing.expectEqual(@as(usize, rows * cols - 3), count(g, '.'));
+}
+
+test "row as text" {
+    var g = emptyGrid();
+    place(&amp;g, 2, 1, 'M');
+    var buf: [cols]u8 = undefined;
+    try std.testing.expectEqualStrings(".M....", rowText(g, 2, &amp;buf));
+    try std.testing.expectEqualStrings("......", rowText(g, 0, &amp;buf));
+}</code></pre>
+  <p><code>[_][cols]u8{[_]u8{'.'} ** cols} ** rows</code> repeats a row of dots <code>rows</code> times. <code>rowText</code> copies the row into the buffer with a plain assignment (<code>buf.* = g[r]</code>, arrays copy) and returns the buffer, which coerces to <code>[]const u8</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 9.4 · A dice histogram <span class="level">challenge</span></h4>
+  <p>Given 2d6 results, count how often each total appeared into a <code>[13]u32</code> (indexes 0 and 1 stay zero), find the most frequent total, and draw a text bar for one total using <code>std.fmt.bufPrint</code> for the prefix. Name the file: <code>exercises/09-arrays/ex4_histogram.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 09, exercise 4: a dice histogram (challenge).
+//! Run with:  zig test ex4_histogram.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Given a list of 2d6 results (each 2..12), count how many times each total
+/// appeared. Index 0 and 1 of the result are always zero.
+fn histogram(rolls: []const u8) [13]u32 {
+    var counts = [_]u32{0} ** 13;
+    for (rolls) |r| {
+        counts[r] += 1;
+    }
+    return counts;
+}
+
+/// The most frequent total. Ties go to the smaller total.
+fn mode(counts: [13]u32) u8 {
+    var best: u8 = 2;
+    for (counts, 0..) |c, i| {
+        if (c &gt; counts[best]) best = @intCast(i);
+    }
+    return best;
+}
+
+/// Build a one-line text bar for a total: "7: ####" style, into buf.
+fn bar(buf: []u8, total: u8, n: u32) []const u8 {
+    const prefix = std.fmt.bufPrint(buf, "{d:&gt;2}: ", .{total}) catch unreachable;
+    var i: usize = 0;
+    while (i &lt; n) : (i += 1) buf[prefix.len + i] = '#';
+    return buf[0 .. prefix.len + n];
+}
+
+test "histogram counts every total" {
+    const h = histogram(&amp;[_]u8{ 7, 7, 2, 12, 7, 6 });
+    try std.testing.expectEqual(@as(u32, 3), h[7]);
+    try std.testing.expectEqual(@as(u32, 1), h[2]);
+    try std.testing.expectEqual(@as(u32, 1), h[12]);
+    try std.testing.expectEqual(@as(u32, 0), h[3]);
+    try std.testing.expectEqual(@as(u32, 0), h[0]);
+}
+
+test "empty input gives all zeros" {
+    const h = histogram(&amp;[_]u8{});
+    try std.testing.expectEqual([_]u32{0} ** 13, h);
+}
+
+test "mode" {
+    try std.testing.expectEqual(@as(u8, 7), mode(histogram(&amp;[_]u8{ 7, 7, 2, 12, 7, 6 })));
+    try std.testing.expectEqual(@as(u8, 3), mode(histogram(&amp;[_]u8{ 9, 3, 3, 9 })));
+}
+
+test "bar" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(" 7: ###", bar(&amp;buf, 7, 3));
+    try std.testing.expectEqualStrings("12: ", bar(&amp;buf, 12, 0));
+}</code></pre>
+  <p>The histogram indexes the array directly by the roll value, which is why it has 13 slots for values up to 12. <code>mode</code> starts at 2 and only moves on a strictly larger count, so ties go to the smaller total. <code>bar</code> takes a slice rather than an array so it works with any buffer size; the next chapter explains why that is the better signature.</p></details>
+</div>
+
+<h3 id="ch09-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Are <code>[3]u8</code> and <code>[4]u8</code> the same type? <details class="answer"><summary>Answer</summary>No. The length is part of an array type, so they are different types and cannot be assigned to each other or passed where the other is expected.</details></li>
+  <li>What does <code>[_]</code> mean in <code>[_]u8{ 1, 2, 3 }</code>? <details class="answer"><summary>Answer</summary>"Count the elements for me." The type is still a fixed <code>[3]u8</code>; the underscore only saves you writing the number.</details></li>
+  <li>What happens when you index past the end with a runtime index in a Debug build? <details class="answer"><summary>Answer</summary>The program panics with <code>index out of bounds: index N, len M</code> and a stack trace. With a compile-time index it is a compile error instead.</details></li>
+  <li>How do you modify each element in a <code>for</code> loop? <details class="answer"><summary>Answer</summary>Loop over <code>&amp;array</code> and capture with <code>|*item|</code>, then assign through <code>item.*</code>. The array must be a <code>var</code>.</details></li>
+  <li>What does <code>var b = a;</code> do when <code>a</code> is an array? <details class="answer"><summary>Answer</summary>Copies every element. <code>b</code> is an independent array; changing it does not affect <code>a</code>.</details></li>
+  <li>Why does <code>a == b</code> not compile for arrays, and what do you use instead? <details class="answer"><summary>Answer</summary>Zig reserves operators for cheap operations; element-wise comparison is a loop, so it is the function <code>std.mem.eql(T, &amp;a, &amp;b)</code>. In tests, <code>expectEqual</code> also compares arrays element by element.</details></li>
+  <li>When should a parameter be <code>*[4]u8</code> instead of <code>[4]u8</code>? <details class="answer"><summary>Answer</summary>When the function must modify the caller's array, or when the array is large enough that copying it is wasteful. For read-only access to arrays of any length, a slice <code>[]const u8</code> is better still.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>An array type <code>[N]T</code> includes its length; <code>[_]T{...}</code> lets the compiler count.</li>
+<li>Indexes are <code>usize</code>, start at 0, and are bounds-checked: a compile error for constant indexes, a panic for runtime ones.</li>
+<li><code>for (arr) |x|</code> reads, <code>for (arr, 0..) |x, i|</code> adds the index, <code>for (&amp;arr) |*x|</code> lets you write.</li>
+<li><code>[N][M]T</code> is an array of arrays; index with <code>a[r][c]</code>.</li>
+<li><code>**</code> repeats and <code>++</code> concatenates compile-time arrays; <code>undefined</code> reserves space you promise to fill.</li>
+<li>Arrays are values: assignment and by-value parameters copy. Compare with <code>std.mem.eql</code>, not <code>==</code>.</li>
+<li>Pass <code>*[N]T</code> to modify in place; pass a slice to accept any length.</li>
+</ul></div>
+</section>

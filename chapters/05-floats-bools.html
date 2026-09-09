@@ -1,0 +1,494 @@
+<section id="ch05">
+<h2>5. Floats, booleans and comparisons</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn Zig's two floating-point types and why 0.1 + 0.2 is not 0.3, how to convert between integers and floats deliberately, how to print floats, what NaN and infinity are, and how comparisons and the boolean operators <code>and</code>, <code>or</code> and <code>!</code> work. You will also see that Zig has no notion of a "truthy" value.</p>
+
+<h3 id="ch05-1">5.1 f32 and f64</h3>
+<p>A floating-point number stores a sign, a fraction, and an exponent, so it can hold 0.001 and 6.02e23 in the same type. Zig's two everyday float types are <code>f32</code> (about 7 significant digits) and <code>f64</code> (about 16). There are also <code>f16</code>, <code>f80</code> and <code>f128</code> for special purposes. Use <code>f64</code> unless you have a reason not to; it is the natural type of most maths libraries and of the constants in <code>std.math</code>.</p>
+<div class="file">floats.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a: f32 = 0.1;
+    const b: f64 = 0.1;
+    std.debug.print("f32: {d}\n", .{a});
+    std.debug.print("f64: {d}\n", .{b});
+    const widened: f64 = a; // f32 widens to f64 for free
+    std.debug.print("the f32 0.1, seen as f64: {d}\n", .{widened});
+    var sum: f64 = 0.0;
+    sum += 0.1;
+    sum += 0.1;
+    sum += 0.1;
+    std.debug.print("0.1 + 0.1 + 0.1 = {d}\n", .{sum});
+    std.debug.print("equal to 0.3? {}\n", .{sum == 0.3});
+}</code></pre>
+<pre class="term">$ zig run floats.zig
+f32: 0.1
+f64: 0.1
+the f32 0.1, seen as f64: 0.10000000149011612
+0.1 + 0.1 + 0.1 = 0.30000000000000004
+equal to 0.3? false</pre>
+<p>The first two lines look identical because Zig prints the shortest decimal that reads back as the same float. The third line tells the truth: the <code>f32</code> nearest to 0.1 is actually 0.100000001490116…, and widening it to <code>f64</code> exposes the digits. The last two lines are the famous one. Three tenths added together is not three tenths, because none of them was exactly a tenth to begin with. Floats are binary fractions; 0.1 in binary repeats forever, the way 1/3 does in decimal, and gets cut off.</p>
+<p>The rule that follows is: <strong>never compare floats for equality when they came from arithmetic</strong>, and <strong>never use floats for money</strong>. Section 5.5 shows the comparison technique; IRON LEDGER's answer to money is <a href="#ch04">Chapter 4</a>'s integers.</p>
+
+<h3 id="ch05-2">5.2 Float literals</h3>
+<p>A literal with a decimal point or an exponent is a <code>comptime_float</code>, the float twin of <code>comptime_int</code> from <a href="#ch03">Chapter 3</a>. It becomes an <code>f32</code> or <code>f64</code> when it meets one.</p>
+<div class="file">float_literal.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const x = 2.5;
+    std.debug.print("{s}\n", .{@typeName(@TypeOf(x))});
+    const y: f64 = x;
+    const z: f32 = 1.0e3;
+    const w: f64 = 6.02e23;
+    std.debug.print("{d} {d} {d} {e}\n", .{ y, z, w, w });
+}</code></pre>
+<pre class="term">$ zig run float_literal.zig
+comptime_float
+2.5 1000 602000000000000000000000 6.02e23</pre>
+<p><code>1.0e3</code> is scientific notation for 1000; <code>6.02e23</code> is 6.02 times ten to the 23rd. A float literal must have a digit on both sides of the point: <code>1.0</code>, not <code>1.</code> and not <code>.5</code>. As with integers, a <code>var</code> initialised from a bare float literal needs a type annotation.</p>
+
+<h3 id="ch05-3">5.3 Converting between integers and floats</h3>
+<p>Integers and floats are different kinds of value, and Zig makes you say when you move between them.</p>
+<div class="file">float_conv.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tons: u32 = 55;
+    const as_float: f64 = @floatFromInt(tons);
+    const half = as_float / 2.0;
+    std.debug.print("half of {d} tons is {d}\n", .{ tons, half });
+
+    const price: f64 = 4_701_000.75;
+    const whole: i64 = @intFromFloat(price); // truncates toward zero
+    std.debug.print("truncated: {d}\n", .{whole});
+
+    const rounded: i64 = @intFromFloat(@round(price));
+    const floored: i64 = @intFromFloat(@floor(-2.5));
+    const ceiled: i64 = @intFromFloat(@ceil(-2.5));
+    std.debug.print("round {d}, floor(-2.5) {d}, ceil(-2.5) {d}\n", .{ rounded, floored, ceiled });
+
+    const narrow: f32 = @floatCast(price); // f64 -&gt; f32 loses precision
+    std.debug.print("as f32: {d}\n", .{narrow});
+}</code></pre>
+<pre class="term">$ zig run float_conv.zig
+half of 55 tons is 27.5
+truncated: 4701000
+round 4701001, floor(-2.5) -3, ceil(-2.5) -2
+as f32: 4701001</pre>
+<ul>
+<li><code>@floatFromInt(x)</code> makes a float from an integer. The target type comes from context, as with the casts in <a href="#ch04">Chapter 4</a>, so you write it on a line with a type annotation or wrap it in <code>@as(f64, …)</code>.</li>
+<li><code>@intFromFloat(x)</code> makes an integer from a float, dropping the fraction (rounding toward zero). Combine it with <code>@round</code>, <code>@floor</code>, or <code>@ceil</code> to choose a different rounding first.</li>
+<li><code>@floatCast(x)</code> changes float width. Going from <code>f64</code> to <code>f32</code> rounds to fewer digits, as the last line shows.</li>
+</ul>
+<p>Two shortcuts exist, and you should know them so you are not surprised, but you should not lean on them. First, an integer type coerces to a float type without a builtin when every value of the integer type is exactly representable in the float: a <code>u32</code> becomes an <code>f64</code> silently, because <code>f64</code> has 53 bits of fraction and can hold any 32-bit integer. The same applies inside arithmetic, so <code>tons * ratio</code> with a <code>u32</code> and an <code>f64</code> compiles and gives an <code>f64</code>:</p>
+<div class="file">mix_bad2.zig</div>
+<pre><code>const std = @import("std");
+
+fn scale(tons: u32, ratio: f64) f64 {
+    return tons * ratio;
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{scale(55, 0.5)});
+}</code></pre>
+<pre class="term">$ zig run mix_bad2.zig
+27.5</pre>
+<p>But a <code>u64</code> does not fit exactly in an <code>f64</code>, nor an <code>i32</code> in an <code>f32</code>, and those are refused:</p>
+<div class="file">coerce7.zig</div>
+<pre><code>const std = @import("std");
+fn a(x: u64) f64 {
+    return x; // u64 -&gt; f64 is lossy above 2^53
+}
+pub fn main() void {
+    std.debug.print("{d}\n", .{a(55)});
+}</code></pre>
+<pre class="term">$ zig run coerce7.zig
+coerce7.zig:3:12: error: expected type 'f64', found 'u64'
+    return x; // u64 -&gt; f64 is lossy above 2^53
+           ^
+coerce7.zig:2:14: note: function return type declared here
+fn a(x: u64) f64 {
+             ^~~</pre>
+<p>Second, a runtime integer and a float <em>literal</em> do not mix at all, because the literal has no concrete type to resolve against:</p>
+<div class="file">coerce2.zig</div>
+<pre><code>const std = @import("std");
+fn f(tons: u32) f64 {
+    return tons + 0.5; // int + float literal
+}
+pub fn main() void {
+    std.debug.print("{d}\n", .{f(55)});
+}</code></pre>
+<pre class="term">$ zig run coerce2.zig
+coerce2.zig:3:17: error: incompatible types: 'u32' and 'comptime_float'
+    return tons + 0.5; // int + float literal
+           ~~~~~^~~~~
+coerce2.zig:3:12: note: type 'u32' here
+    return tons + 0.5; // int + float literal
+           ^~~~
+coerce2.zig:3:19: note: type 'comptime_float' here
+    return tons + 0.5; // int + float literal
+                  ^~~</pre>
+<p>And a float never becomes an integer by itself, whatever its value:</p>
+<pre class="term">$ zig run coerce3.zig
+coerce3.zig:3:12: error: expected type 'u32', found 'f64'
+    return x; // float -&gt; int should never coerce
+           ^
+coerce3.zig:2:14: note: function return type declared here
+fn f(x: f64) u32 {
+             ^~~</pre>
+<p>The habit that avoids all of this is to write <code>@floatFromInt</code> whenever an integer enters a float calculation. It always works, it is explicit about where precision might be lost, and a reader does not have to remember the exact-representability table.</p>
+<div class="warn"><strong>Trap: integer division happens first.</strong> <code>const half: f64 = tons / 2;</code> with <code>tons: u32 = 55</code> gives 27, not 27.5. The division is done between integers, truncating, and the result is only then widened to a float. Convert before dividing: <code>@as(f64, @floatFromInt(tons)) / 2.0</code>.</div>
+<p>Converting the other way is also checked. <code>@intFromFloat</code> panics in Debug builds if the float's integer part does not fit the target type:</p>
+<div class="file">intfromfloat_fail.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var big: f64 = 300.0;
+    big += 1.0;
+    const small: u8 = @intFromFloat(big);
+    std.debug.print("{d}\n", .{small});
+}</code></pre>
+<pre class="term">$ zig run intfromfloat_fail.zig
+thread 12345 panic: integer part of floating point value out of bounds
+intfromfloat_fail.zig:6:23: 0x10000abcd in main (intfromfloat_fail)
+    const small: u8 = @intFromFloat(big);
+                      ^</pre>
+
+<h3 id="ch05-4">5.4 Printing floats</h3>
+<p>The <code>{d}</code> placeholder prints a float in plain decimal, and the precision option controls how many digits follow the point:</p>
+<div class="file">fmt_floats.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const x: f64 = 1234.5678;
+    std.debug.print("{d}\n", .{x});
+    std.debug.print("{d:.1}\n", .{x});
+    std.debug.print("{d:.0}\n", .{x});
+    std.debug.print("{d:12.2}|\n", .{x});
+    std.debug.print("{d:&lt;12.2}|\n", .{x});
+    std.debug.print("{e}\n", .{x});
+    std.debug.print("{e:.3}\n", .{x});
+    std.debug.print("{any}\n", .{x});
+    std.debug.print("{}\n", .{x});
+}</code></pre>
+<pre class="term">$ zig run fmt_floats.zig
+1234.5678
+1234.6
+1235
+     1234.57|
+1234.57     |
+1.2345678e3
+1.235e3
+1234.5678
+1234.5678</pre>
+<p><code>{d}</code> alone prints the shortest exact representation; <code>{d:.1}</code> rounds to one decimal and <code>{d:.0}</code> to none. Width and alignment work as for integers. <code>{e}</code> prints scientific notation, with its own precision. <code>{any}</code> and the bare <code>{}</code> both give the same shortest form as <code>{d}</code>. For a table of prices, <code>{d:.2}</code> is almost always what you want.</p>
+
+<h3 id="ch05-5">5.5 Arithmetic, NaN and infinity</h3>
+<p>The four operators work on floats as you would expect, and the remainder builtins from <a href="#ch04">Chapter 4</a> apply to floats as well: <code>%</code> on a float is an error, <code>@rem</code> and <code>@mod</code> are not. <code>std.math</code> has the usual functions and constants.</p>
+<div class="file">float_ops.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a: f64 = 7.0;
+    const b: f64 = 2.0;
+    std.debug.print("{d} {d} {d} {d}\n", .{ a + b, a - b, a * b, a / b });
+    std.debug.print("rem {d}, mod {d}\n", .{ @rem(a, b), @mod(-a, b) });
+    std.debug.print("sqrt {d}, pow {d}, pi {d:.4}\n", .{ @sqrt(a), std.math.pow(f64, a, b), std.math.pi });
+    std.debug.print("{d}\n", .{1.0 / 3.0});
+}</code></pre>
+<pre class="term">$ zig run float_ops.zig
+9 5 14 3.5
+rem 1, mod 1
+sqrt 2.6457513110645907, pow 49, pi 3.1416
+0.3333333333333333333333333333333333</pre>
+<p>Notice the last line: <code>1.0 / 3.0</code> printed with far more digits than an <code>f64</code> has. Both operands were literals, so the division happened at compile time in <code>comptime_float</code>, which is exact, and only the printing rounded it. Give either side a runtime type and you get the sixteen-digit <code>f64</code> answer.</p>
+<p>Unlike integer division, float division by zero does not panic. It produces one of the special values that every float type carries:</p>
+<div class="file">naninf.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var zero: f64 = 0.0;
+    zero += 0.0;
+    const one: f64 = 1.0;
+    const inf = one / zero;
+    const neg_inf = -one / zero;
+    const nan = zero / zero;
+    std.debug.print("{d} {d} {d}\n", .{ inf, neg_inf, nan });
+    std.debug.print("nan == nan? {}\n", .{nan == nan});
+    std.debug.print("isNan {}, isInf {}\n", .{ std.math.isNan(nan), std.math.isInf(inf) });
+    std.debug.print("constants: {d} {d}\n", .{ std.math.inf(f64), std.math.nan(f64) });
+    std.debug.print("f64 max {e}, f32 max {e}\n", .{ std.math.floatMax(f64), std.math.floatMax(f32) });
+}</code></pre>
+<pre class="term">$ zig run naninf.zig
+inf -inf nan
+nan == nan? false
+isNan true, isInf true
+constants: inf nan
+f64 max 1.7976931348623157e308, f32 max 3.4028235e38</pre>
+<p>Dividing a nonzero number by zero gives <em>infinity</em> with the appropriate sign. Dividing zero by zero, or taking the square root of a negative, gives <em>NaN</em>, "not a number". NaN has one property that catches everyone: it is not equal to anything, including itself. <code>nan == nan</code> is <code>false</code>. To test for it, use <code>std.math.isNan</code>; for infinity, <code>std.math.isInf</code>. <code>std.math.inf(T)</code> and <code>std.math.nan(T)</code> construct them, and <code>std.math.floatMax(T)</code> is the largest finite value of the type.</p>
+<p>A NaN spreads: any arithmetic with a NaN gives a NaN, so one bad division early in a calculation poisons everything after it. If a float result looks wrong, print it; <code>nan</code> in the output points straight at the problem.</p>
+
+<h3 id="ch05-6">5.6 Comparisons</h3>
+<p>Six operators compare two values of the same type and produce a <code>bool</code>:</p>
+<div class="file">compare.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a: i32 = 5;
+    const b: i32 = 7;
+    std.debug.print("{} {} {} {} {} {}\n", .{ a == b, a != b, a &lt; b, a &lt;= b, a &gt; b, a &gt;= b });
+
+    var x: f64 = 0.1;
+    x += 0.2;
+    std.debug.print("0.1 + 0.2 = {d}\n", .{x});
+    std.debug.print("0.1 + 0.2 == 0.3 ? {}\n", .{x == 0.3});
+    const close = std.math.approxEqAbs(f64, x, 0.3, 1e-9);
+    std.debug.print("close enough? {}\n", .{close});
+
+    const result = a &lt; b;
+    std.debug.print("{s}\n", .{@typeName(@TypeOf(result))});
+}</code></pre>
+<pre class="term">$ zig run compare.zig
+false true true true false false
+0.1 + 0.2 = 0.30000000000000004
+0.1 + 0.2 == 0.3 ? false
+close enough? true
+bool</pre>
+<p><code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>. They work on integers, floats, booleans (only <code>==</code> and <code>!=</code>), enums, and a few other types; they do not work on strings, which need <code>std.mem.eql</code> (<a href="#ch11">Chapter 11</a>). Comparison between different integer types follows peer type resolution; comparing an integer to a float needs a conversion.</p>
+<p>The float lines demonstrate the fix for section 5.1's problem. Instead of asking whether two computed floats are equal, ask whether they are within a tolerance: <code>std.math.approxEqAbs(f64, a, b, 1e-9)</code> is true when the absolute difference is below the fourth argument. There is also <code>approxEqRel</code> for a relative tolerance, which suits very large or very small values. In tests, <code>std.testing.expectApproxEqAbs</code> does the same job.</p>
+<p>One thing Zig does not allow that Python does: chaining. <code>1 &lt; x &lt; 10</code> is a compile error, "comparison operators cannot be chained". Write <code>1 &lt; x and x &lt; 10</code>.</p>
+
+<h3 id="ch05-7">5.7 Booleans</h3>
+<p><code>bool</code> has two values, <code>true</code> and <code>false</code>, and three operators, which are words rather than symbols:</p>
+<div class="file">bools.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const has_pilot = true;
+    const has_mech = false;
+    std.debug.print("and: {}\n", .{has_pilot and has_mech});
+    std.debug.print("or:  {}\n", .{has_pilot or has_mech});
+    std.debug.print("not: {}\n", .{!has_mech});
+    std.debug.print("as int: {d}\n", .{@intFromBool(has_pilot)});
+    const morale: u8 = 60;
+    const fatigue: u8 = 30;
+    const ready = has_pilot and morale &gt;= 50 and fatigue &lt; 40;
+    std.debug.print("ready to deploy: {}\n", .{ready});
+}</code></pre>
+<pre class="term">$ zig run bools.zig
+and: false
+or:  true
+not: true
+as int: 1
+ready to deploy: true</pre>
+<p><code>and</code>, <code>or</code>, and <code>!</code>. There is no <code>&amp;&amp;</code> or <code>||</code>; type <code>a &amp;&amp; b</code> and the compiler says "ambiguous use of '&amp;&amp;'; use 'and' for logical AND". <code>@intFromBool</code> converts to 1 or 0 when you need to add a flag to a number. Comparisons bind tighter than <code>and</code>, and <code>and</code> binds tighter than <code>or</code>, so <code>a and b &gt;= 50 or c</code> means <code>(a and (b &gt;= 50)) or c</code>. When in doubt, add parentheses; <code>zig fmt</code> will not remove them.</p>
+<p><code>and</code> and <code>or</code> short-circuit: the right side is only evaluated when the left side has not already decided the answer.</p>
+<div class="file">shortcircuit.zig</div>
+<pre><code>const std = @import("std");
+
+fn loud(name: []const u8, value: bool) bool {
+    std.debug.print("  evaluating {s}\n", .{name});
+    return value;
+}
+
+pub fn main() void {
+    std.debug.print("false and ...:\n", .{});
+    _ = loud("left", false) and loud("right", true);
+    std.debug.print("true or ...:\n", .{});
+    _ = loud("left", true) or loud("right", false);
+}</code></pre>
+<pre class="term">$ zig run shortcircuit.zig
+false and ...:
+  evaluating left
+true or ...:
+  evaluating left</pre>
+<p>This matters when the right side is expensive or would fail: <code>i &lt; items.len and items[i] == x</code> is safe because the index is only read when it is in range. <a href="#ch15">Chapter 15</a> leans on this with optionals.</p>
+
+<h3 id="ch05-8">5.8 No truthiness</h3>
+<p>In Python, JavaScript and C, a number can stand in for a boolean: zero is false, anything else is true. Zig does not do this. The condition of an <code>if</code> or a <code>while</code> must be a <code>bool</code>, and a number is not one:</p>
+<div class="file">truthy.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const count: u32 = 3;
+    if (count) {
+        std.debug.print("nonzero\n", .{});
+    }
+}</code></pre>
+<pre class="term">$ zig run truthy.zig
+truthy.zig:5:9: error: expected type 'bool', found 'u32'
+    if (count) {
+        ^~~~~</pre>
+<p>Write the comparison out: <code>if (count != 0)</code> or <code>if (count &gt; 0)</code>. The same applies to pointers and everything else. It costs a few characters and removes a whole class of "is an empty list false?" questions. The only values that can appear in a condition besides <code>bool</code> are optionals and error unions, which have their own special <code>if</code> syntax that captures the inner value; those are Chapters <a href="#ch15">15</a> and <a href="#ch16">16</a>.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> Floats appear in exactly two places in the whole game, and both are geometry rather than accounting: the distance between two worlds in <code>game/src/domain/planet.zig</code> (<code>const dx: f64 = @floatFromInt(a.x - b.x);</code> and then <code>@sqrt(dx * dx + dy * dy)</code>), and the star map, where light-year coordinates are scaled to terminal columns (<code>game/src/tui/app.zig</code>):
+<pre><code>const usable_w: f64 = @floatFromInt(@max(20, @as(i32, inner.w) - 16));
+const usable_h: f64 = @floatFromInt(@max(6, @as(i32, inner.h) - 2));
+var sx: f64 = @as(f64, @floatFromInt(max_x - min_x)) / usable_w;
+var sy: f64 = @as(f64, @floatFromInt(max_y - min_y)) / usable_h;
+// …
+return .{ @intFromFloat(@floor(cx)), @intFromFloat(@floor(cy)) };</code></pre>
+Every integer that enters the calculation goes through <code>@floatFromInt</code>, every result that becomes a screen position goes through <code>@floor</code> and then <code>@intFromFloat</code>, and there is no float anywhere in <code>src/sim/</code> or <code>src/econ/</code>. Booleans, on the other hand, are everywhere; the calendar's leap-year test in <code>game/src/sim/clock.zig</code> is a one-line boolean expression: <code>return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;</code>. You will write it yourself in <a href="#ch07">Chapter 7</a>.</div>
+
+<h3 id="ch05-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 5.1 · Integer in, float out <span class="level">warm-up</span></h4>
+  <p>Write <code>average3</code>, which returns the mean of three <code>u32</code> values as an <code>f64</code>, and <code>percent</code>, which returns <code>part</code> as a percentage of <code>whole</code> rounded to the nearest whole number. You will need <code>@floatFromInt</code>, <code>@intFromFloat</code> and <code>@round</code>. Name the file: <code>exercises/05-floats-bools/ex1_average.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 05, exercise 1: integer in, float out.
+//! Run with:  zig test ex1_average.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Average of three tonnages as an f64 (so 20, 55, 100 gives 58.333...).
+fn average3(a: u32, b: u32, c: u32) f64 {
+    const sum: f64 = @floatFromInt(a + b + c);
+    return sum / 3.0;
+}
+
+/// Percentage of `part` out of `whole`, rounded to the nearest whole number.
+/// 1 out of 3 is 33, 2 out of 3 is 67.
+fn percent(part: u32, whole: u32) u32 {
+    const p: f64 = @floatFromInt(part);
+    const w: f64 = @floatFromInt(whole);
+    return @intFromFloat(@round(p / w * 100.0));
+}
+
+test "average3" {
+    try std.testing.expectApproxEqAbs(@as(f64, 58.3333), average3(20, 55, 100), 0.001);
+    try std.testing.expectEqual(@as(f64, 50), average3(50, 50, 50));
+}
+
+test "percent rounds" {
+    try std.testing.expectEqual(@as(u32, 33), percent(1, 3));
+    try std.testing.expectEqual(@as(u32, 67), percent(2, 3));
+    try std.testing.expectEqual(@as(u32, 100), percent(7, 7));
+    try std.testing.expectEqual(@as(u32, 0), percent(0, 7));
+}</code></pre>
+  <p>The sum is computed in <code>u32</code> and converted once, which is fine here; converting each value first would also work. In <code>percent</code>, the conversions happen before the division, avoiding the integer-division trap, and <code>@round</code> runs before <code>@intFromFloat</code> so that 66.67 becomes 67 rather than 66.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 5.2 · Comparing honestly <span class="level">practice</span></h4>
+  <p>Write <code>nearlyEqual(a, b, tolerance)</code> without using <code>std.math.approxEqAbs</code>, and <code>isUsable(x)</code>, which is true only for finite numbers. The first test adds 0.1 ten times and checks that the sum is <em>not</em> 1.0 but is nearly 1.0. Name the file: <code>exercises/05-floats-bools/ex2_approx.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 05, exercise 2: comparing floats honestly.
+//! Run with:  zig test ex2_approx.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// True when a and b are within `tolerance` of each other.
+fn nearlyEqual(a: f64, b: f64, tolerance: f64) bool {
+    return @abs(a - b) &lt;= tolerance;
+}
+
+/// True when x is a finite number (not NaN, not +/- infinity).
+fn isUsable(x: f64) bool {
+    return !std.math.isNan(x) and !std.math.isInf(x);
+}
+
+test "nearlyEqual" {
+    var sum: f64 = 0.0;
+    for (0..10) |_| sum += 0.1;
+    try std.testing.expect(sum != 1.0); // the classic surprise
+    try std.testing.expect(nearlyEqual(sum, 1.0, 1e-9));
+    try std.testing.expect(!nearlyEqual(1.0, 1.1, 0.01));
+}
+
+test "isUsable" {
+    try std.testing.expect(isUsable(3.5));
+    try std.testing.expect(isUsable(0.0));
+    try std.testing.expect(!isUsable(std.math.nan(f64)));
+    try std.testing.expect(!isUsable(std.math.inf(f64)));
+    try std.testing.expect(!isUsable(-std.math.inf(f64)));
+}</code></pre>
+  <p><code>@abs</code> works on floats as well as integers. <code>isUsable</code> must reject NaN explicitly, because <code>x == x</code> is the only comparison that catches it and that reads as a trick; <code>std.math.isNan</code> says what it means.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 5.3 · Ready to deploy <span class="level">practice</span></h4>
+  <p>Write <code>canDeploy</code> as a single boolean expression from four inputs, following the rule in its doc comment, and <code>moraleLabel</code> as an <code>if</code> expression with three outcomes. Name the file: <code>exercises/05-floats-bools/ex3_ready.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 05, exercise 3: a readiness check with and/or/not.
+//! Run with:  zig test ex3_ready.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// A unit may deploy when it has a pilot, is not destroyed, and either has
+/// at least 30 armor or is being sent on a milk run.
+fn canDeploy(has_pilot: bool, destroyed: bool, armor: u8, milk_run: bool) bool {
+    return has_pilot and !destroyed and (armor &gt;= 30 or milk_run);
+}
+
+/// Morale label: "high" at 70 or more, "low" below 30, otherwise "steady".
+fn moraleLabel(morale: u8) []const u8 {
+    return if (morale &gt;= 70) "high" else if (morale &lt; 30) "low" else "steady";
+}
+
+test "canDeploy" {
+    try std.testing.expect(canDeploy(true, false, 50, false));
+    try std.testing.expect(canDeploy(true, false, 10, true));
+    try std.testing.expect(!canDeploy(true, false, 10, false));
+    try std.testing.expect(!canDeploy(false, false, 100, true));
+    try std.testing.expect(!canDeploy(true, true, 100, true));
+}
+
+test "moraleLabel" {
+    try std.testing.expectEqualStrings("high", moraleLabel(70));
+    try std.testing.expectEqualStrings("steady", moraleLabel(69));
+    try std.testing.expectEqualStrings("steady", moraleLabel(30));
+    try std.testing.expectEqualStrings("low", moraleLabel(29));
+}</code></pre>
+  <p>The parentheses around the <code>or</code> are required: without them, <code>and</code> would bind first and a milk run would let a pilotless, destroyed unit deploy. <code>if … else if … else</code> as an expression is previewed here and covered in <a href="#ch06">Chapter 6</a>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 5.4 · Price per ton <span class="level">challenge</span></h4>
+  <p>Write <code>perTon</code> and then print the three-row report in the starter's header: name 12 wide, tons 3 wide, price 9 wide, and price per ton 10 wide with two decimals, followed by the average per-ton price. The starter already loops over three arrays at once with <code>for (names, tons, prices) |name, t, price|</code>, a form <a href="#ch06">Chapter 6</a> explains. Name the file: <code>exercises/05-floats-bools/ex4_report.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 05, exercise 4: a formatted float report.
+//! Run with:  zig run ex4_report.zig
+//! Expected output (on stderr):
+//!   Locust        20 t   1512000 C-bills   75600.00 per ton
+//!   Shadow Hawk   55 t   4701000 C-bills   85472.73 per ton
+//!   Atlas        100 t   9626000 C-bills   96260.00 per ton
+//!   average price per ton: 85777.58
+const std = @import("std");
+
+fn perTon(price: u32, tons: u32) f64 {
+    const p: f64 = @floatFromInt(price);
+    const t: f64 = @floatFromInt(tons);
+    return p / t;
+}
+
+pub fn main() void {
+    const names = [_][]const u8{ "Locust", "Shadow Hawk", "Atlas" };
+    const tons = [_]u32{ 20, 55, 100 };
+    const prices = [_]u32{ 1_512_000, 4_701_000, 9_626_000 };
+    var total: f64 = 0.0;
+    for (names, tons, prices) |name, t, price| {
+        const ratio = perTon(price, t);
+        total += ratio;
+        std.debug.print("{s:&lt;12} {d:&gt;3} t {d:&gt;9} C-bills {d:&gt;10.2} per ton\n", .{
+            name, t, price, ratio,
+        });
+    }
+    std.debug.print("average price per ton: {d:.2}\n", .{total / 3.0});
+}</code></pre>
+  <p><code>{d:&gt;10.2}</code> combines width, alignment and precision. The running total is an <code>f64</code> so that the average keeps its fraction; dividing by <code>3.0</code> rather than <code>3</code> keeps the literal a float, although a <code>comptime_int</code> would also coerce here.</p></details>
+</div>
+
+<h3 id="ch05-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Why is <code>0.1 + 0.2 == 0.3</code> false for <code>f64</code> values? <details class="answer"><summary>Answer</summary>None of 0.1, 0.2 and 0.3 is exactly representable in binary, and the rounding errors of the two operands do not cancel. Compare with a tolerance instead.</details></li>
+  <li>How do you turn a <code>u32</code> into an <code>f64</code>, and the reverse? <details class="answer"><summary>Answer</summary><code>@floatFromInt(x)</code> and <code>@intFromFloat(x)</code>, with the target type given by context. The reverse drops the fraction and panics if the integer part does not fit.</details></li>
+  <li>What does <code>const h: f64 = n / 2;</code> give when <code>n: u32 = 7</code>? <details class="answer"><summary>Answer</summary>3, not 3.5. The integer division runs first, then the result is widened.</details></li>
+  <li>What is <code>nan == nan</code>? <details class="answer"><summary>Answer</summary><code>false</code>. NaN is unequal to everything, itself included. Use <code>std.math.isNan</code>.</details></li>
+  <li>Does <code>1.0 / 0.0</code> panic? <details class="answer"><summary>Answer</summary>No. Float division by zero gives infinity (or NaN for 0/0); only integer division by zero panics.</details></li>
+  <li>Why does <code>if (count)</code> fail when <code>count</code> is a <code>u32</code>? <details class="answer"><summary>Answer</summary>Zig has no truthiness; a condition must be a <code>bool</code>. Write <code>if (count != 0)</code>.</details></li>
+  <li>What is wrong with <code>a &amp;&amp; b</code>? <details class="answer"><summary>Answer</summary>Zig's logical operators are the words <code>and</code> and <code>or</code>; <code>&amp;&amp;</code> is a compile error that tells you so.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>f64</code> is the default float; floats are approximate, so never test computed floats for equality and never use them for money.</li>
+<li><code>@floatFromInt</code>, <code>@intFromFloat</code> and <code>@floatCast</code> convert explicitly; some lossless int-to-float coercions are allowed, but write the builtin anyway, and convert before dividing.</li>
+<li><code>{d:.2}</code> prints a float with two decimals; <code>{e}</code> is scientific notation.</li>
+<li>Float division by zero gives inf or NaN rather than panicking; NaN is never equal to anything; test with <code>std.math.isNan</code>.</li>
+<li>Comparisons give <code>bool</code>, cannot be chained, and need <code>std.math.approxEqAbs</code> for floats.</li>
+<li>Boolean operators are <code>and</code>, <code>or</code>, <code>!</code>; they short-circuit; there is no truthiness.</li>
+</ul></div>
+</section>

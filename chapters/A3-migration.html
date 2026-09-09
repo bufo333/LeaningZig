@@ -1,0 +1,123 @@
+<section id="appA3">
+<h2>Appendix A3. Zig 0.16 migration notes</h2>
+<p class="goals"><strong>This appendix</strong> is for the moment you paste something from a web tutorial and the compiler says a member does not exist. The left column is the form you will find in tutorials and answers written for Zig 0.9 to 0.14; the right column is the 0.16 form. Every right-hand form was compiled with Zig 0.16.0 in one program (<code>a3_new.zig</code>) while writing this page, and the left-hand forms that appear in <a href="#appA4">A4</a> were confirmed to fail with the messages shown there. Where a chapter covers the topic, it is linked.</p>
+
+<div class="note"><strong>The three big changes.</strong> First, I/O is explicit: anything that touches the outside world takes an <code>std.Io</code> value, which <code>main</code> receives through <code>std.process.Init</code> (<a href="#ch33">Chapter 33</a>). Second, containers are unmanaged: <code>ArrayList</code> and the hash maps no longer store an allocator, so you pass one to every call that can allocate (<a href="#ch21">Chapter 21</a>). Third, casts infer their result type: <code>@intCast(x)</code>, not <code>@intCast(T, x)</code> (<a href="#ch04">Chapter 4</a>). Most rows below are an instance of one of these.</div>
+
+<h3 id="appA3-1">A3.1 Program entry, I/O and the process</h3>
+<table class="compare">
+<tr><th>Old form (tutorials)</th><th>Zig 0.16</th></tr>
+<tr><td><code>pub fn main() !void</code> with no way to reach I/O or an allocator except globals</td><td><code>pub fn main(init: std.process.Init) !void</code>; <code>init.io</code>, <code>init.gpa</code>, <code>init.arena</code>, <code>init.minimal.args</code>, <code>init.environ_map</code>. The old zero-parameter form still compiles for programs that only use <code>std.debug.print</code>.</td></tr>
+<tr><td><code>const out = std.io.getStdOut().writer();</code></td><td><code>var buf: [1024]u8 = undefined;<br>var w = std.Io.File.stdout().writer(init.io, &amp;buf);<br>const out = &amp;w.interface;</code> then <code>try out.print(…)</code> and <code>try out.flush()</code> at the end.</td></tr>
+<tr><td><code>std.io.getStdIn().reader().readUntilDelimiterOrEof(&amp;buf, '\n')</code></td><td><code>var r = std.Io.File.stdin().reader(init.io, &amp;buf);<br>const line = try r.interface.takeDelimiter('\n');</code> (returns <code>?[]u8</code>, <code>null</code> at end of input)</td></tr>
+<tr><td><code>std.io.bufferedWriter(file.writer())</code></td><td>Writers are buffered by construction: the buffer is the second argument of <code>.writer(io, &amp;buf)</code>. There is no separate wrapper.</td></tr>
+<tr><td><code>std.fs.cwd()</code></td><td><code>std.Io.Dir.cwd()</code>; every <code>Dir</code> and <code>File</code> method takes <code>io</code> first: <code>dir.createFile(io, "x", .{})</code>, <code>dir.openFile(io, …)</code>, <code>f.close(io)</code>, <code>dir.deleteFile(io, …)</code>.</td></tr>
+<tr><td><code>std.fs.cwd().readFileAlloc(alloc, path, max)</code></td><td><code>dir.readFileAlloc(io, path, alloc, .limited(1 &lt;&lt; 20))</code> (the limit is a <code>std.Io.Limit</code>, not an integer)</td></tr>
+<tr><td><code>std.time.timestamp()</code>, <code>std.time.milliTimestamp()</code></td><td><code>const now = std.Io.Clock.now(.real, io);</code> then <code>now.nanoseconds</code>. It is not an error union.</td></tr>
+<tr><td><code>std.time.Timer.start()</code></td><td>Gone. Take two readings of <code>std.Io.Clock.now(.awake, io)</code> and subtract the nanoseconds.</td></tr>
+<tr><td><code>std.time.sleep(ns)</code></td><td><code>try std.Io.sleep(io, .{ .nanoseconds = ns }, .awake);</code></td></tr>
+<tr><td><code>std.process.args()</code>, <code>std.process.argsAlloc(alloc)</code></td><td><code>var it = std.process.Args.Iterator.init(init.minimal.args);<br>_ = it.next(); // program name<br>while (it.next()) |arg| { … }</code></td></tr>
+<tr><td><code>std.os.getenv("HOME")</code>, <code>std.process.getEnvVarOwned</code></td><td><code>init.environ_map.get("HOME")</code> (returns <code>?[]const u8</code>)</td></tr>
+<tr><td><code>std.os.exit(1)</code></td><td><code>std.process.exit(1)</code></td></tr>
+<tr><td><code>std.ChildProcess.init(argv, alloc)</code> then <code>.spawn()</code></td><td><code>var child = try std.process.spawn(io, .{ .argv = &amp;.{ "echo", "hi" } });<br>const term = try child.wait(io);</code></td></tr>
+</table>
+
+<h3 id="appA3-2">A3.2 Containers and allocators</h3>
+<table class="compare">
+<tr><th>Old form (tutorials)</th><th>Zig 0.16</th></tr>
+<tr><td><code>var list = std.ArrayList(u32).init(alloc);<br>defer list.deinit();<br>try list.append(1);</code></td><td><code>var list: std.ArrayList(u32) = .empty;<br>defer list.deinit(gpa);<br>try list.append(gpa, 1);</code>. Every growing call takes the allocator; <code>toOwnedSlice(gpa)</code>, <code>appendSlice(gpa, …)</code> likewise. (<code>ArrayListUnmanaged</code> is the same type under its older name.)</td></tr>
+<tr><td><code>list.writer()</code> to format into an ArrayList of bytes</td><td><code>var aw: std.Io.Writer.Allocating = .init(gpa);<br>defer aw.deinit();<br>try aw.writer.print("{d}", .{1});<br>aw.written()</code></td></tr>
+<tr><td><code>std.io.fixedBufferStream(&amp;buf).writer()</code></td><td><code>var fw = std.Io.Writer.fixed(&amp;buf);<br>try fw.print("{d}", .{42});<br>fw.buffered()</code></td></tr>
+<tr><td><code>var m = std.AutoHashMap(u32, u32).init(alloc);</code></td><td><code>var m: std.AutoHashMapUnmanaged(u32, u32) = .empty;<br>defer m.deinit(gpa);<br>try m.put(gpa, 1, 2);</code>. Same for <code>StringHashMapUnmanaged</code> and the <code>ArrayHashMap</code> variants.</td></tr>
+<tr><td><code>var gpa = std.heap.GeneralPurposeAllocator(.{}){};</code></td><td><code>var dbg: std.heap.DebugAllocator(.{}) = .init;<br>defer _ = dbg.deinit();<br>const a = dbg.allocator();</code>, or simply use <code>init.gpa</code> in <code>main</code>.</td></tr>
+<tr><td><code>std.heap.c_allocator</code> without linking libc</td><td>Unchanged, but it needs <code>link_libc = true</code>; prefer <code>std.heap.page_allocator</code> or <code>init.gpa</code>.</td></tr>
+</table>
+
+<h3 id="appA3-3">A3.3 Language and reflection</h3>
+<table class="compare">
+<tr><th>Old form (tutorials)</th><th>Zig 0.16</th></tr>
+<tr><td><code>@intCast(u8, x)</code>, <code>@floatFromInt(f64, n)</code>, <code>@ptrCast(*T, p)</code></td><td><code>const y: u8 = @intCast(x);</code> or <code>@as(u8, @intCast(x))</code>. All casts infer the result type (<a href="#appA1">A1</a>).</td></tr>
+<tr><td><code>@typeInfo(T).Struct.fields</code>, <code>.Enum</code>, <code>.Union</code>, <code>.Int</code>, <code>.Pointer</code></td><td><code>@typeInfo(T).@"struct".fields</code>, <code>.@"enum"</code>, <code>.@"union"</code>, <code>.int</code>, <code>.pointer</code>, <code>.optional</code>, <code>.error_union</code>, <code>.@"fn"</code>: lower-case tags, quoted where they collide with keywords.</td></tr>
+<tr><td><code>usingnamespace other;</code></td><td>Gone. Re-export what you need by hand: <code>pub const answer = other.answer;</code></td></tr>
+<tr><td><code>@Type(.{ .Struct = … })</code></td><td>Gone in 0.16 ("invalid builtin function"). Build types with generics (<a href="#ch26">Chapter 26</a>) instead.</td></tr>
+<tr><td><code>for (items) |item, i|</code></td><td><code>for (items, 0..) |item, i|</code> (the index is a second iterable)</td></tr>
+<tr><td><code>async</code>, <code>await</code>, <code>suspend</code></td><td>Not in the language. Use threads (<a href="#ch36">Chapter 36</a>) or the <code>std.Io</code> interface.</td></tr>
+<tr><td><code>pub fn format(self: T, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void</code>, called by <code>{}</code></td><td><code>pub fn format(self: T, w: *std.Io.Writer) std.Io.Writer.Error!void</code>, called by <code>{f}</code>. Plain <code>{}</code> on a struct does not call it.</td></tr>
+<tr><td><code>std.fmt.format(writer, "…", args)</code></td><td><code>try writer.print("…", args)</code> on any <code>*std.Io.Writer</code></td></tr>
+<tr><td><code>std.testing.expectEqual(5, add(2, 3))</code> with an untyped literal</td><td>Still compiles in 0.16 when the literal coerces to the actual value's type. If you see "expected type 'u32', found 'i32'", the two sides have different types; fix with <code>@as(i32, 5)</code> on the expected side.</td></tr>
+</table>
+
+<h3 id="appA3-4">A3.4 Standard library renames</h3>
+<table class="compare">
+<tr><th>Old form (tutorials)</th><th>Zig 0.16</th></tr>
+<tr><td><code>std.rand.DefaultPrng</code>, <code>std.rand.Random</code></td><td><code>std.Random.DefaultPrng.init(seed)</code>; <code>prng.random()</code> returns a <code>std.Random</code>; <code>r.intRangeAtMost(u8, 1, 6)</code>.</td></tr>
+<tr><td><code>std.mem.split(u8, s, ",")</code>, <code>std.mem.tokenize(u8, s, " ")</code></td><td><code>std.mem.splitScalar(u8, s, ',')</code>, <code>std.mem.splitSequence(u8, s, "::")</code>, <code>std.mem.tokenizeScalar(u8, s, ' ')</code>, <code>tokenizeAny</code>, <code>tokenizeSequence</code>.</td></tr>
+<tr><td><code>std.sort.sort(u8, &amp;arr, {}, comptime std.sort.asc(u8))</code></td><td><code>std.mem.sort(u8, &amp;arr, {}, std.sort.asc(u8))</code></td></tr>
+<tr><td><code>std.Thread.Mutex{}</code> with <code>.lock()</code> / <code>.unlock()</code></td><td><code>var mtx: std.Io.Mutex = .init;<br>try mtx.lock(io);<br>mtx.unlock(io);</code>. <code>std.Thread.Mutex</code> no longer exists; the mutex takes the <code>io</code> because locking can be cancelled.</td></tr>
+<tr><td><code>std.atomic.Atomic(T)</code></td><td><code>std.atomic.Value(T).init(x)</code>; <code>.load(.seq_cst)</code>, <code>.store(x, .seq_cst)</code>, <code>.swap</code>, <code>.cmpxchgStrong</code>.</td></tr>
+<tr><td><code>thread.setName("worker")</code></td><td><code>try thread.setName(io, "worker")</code>. On macOS only a thread may name itself; naming another thread returns <code>error.Unsupported</code>, so write <code>catch {}</code> if the name is cosmetic.</td></tr>
+<tr><td><code>std.Thread.spawn(.{}, f, .{arg})</code></td><td>Unchanged; <code>th.join()</code> unchanged.</td></tr>
+<tr><td><code>std.debug.print</code>, <code>std.log.info</code></td><td>Unchanged; both write to stderr without an <code>io</code>. This is why the earliest chapters can print without touching <code>std.Io</code>.</td></tr>
+</table>
+
+<h3 id="appA3-5">A3.5 build.zig</h3>
+<table class="compare">
+<tr><th>Old form (tutorials)</th><th>Zig 0.16</th></tr>
+<tr><td><code>b.addExecutable(.{ .name = "x", .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize })</code></td><td><code>b.addExecutable(.{ .name = "x", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .imports = &amp;.{…} }) })</code>. The executable owns a module; imports are listed on the module.</td></tr>
+<tr><td><code>exe.addModule("game", mod)</code> or <code>exe.root_module.addImport(…)</code> after creation</td><td>List imports in <code>createModule</code>'s <code>.imports</code>, or call <code>mod.addImport("name", other)</code> on a module. <code>b.addModule("game", .{ .root_source_file = …, .target = target })</code> declares a module others can import.</td></tr>
+<tr><td><code>exe.linkLibC(); exe.linkSystemLibrary("sqlite3")</code></td><td><code>mod.link_libc = true; mod.linkSystemLibrary("sqlite3", .{});</code> on the module that needs it.</td></tr>
+<tr><td><code>b.addTest(.{ .root_source_file = … })</code></td><td><code>b.addTest(.{ .root_module = mod })</code>; one test executable per module, so a library and an executable need two.</td></tr>
+<tr><td><code>std.fs.cwd()</code> inside build.zig</td><td><code>b.build_root.handle.access(b.graph.io, path, .{})</code>, <code>std.Io.Dir.accessAbsolute(b.graph.io, …)</code>: the build runner has its own <code>io</code> in <code>b.graph.io</code>.</td></tr>
+<tr><td><code>exe.addAnonymousModule("data", .{ .source_file = … })</code></td><td><code>mod.addAnonymousImport("data_zon", .{ .root_source_file = b.path("data/x.zon") });</code> then <code>@import("data_zon")</code> in source (<a href="#ch40">Chapter 40</a>).</td></tr>
+</table>
+
+<h3 id="appA3-6">A3.6 The check program</h3>
+<p>The right-hand forms above were all compiled in one file. The parts most likely to surprise you are reproduced here so you can paste them into a scratch file and confirm your installed compiler agrees:</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+
+    var out_buf: [1024]u8 = undefined;
+    var out_w = std.Io.File.stdout().writer(io, &amp;out_buf);
+    const out = &amp;out_w.interface;
+
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(gpa);
+    try list.append(gpa, 1);
+
+    const now = std.Io.Clock.now(.real, io);
+    try out.print("ns {d}\n", .{now.nanoseconds});
+
+    var dir = std.Io.Dir.cwd();
+    var f = try dir.createFile(io, "a3_out.txt", .{});
+    var fb: [128]u8 = undefined;
+    var fw = f.writer(io, &amp;fb);
+    try fw.interface.print("line {d}\n", .{1});
+    try fw.interface.flush();
+    f.close(io);
+    const data = try dir.readFileAlloc(io, "a3_out.txt", gpa, .limited(1 &lt;&lt; 20));
+    defer gpa.free(data);
+    try dir.deleteFile(io, "a3_out.txt");
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try aw.writer.print("{d}-{s}", .{ 1, "x" });
+    try out.print("allocating {s}\n", .{aw.written()});
+
+    var mtx: std.Io.Mutex = .init;
+    try mtx.lock(io);
+    mtx.unlock(io);
+    try std.Io.sleep(io, .{ .nanoseconds = 1 }, .awake);
+
+    var child = try std.process.spawn(io, .{ .argv = &amp;.{ "echo", "spawned" } });
+    _ = try child.wait(io);
+
+    try out.flush();
+}</code></pre>
+<pre class="term">$ zig run a3_check.zig
+spawned
+ns 1788967362109410000
+allocating 1-x</pre>
+</section>

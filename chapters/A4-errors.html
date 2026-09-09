@@ -1,0 +1,256 @@
+<section id="appA4">
+<h2>Appendix A4. Common compile errors, decoded</h2>
+<p class="goals"><strong>This appendix</strong> collects the compiler messages a beginner meets most often, each reproduced by compiling a tiny file with Zig 0.16.0 while this page was written. For each: the code that triggers it, the message exactly as printed (file names and line numbers will differ), what it means, and the fix. The last section covers the three runtime panics that look like compile errors to a newcomer. <a href="#ch37">Chapter 37</a> explains how to read a message; this is the lookup table.</p>
+
+<div class="note"><strong>Reading a message.</strong> The first line is <code>file:line:column: error: …</code> and points at the exact token. Lines beginning <code>note:</code> add context (where a type was declared, which value is unhandled). Lines after <code>referenced by:</code> show the call chain that made the compiler look at this code, which is how a message inside the standard library (as in A4.24) leads back to your own line. Fix the first error and rebuild; later ones are often consequences of it.</div>
+
+<h3 id="appA4-1">A4.1 Unused and misused names</h3>
+
+<h4>A4.1 unused local constant</h4>
+<pre><code>pub fn main() void {
+    const x: u32 = 5;
+}</code></pre>
+<pre class="term">e01.zig:2:11: error: unused local constant</pre>
+<p><strong>Meaning.</strong> Every local must be used. <strong>Fix.</strong> Use it, delete it, or discard it on purpose with <code>_ = x;</code>. The same message reads "unused local variable" for a <code>var</code>. (<a href="#ch03">Chapter 3</a>)</p>
+
+<h4>A4.2 unused function parameter</h4>
+<pre><code>fn f(a: u32, b: u32) u32 {
+    return a;
+}</code></pre>
+<pre class="term">e02.zig:1:14: error: unused function parameter</pre>
+<p><strong>Meaning.</strong> <code>b</code> is never read. <strong>Fix.</strong> <code>_ = b;</code> as the first line of the body, or name the parameter <code>_</code> if it exists only to match a signature. (<a href="#ch07">Chapter 7</a>)</p>
+
+<h4>A4.3 local variable is never mutated</h4>
+<pre><code>pub fn main() void {
+    var x: u32 = 5;
+    _ = x;
+}</code></pre>
+<pre class="term">e03.zig:2:9: error: local variable is never mutated
+e03.zig:2:9: note: consider using 'const'</pre>
+<p><strong>Meaning.</strong> A <code>var</code> that is never assigned after initialisation must be a <code>const</code>. <strong>Fix.</strong> Do what the note says. This is the error you get most often after deleting code. (<a href="#ch03">Chapter 3</a>)</p>
+
+<h4>A4.4 pointless discard of local variable</h4>
+<pre><code>var x: u8 = 200;
+x += 100;
+_ = x;</code></pre>
+<pre class="term">e24.zig:4:9: error: pointless discard of local variable
+e24.zig:3:5: note: used here</pre>
+<p><strong>Meaning.</strong> You wrote <code>_ = x;</code> but <code>x</code> is already used. <strong>Fix.</strong> Remove the discard. (<a href="#ch03">Chapter 3</a>)</p>
+
+<h4>A4.5 local constant shadows declaration</h4>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    const std = 1;
+    _ = std;
+}</code></pre>
+<pre class="term">e04.zig:3:11: error: local constant shadows declaration of 'std'
+e04.zig:1:1: note: declared here</pre>
+<p><strong>Meaning.</strong> Zig forbids shadowing entirely; an inner name may not reuse an outer one. <strong>Fix.</strong> Rename the local. IRON LEDGER's slightly fussy names (<code>uit2</code>, <code>pit2</code>) exist because of this rule. (<a href="#ch07">Chapter 7</a>)</p>
+
+<h4>A4.6 unused capture</h4>
+<pre><code>const items = [_]u8{ 1, 2 };
+for (items) |item| {}</code></pre>
+<pre class="term">e31.zig:3:18: error: unused capture</pre>
+<p><strong>Meaning.</strong> The loop captures <code>item</code> and never reads it. <strong>Fix.</strong> Write <code>|_|</code> if you only want the iteration count, or use the value. (<a href="#ch06">Chapter 6</a>)</p>
+
+<h3 id="appA4-2">A4.2 Types and coercion</h3>
+
+<h4>A4.7 expected type 'X', found 'Y'</h4>
+<pre><code>pub fn main() void {
+    const s: []const u8 = 42;
+    _ = s;
+}</code></pre>
+<pre class="term">e11.zig:2:27: error: expected type '[]const u8', found 'comptime_int'</pre>
+<p><strong>Meaning.</strong> The value's type cannot coerce to the declared type. <strong>Fix.</strong> Supply a value of the right type, or convert explicitly. This message has a hundred variants; read both type names carefully, because the difference is often a <code>const</code>, a <code>?</code>, or a pointer versus a value (see A4.8, A4.9, A4.14). (<a href="#ch03">Chapter 3</a>)</p>
+
+<h4>A4.8 unsigned 8-bit int cannot represent all possible signed 64-bit values</h4>
+<pre><code>pub fn main() void {
+    var big: i64 = 300;
+    big += 1;
+    const small: u8 = big;
+    _ = small;
+}</code></pre>
+<pre class="term">e15.zig:4:23: error: expected type 'u8', found 'i64'
+e15.zig:4:23: note: unsigned 8-bit int cannot represent all possible signed 64-bit values</pre>
+<p><strong>Meaning.</strong> Integers only coerce implicitly when every value of the source fits the destination. <strong>Fix.</strong> <code>const small: u8 = @intCast(big);</code>, which checks at runtime, or <code>@truncate</code> if you mean to keep the low bits. (<a href="#ch04">Chapter 4</a>)</p>
+
+<h4>A4.9 type 'u8' cannot represent integer value '256'</h4>
+<pre><code>const x: u8 = 255 + 1;</code></pre>
+<pre class="term">e08.zig:2:23: error: type 'u8' cannot represent integer value '256'</pre>
+<p><strong>Meaning.</strong> The value is known at compile time and does not fit. <strong>Fix.</strong> Use a wider type, or if the wrap is intended, wrapping arithmetic (<code>+%</code>) on a runtime value. (<a href="#ch04">Chapter 4</a>)</p>
+
+<h4>A4.10 division with 'i32' and 'i32': signed integers must use @divTrunc, @divFloor, or @divExact</h4>
+<pre><code>var a: i32 = -7;
+a -= 1;
+const b: i32 = 2;
+std.debug.print("{d}\n", .{a / b});</code></pre>
+<pre class="term">e26.zig:6:34: error: division with 'i32' and 'i32': signed integers must use @divTrunc, @divFloor, or @divExact</pre>
+<p><strong>Meaning.</strong> Truncation and flooring differ on negatives, so Zig makes you choose. <strong>Fix.</strong> <code>@divTrunc(a, b)</code> for C-style rounding toward zero, as IRON LEDGER's <code>applyBp</code> does. (<a href="#ch04">Chapter 4</a>, <a href="#ch45">Chapter 45</a>)</p>
+
+<h4>A4.11 cannot compare strings with ==</h4>
+<pre><code>const a: []const u8 = "x";
+if (a == "x") std.debug.print("same\n", .{});</code></pre>
+<pre class="term">e16.zig:4:11: error: cannot compare strings with ==</pre>
+<p><strong>Meaning.</strong> Slices compare by pointer and length, not by contents, and the compiler refuses the obvious mistake. <strong>Fix.</strong> <code>std.mem.eql(u8, a, "x")</code>. (<a href="#ch11">Chapter 11</a>)</p>
+
+<h4>A4.12 invalid operands to binary expression: 'optional' and 'comptime_int'</h4>
+<pre><code>const m: ?u32 = 5;
+const n: u32 = m + 1;</code></pre>
+<pre class="term">e12.zig:3:22: error: invalid operands to binary expression: 'optional' and 'comptime_int'</pre>
+<p><strong>Meaning.</strong> An optional must be unwrapped before use. <strong>Fix.</strong> <code>(m orelse 0) + 1</code>, <code>if (m) |v| v + 1 else …</code>, or <code>m.? + 1</code> if you are sure it is not null. (<a href="#ch15">Chapter 15</a>)</p>
+
+<h4>A4.13 no field or member function named 'double' in '?P'</h4>
+<pre><code>const p: ?P = .{ .x = 1 };
+_ = p.double();</code></pre>
+<pre class="term">e30.zig:7:10: error: no field or member function named 'double' in '?e30.P'</pre>
+<p><strong>Meaning.</strong> The same optional trap with a method call: the type is <code>?P</code>, not <code>P</code>. <strong>Fix.</strong> Unwrap first. The message also appears, without the <code>?</code>, when you misspell a method or field name. (<a href="#ch15">Chapter 15</a>)</p>
+
+<h4>A4.14 expected type '*u32', found 'u32'</h4>
+<pre><code>fn bump(n: *u32) void { n.* += 1; }
+pub fn main() void {
+    var n: u32 = 1;
+    bump(n);
+}</code></pre>
+<pre class="term">e34.zig:4:10: error: expected type '*u32', found 'u32'
+e34.zig:1:12: note: parameter type declared here</pre>
+<p><strong>Meaning.</strong> The function wants a pointer and you passed a value. <strong>Fix.</strong> <code>bump(&amp;n);</code>. Method calls take the address for you (<code>gs.deinit()</code>), plain calls do not (<code>execute(&amp;gs, …)</code>). (<a href="#ch18">Chapter 18</a>)</p>
+
+<h4>A4.15 cannot assign to constant</h4>
+<pre><code>const x: u32 = 1;
+x = 2;</code></pre>
+<pre class="term">e14.zig:3:5: error: cannot assign to constant</pre>
+<p><strong>Meaning.</strong> Exactly what it says. The same message appears for <code>p.* = 2</code> through a <code>*const u32</code> obtained by <code>&amp;x</code> when <code>x</code> is <code>const</code>. <strong>Fix.</strong> Declare with <code>var</code>, or take a mutable pointer to a <code>var</code>. (<a href="#ch03">Chapter 3</a>, <a href="#ch18">Chapter 18</a>)</p>
+
+<h4>A4.16 slice of non-array type 'u32'</h4>
+<pre><code>const n: u32 = 5;
+const s = n[0..1];</code></pre>
+<pre class="term">e27.zig:3:16: error: slice of non-array type 'u32'</pre>
+<p><strong>Meaning.</strong> Only arrays, slices and many-item pointers can be sliced. <strong>Fix.</strong> Slice the container, not the element; if you meant bytes of an integer, use <code>std.mem.asBytes(&amp;n)</code>. (<a href="#ch10">Chapter 10</a>)</p>
+
+<h3 id="appA4-3">A4.3 Control flow and completeness</h3>
+
+<h4>A4.17 switch must handle all possibilities</h4>
+<pre><code>const Color = enum { red, green, blue };
+const n: u8 = switch (c) {
+    .red =&gt; 1,
+    .green =&gt; 2,
+};</code></pre>
+<pre class="term">e07.zig:4:19: error: switch must handle all possibilities
+e07.zig:1:34: note: unhandled enumeration value: 'blue'
+e07.zig:1:15: note: enum 'e07.Color' declared here</pre>
+<p><strong>Meaning.</strong> A switch on an enum, union or error set must name every case or have an <code>else</code>. <strong>Fix.</strong> Add the arm. This is the error IRON LEDGER relies on when a <code>Command</code> or <code>Effect</code> variant is added (<a href="#ch42">Chapter 42</a>, <a href="#ch46">Chapter 46</a>). For an integer switch the message is the same but with no note listing values; add <code>else</code>. (<a href="#ch06">Chapter 6</a>, <a href="#ch14">Chapter 14</a>)</p>
+
+<h4>A4.18 function with non-void return type 'u32' implicitly returns</h4>
+<pre><code>fn f(a: u32) u32 {
+    if (a &gt; 1) return 1;
+}</code></pre>
+<pre class="term">e18.zig:1:14: error: function with non-void return type 'u32' implicitly returns
+e18.zig:3:1: note: control flow reaches end of body here</pre>
+<p><strong>Meaning.</strong> Some path reaches the closing brace without returning. <strong>Fix.</strong> Add the missing <code>return</code>, or make the <code>if</code> an expression with an <code>else</code>. (<a href="#ch07">Chapter 7</a>)</p>
+
+<h4>A4.19 unreachable code</h4>
+<pre><code>pub fn main() void {
+    return;
+    const x = 1;
+    _ = x;
+}</code></pre>
+<pre class="term">e23.zig:3:5: error: unreachable code
+e23.zig:2:5: note: control flow is diverted here</pre>
+<p><strong>Meaning.</strong> Code after a <code>return</code>, <code>break</code>, <code>continue</code> or <code>unreachable</code> is an error, not a warning. <strong>Fix.</strong> Delete it or move the return. (<a href="#ch06">Chapter 6</a>)</p>
+
+<h4>A4.20 cannot return from defer expression</h4>
+<pre><code>defer {
+    return;
+}</code></pre>
+<pre class="term">e25.zig:3:9: error: cannot return from defer expression
+e25.zig:2:5: note: defer expression here</pre>
+<p><strong>Meaning.</strong> A <code>defer</code> block runs on the way out and may not change where the function returns to or what it returns. <strong>Fix.</strong> Do the cleanup and nothing else in the block; if the cleanup can fail, <code>catch {}</code> it. (<a href="#ch17">Chapter 17</a>)</p>
+
+<h3 id="appA4-4">A4.4 Errors and try</h3>
+
+<h4>A4.21 expected type 'void', found '…error_set' / function cannot return an error</h4>
+<pre><code>fn parse() !u32 { return std.fmt.parseInt(u32, "12", 10); }
+pub fn main() void {
+    const n = try parse();
+    _ = n;
+}</code></pre>
+<pre class="term">e05.zig:4:15: error: expected type 'void', found '@typeInfo(@typeInfo(@TypeOf(e05.parse)).@"fn".return_type.?).error_union.error_set'
+e05.zig:3:15: note: function cannot return an error</pre>
+<p><strong>Meaning.</strong> <code>try</code> returns the error from the current function, so the current function must be able to return one; <code>main</code> here returns <code>void</code>. The long type in the message is just "parse's error set". <strong>Fix.</strong> Change the return type to <code>!void</code>, or handle the error with <code>catch</code>. (<a href="#ch16">Chapter 16</a>)</p>
+
+<h4>A4.22 error union is ignored</h4>
+<pre><code>pub fn main() void {
+    parse();
+}</code></pre>
+<pre class="term">e13.zig:4:10: error: error union is ignored
+e13.zig:4:10: note: consider using 'try', 'catch', or 'if'</pre>
+<p><strong>Meaning.</strong> A call that can fail must have its result handled. <strong>Fix.</strong> One of the three in the note, or <code>_ = parse() catch {};</code> if you truly do not care. (<a href="#ch16">Chapter 16</a>)</p>
+
+<h4>A4.23 expectEqual: expected type 'u32', found 'i32'</h4>
+<pre><code>fn add(a: i32, b: i32) i32 { return a + b; }
+test "t" { try std.testing.expectEqual(@as(u32, 5), add(2, 3)); }</code></pre>
+<pre class="term">…/std/testing.zig:83:42: error: expected type 'u32', found 'i32'
+…/std/testing.zig:83:42: note: unsigned 32-bit int cannot represent all possible signed 32-bit values
+…/std/testing.zig:86:60: note: parameter type declared here
+e06.zig:3:39: note: called inline here</pre>
+<p><strong>Meaning.</strong> The expected and actual values have different types and the actual cannot coerce to the expected. The message points into the standard library; the last note is your line. <strong>Fix.</strong> Make the expected value's type match the function's return type: <code>@as(i32, 5)</code>. (An untyped literal, <code>expectEqual(5, add(2, 3))</code>, compiles in 0.16 because the literal coerces.) (<a href="#ch08">Chapter 8</a>)</p>
+
+<h3 id="appA4-5">A4.5 Compile-time and formatting</h3>
+
+<h4>A4.24 too few arguments (inside Writer.zig)</h4>
+<pre><code>std.debug.print("{d} {d}\n", .{1});</code></pre>
+<pre class="term">…/std/Io/Writer.zig:717:13: error: too few arguments
+referenced by:
+    print__anon_27067: …/std/debug.zig:311:39
+    main: e28.zig:3:20</pre>
+<p><strong>Meaning.</strong> Two placeholders, one argument. Format strings are checked at compile time, so the error is inside the formatter with your line in the <code>referenced by</code> chain. <strong>Fix.</strong> Match the tuple to the placeholders. The sibling message "invalid format string 'd' for type '[]const u8'" means a placeholder does not suit the argument's type; see <a href="#appA2">A2</a>. (<a href="#ch02">Chapter 2</a>, <a href="#ch23">Chapter 23</a>)</p>
+
+<h4>A4.25 unable to resolve comptime value / types must be comptime-known</h4>
+<pre><code>var n: usize = 3;
+n += 1;
+const arr: [n]u8 = undefined;</code></pre>
+<pre class="term">e22.zig:5:17: error: unable to resolve comptime value
+e22.zig:5:17: note: types must be comptime-known</pre>
+<p><strong>Meaning.</strong> An array length is part of a type, and types are fixed at compile time; <code>n</code> is a runtime value. <strong>Fix.</strong> Use a slice allocated at runtime (<code>try alloc.alloc(u8, n)</code>), or make <code>n</code> a <code>comptime</code> constant. (<a href="#ch09">Chapter 9</a>, <a href="#ch25">Chapter 25</a>)</p>
+
+<h4>A4.26 no field named 'Struct' in union 'builtin.Type'</h4>
+<pre><code>const n = @typeInfo(P).Struct.fields.len;</code></pre>
+<pre class="term">e19.zig:4:28: error: no field named 'Struct' in union 'builtin.Type'
+…/std/builtin.zig:550:18: note: union declared here</pre>
+<p><strong>Meaning.</strong> The <code>@typeInfo</code> tags were renamed to lower case (<code>.@"struct"</code>, <code>.@"enum"</code>, <code>.int</code>…). The tutorial you copied from is pre-0.14. <strong>Fix.</strong> See <a href="#appA3">A3</a>. (<a href="#ch27">Chapter 27</a>)</p>
+
+<h4>A4.27 root source file struct 'std' has no member named 'io'</h4>
+<pre><code>const out = std.io.getStdOut().writer();</code></pre>
+<pre class="term">e20.zig:3:21: error: root source file struct 'std' has no member named 'io'
+…/std/std.zig:1:1: note: struct declared here</pre>
+<p><strong>Meaning.</strong> <code>std.io</code> (lower case) is gone; I/O lives in <code>std.Io</code> and takes an <code>io</code> value. Any "has no member named" against <code>std</code> is a sign of a pre-0.16 tutorial. <strong>Fix.</strong> <a href="#appA3">A3</a>, first table. (<a href="#ch02">Chapter 2</a>)</p>
+
+<h4>A4.28 struct 'array_list.Aligned(u32,null)' has no member named 'init'</h4>
+<pre><code>var list = std.ArrayList(u32).init(std.heap.page_allocator);</code></pre>
+<pre class="term">e21.zig:3:34: error: struct 'array_list.Aligned(u32,null)' has no member named 'init'</pre>
+<p><strong>Meaning.</strong> Managed lists are gone; there is no <code>init(alloc)</code>. <strong>Fix.</strong> <code>var list: std.ArrayList(u32) = .empty;</code> and pass the allocator to <code>append</code>, <code>deinit</code> and friends. (<a href="#ch21">Chapter 21</a>)</p>
+
+<h3 id="appA4-6">A4.6 Three runtime panics that are not compile errors</h3>
+<p>These compile fine and stop the program with a stack trace in Debug and ReleaseSafe builds. The trace names the line; read it the same way.</p>
+
+<h4>A4.29 integer overflow</h4>
+<pre><code>var x: u8 = 200;
+x += 100;</code></pre>
+<pre class="term">thread 6004466 panic: integer overflow
+e24.zig:4:7: 0x10109dc53 in main (e24)
+    x += 100;
+      ^</pre>
+<p><strong>Meaning.</strong> Plain <code>+</code> is checked. <strong>Fix.</strong> A wider type, <code>+%</code> to wrap, <code>+|</code> to saturate, or <code>@addWithOverflow</code> to inspect. (<a href="#ch04">Chapter 4</a>)</p>
+
+<h4>A4.30 index out of bounds</h4>
+<pre class="term">thread 6003567 panic: index out of bounds: index 3, len 3
+e32.zig:6:37: 0x104341cd3 in main (e32)</pre>
+<p><strong>Meaning.</strong> Every index into an array or slice is checked against its length. <strong>Fix.</strong> Check the index, or use <code>if (i &lt; items.len)</code>; note that the message gives you both numbers. (<a href="#ch09">Chapter 9</a>)</p>
+
+<h4>A4.31 attempt to use null value</h4>
+<pre class="term">thread 6003651 panic: attempt to use null value
+e33.zig:5:33: 0x1028d1c97 in main (e33)
+    std.debug.print("{d}\n", .{m.?});
+                                ^</pre>
+<p><strong>Meaning.</strong> <code>.?</code> asserted an optional was non-null and it was null. <strong>Fix.</strong> <code>orelse</code> or <code>if (m) |v|</code>. IRON LEDGER uses <code>.?</code> only where the code just created the value it unwraps (<a href="#ch42">Chapter 42</a>). (<a href="#ch15">Chapter 15</a>)</p>
+</section>

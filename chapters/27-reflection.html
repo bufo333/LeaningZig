@@ -1,0 +1,853 @@
+<section id="ch27">
+<h2>27. Reflection with @typeInfo</h2>
+<p class="goals"><strong>In this chapter</strong> you will ask the compiler questions about types: what kind of thing a type is, what fields a struct has, what tags an enum has, and whether a name exists. You will use the answers, at compile time, to write one function that handles many types. By the end you will understand the tuning-table validator that IRON LEDGER runs on every build.</p>
+
+<h3 id="ch27-1">27.1 Types are values, and values have types</h3>
+<p>In <a href="#ch26">Chapter 26</a> you passed types into functions as <code>comptime T: type</code>. Reflection is the other direction: given a value or a type, ask the compiler what it is. The first tool is <code>@TypeOf</code>, which takes any expression and returns its type without evaluating it at run time. The second is <code>@typeName</code>, which turns a type into a string you can print.</p>
+<p class="file">typeof.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a = 42;
+    const b: u8 = 42;
+    const c = 2.5;
+    const name = "Shadow Hawk";
+    const list = [_]u16{ 1, 2, 3 };
+
+    std.debug.print("a is {s}\n", .{@typeName(@TypeOf(a))});
+    std.debug.print("b is {s}\n", .{@typeName(@TypeOf(b))});
+    std.debug.print("c is {s}\n", .{@typeName(@TypeOf(c))});
+    std.debug.print("name is {s}\n", .{@typeName(@TypeOf(name))});
+    std.debug.print("list is {s}\n", .{@typeName(@TypeOf(list))});
+    std.debug.print("list[0..] is {s}\n", .{@typeName(@TypeOf(list[0..]))});
+    std.debug.print("a + b is {s}\n", .{@typeName(@TypeOf(a + b))});
+}</code></pre>
+<pre class="term">a is comptime_int
+b is u8
+c is comptime_float
+name is *const [11:0]u8
+list is [3]u16
+list[0..] is *const [3]u16
+a + b is u8</pre>
+<p>Every line here teaches something you already half knew. A bare literal like <code>42</code> is a <code>comptime_int</code>, not a <code>u8</code> or an <code>i32</code>: it has no width until it meets a typed variable. A string literal is a pointer to a constant, sentinel-terminated array of bytes, which is why <code>"Shadow Hawk"</code> shows as <code>*const [11:0]u8</code>. Slicing an array with <code>[0..]</code> gives a pointer to the whole array, not a slice, because the length is still known. And <code>a + b</code> is a <code>u8</code>: the untyped literal adopted the concrete type next to it.</p>
+<div class="note"><strong>Why this matters.</strong> Zig has no <code>auto</code> keyword and no type inference across function boundaries, but inside an expression the compiler always knows the type. <code>@TypeOf</code> lets you name that type in places where you would otherwise repeat it, such as <code>var copy: @TypeOf(original) = original;</code>. It is also how generic functions with <code>anytype</code> parameters discover what they were given.</div>
+
+<h3 id="ch27-2">27.2 @typeInfo: a description of a type</h3>
+<p><code>@typeInfo(T)</code> returns a value of type <code>std.builtin.Type</code>, which is a tagged union (<a href="#ch14">Chapter 14</a>). Each tag names a kind of type, and most tags carry a payload struct with the details. Because it is a tagged union, you inspect it with <code>switch</code>, and because the argument is a type, the whole switch happens at compile time.</p>
+<p class="file">describe.zig</p>
+<pre><code>const std = @import("std");
+
+fn describe(comptime T: type) []const u8 {
+    return switch (@typeInfo(T)) {
+        .int =&gt; |info| if (info.signedness == .signed) "a signed integer" else "an unsigned integer",
+        .float =&gt; "a float",
+        .bool =&gt; "a boolean",
+        .pointer =&gt; "a pointer",
+        .array =&gt; "an array",
+        .optional =&gt; "an optional",
+        .error_union =&gt; "an error union",
+        .@"struct" =&gt; "a struct",
+        .@"enum" =&gt; "an enum",
+        .@"union" =&gt; "a union",
+        .@"fn" =&gt; "a function",
+        else =&gt; "something else",
+    };
+}
+
+const Role = enum { pilot, tech, medic };
+const Pilot = struct { name: []const u8, gunnery: u8 };
+
+pub fn main() void {
+    std.debug.print("u32:       {s}\n", .{describe(u32)});
+    std.debug.print("i8:        {s}\n", .{describe(i8)});
+    std.debug.print("f64:       {s}\n", .{describe(f64)});
+    std.debug.print("bool:      {s}\n", .{describe(bool)});
+    std.debug.print("*u8:       {s}\n", .{describe(*u8)});
+    std.debug.print("[]u8:      {s}\n", .{describe([]const u8)});
+    std.debug.print("[4]u8:     {s}\n", .{describe([4]u8)});
+    std.debug.print("?u8:       {s}\n", .{describe(?u8)});
+    std.debug.print("!u8:       {s}\n", .{describe(anyerror!u8)});
+    std.debug.print("Pilot:     {s}\n", .{describe(Pilot)});
+    std.debug.print("Role:      {s}\n", .{describe(Role)});
+    std.debug.print("fn:        {s}\n", .{describe(@TypeOf(describe))});
+}</code></pre>
+<pre class="term">u32:       an unsigned integer
+i8:        a signed integer
+f64:       a float
+bool:      a boolean
+*u8:       a pointer
+[]u8:      a pointer
+[4]u8:     an array
+?u8:       an optional
+!u8:       an error union
+Pilot:     a struct
+Role:      an enum
+fn:        a function</pre>
+<p>Two details of the spelling deserve a pause. The tags for struct, enum, union and function are <code>.@"struct"</code>, <code>.@"enum"</code>, <code>.@"union"</code> and <code>.@"fn"</code>: those words are keywords in Zig, and the <code>@"…"</code> syntax lets an identifier be spelled with a keyword. The other tags are plain lower-case words: <code>.int</code>, <code>.float</code>, <code>.bool</code>, <code>.pointer</code>, <code>.array</code>, <code>.optional</code>, <code>.error_union</code>, <code>.vector</code>, <code>.void</code>, <code>.type</code>.</p>
+<div class="warn"><strong>Old tutorials will mislead you.</strong> Before 0.14 the tags were capitalised: <code>.Int</code>, <code>.Struct</code>, <code>.Enum</code>. In 0.16 those do not exist. If a snippet on the web writes <code>@typeInfo(T).Struct.fields</code>, translate it to <code>@typeInfo(T).@"struct".fields</code>.</div>
+<p>Notice also that a slice (<code>[]const u8</code>) reports as <code>.pointer</code>. A slice is a pointer with a length, and the pointer payload tells you which flavour it is through a <code>size</code> field: <code>.one</code>, <code>.many</code>, <code>.slice</code> or <code>.c</code>.</p>
+<p>Here is the full list of tags in <code>std.builtin.Type</code> as shipped with 0.16, so you never have to guess:</p>
+<table>
+<tr><th>Tag</th><th>Payload fields you will use</th></tr>
+<tr><td><code>.int</code></td><td><code>signedness</code> (<code>.signed</code> / <code>.unsigned</code>), <code>bits</code></td></tr>
+<tr><td><code>.float</code></td><td><code>bits</code></td></tr>
+<tr><td><code>.bool</code>, <code>.void</code>, <code>.type</code>, <code>.comptime_int</code>, <code>.comptime_float</code></td><td>no payload</td></tr>
+<tr><td><code>.pointer</code></td><td><code>size</code>, <code>child</code>, <code>is_const</code>, <code>alignment</code>, <code>sentinel_ptr</code></td></tr>
+<tr><td><code>.array</code></td><td><code>len</code>, <code>child</code>, <code>sentinel_ptr</code></td></tr>
+<tr><td><code>.optional</code></td><td><code>child</code></td></tr>
+<tr><td><code>.error_union</code></td><td><code>error_set</code>, <code>payload</code></td></tr>
+<tr><td><code>.error_set</code></td><td>an optional slice of <code>Error</code> (<code>name</code>)</td></tr>
+<tr><td><code>.@"struct"</code></td><td><code>fields</code>, <code>decls</code>, <code>layout</code>, <code>is_tuple</code>, <code>backing_integer</code></td></tr>
+<tr><td><code>.@"enum"</code></td><td><code>fields</code>, <code>decls</code>, <code>tag_type</code>, <code>is_exhaustive</code></td></tr>
+<tr><td><code>.@"union"</code></td><td><code>fields</code>, <code>decls</code>, <code>tag_type</code> (optional), <code>layout</code></td></tr>
+<tr><td><code>.@"fn"</code></td><td><code>params</code>, <code>return_type</code>, <code>is_generic</code>, <code>calling_convention</code></td></tr>
+<tr><td><code>.vector</code></td><td><code>len</code>, <code>child</code></td></tr>
+<tr><td><code>.@"opaque"</code>, <code>.enum_literal</code>, <code>.null</code>, <code>.undefined</code>, <code>.noreturn</code></td><td>rare</td></tr>
+</table>
+
+<h3 id="ch27-3">27.3 Reading the payload</h3>
+<p>The tag tells you the kind; the payload tells you the details. You capture it in a switch arm with <code>|info|</code>, or reach for it directly with field syntax when you already know the kind: <code>@typeInfo(i16).int</code> is the <code>Int</code> payload, and it is a compile error if <code>i16</code> were not an integer.</p>
+<p class="file">intinfo.zig</p>
+<pre><code>const std = @import("std");
+
+fn bitsOf(comptime T: type) u16 {
+    return switch (@typeInfo(T)) {
+        .int =&gt; |i| i.bits,
+        .float =&gt; |f| f.bits,
+        else =&gt; @compileError("bitsOf wants a number type, got " ++ @typeName(T)),
+    };
+}
+
+pub fn main() void {
+    std.debug.print("u8 has {d} bits\n", .{bitsOf(u8)});
+    std.debug.print("i64 has {d} bits\n", .{bitsOf(i64)});
+    std.debug.print("u3 has {d} bits\n", .{bitsOf(u3)});
+    std.debug.print("f32 has {d} bits\n", .{bitsOf(f32)});
+    const info = @typeInfo(i16).int;
+    std.debug.print("i16: signedness={s} bits={d}\n", .{ @tagName(info.signedness), info.bits });
+    const opt = @typeInfo(?u32).optional;
+    std.debug.print("?u32 wraps {s}\n", .{@typeName(opt.child)});
+    const arr = @typeInfo([5]f32).array;
+    std.debug.print("[5]f32: {d} of {s}\n", .{ arr.len, @typeName(arr.child) });
+    const ptr = @typeInfo([]const u8).pointer;
+    std.debug.print("[]const u8: size={s} const={} child={s}\n", .{ @tagName(ptr.size), ptr.is_const, @typeName(ptr.child) });
+}</code></pre>
+<pre class="term">u8 has 8 bits
+i64 has 64 bits
+u3 has 3 bits
+f32 has 32 bits
+i16: signedness=signed bits=16
+?u32 wraps u32
+[5]f32: 5 of f32
+[]const u8: size=slice const=true child=u8</pre>
+<p><code>bitsOf</code> shows the standard shape of a reflective function: switch on the info, use the payload in the arms you support, and turn every other kind into a <code>@compileError</code> with a helpful message. The message is built with <code>++</code>, which concatenates strings at compile time, so it can include <code>@typeName(T)</code>. Try calling <code>bitsOf(bool)</code> and read the error: it names your function, your message and the offending type.</p>
+<div class="note"><strong>Compile errors are the point.</strong> A reflective function that quietly does the wrong thing for an unexpected type is worse than one that refuses. Always end the switch with <code>else =&gt; @compileError(…)</code> unless "do nothing" is genuinely the right behaviour, as it is in the validator later in this chapter.</div>
+
+<h3 id="ch27-4">27.4 Walking the fields of a struct</h3>
+<p>The most useful payload is <code>.@"struct".fields</code>: a slice of <code>StructField</code>, each with a <code>name</code>, a <code>type</code>, and whether it has a default. Combined with <code>inline for</code>, which unrolls the loop at compile time, and <code>@field(value, name)</code>, which reads a field by a compile-time known name, you can visit every field of any struct without knowing the struct in advance.</p>
+<p class="file">walk.zig</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    name: []const u8,
+    gunnery: u8,
+    piloting: u8,
+    salary: u32,
+    active: bool,
+};
+
+fn printFields(value: anytype) void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T).@"struct";
+    std.debug.print("{s} has {d} fields:\n", .{ @typeName(T), info.fields.len });
+    inline for (info.fields) |f| {
+        std.debug.print("  {s}: {s} = {any}\n", .{ f.name, @typeName(f.type), @field(value, f.name) });
+    }
+}
+
+pub fn main() void {
+    const p = Pilot{ .name = "Kell", .gunnery = 3, .piloting = 4, .salary = 1500, .active = true };
+    printFields(p);
+}</code></pre>
+<pre class="term">walk.Pilot has 5 fields:
+  name: []const u8 = { 75, 101, 108, 108 }
+  gunnery: u8 = 3
+  piloting: u8 = 4
+  salary: u32 = 1500
+  active: bool = true</pre>
+<p>Read <code>printFields</code> slowly. It takes <code>anytype</code>, so it is specialised per argument type. <code>@TypeOf(value)</code> recovers the type. <code>@typeInfo(T).@"struct"</code> would be a compile error for a non-struct, which is fine: that is the contract. Then <code>inline for</code> runs the body once per field, at compile time, with <code>f</code> a different constant each time. Inside, <code>f.name</code> is a string, <code>f.type</code> is a type, and <code>@field(value, f.name)</code> is the actual field value, with its own concrete type.</p>
+<p>The one blemish is the name: <code>{any}</code> printed the string as a list of byte values, because to the formatter a <code>[]const u8</code> is just a slice of integers. You already know the fix from <a href="#ch23">Chapter 23</a>: pick the format by type. Reflection lets you do that inside the loop.</p>
+<p class="file">walk2.zig</p>
+<pre><code>fn printFields(value: anytype) void {
+    const T = @TypeOf(value);
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        const v = @field(value, f.name);
+        switch (@typeInfo(f.type)) {
+            .int =&gt; std.debug.print("  {s} = {d}\n", .{ f.name, v }),
+            .bool =&gt; std.debug.print("  {s} = {}\n", .{ f.name, v }),
+            .pointer =&gt; std.debug.print("  {s} = \"{s}\"\n", .{ f.name, v }),
+            else =&gt; std.debug.print("  {s} = ?\n", .{f.name}),
+        }
+    }
+}
+</code></pre>
+<pre class="term">  name = "Kell"
+  gunnery = 3
+  piloting = 4
+  salary = 1500
+  active = true</pre>
+<p>The inner <code>switch (@typeInfo(f.type))</code> is resolved at compile time for each field, so the compiled program contains five straight-line print calls and no switch at all. This pattern, an outer <code>inline for</code> over fields and an inner switch on each field's kind, is the heart of every serializer, pretty-printer and validator written in Zig. Exercise 27.2 asks you to grow it into a general <code>toString</code>.</p>
+
+<h3 id="ch27-5">27.5 Writing fields by name</h3>
+<p><code>@field</code> works on the left of an assignment too, provided you have a pointer to the struct. This is how a settings screen or a command parser can map a run-time string like <code>"turnover"</code> onto a field, without a hand-written table that goes stale.</p>
+<p class="file">setfield.zig</p>
+<pre><code>const std = @import("std");
+
+const Tuning = struct { fatigue_tired: u8 = 30, exhausted: u8 = 70, turnover: u8 = 3 };
+
+fn setByName(t: *Tuning, name: []const u8, value: u8) bool {
+    inline for (@typeInfo(Tuning).@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) {
+            @field(t, f.name) = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn main() void {
+    var t = Tuning{};
+    _ = setByName(&amp;t, "turnover", 5);
+    const ok = setByName(&amp;t, "nonsense", 1);
+    std.debug.print("turnover={d} nonsense-accepted={}\n", .{ t.turnover, ok });
+}</code></pre>
+<pre class="term">turnover=5 nonsense-accepted=false</pre>
+<p>The <code>inline for</code> is unrolled at compile time, but the <code>std.mem.eql</code> inside runs at run time, once per field, because <code>name</code> is a run-time value. So this compiles to three string comparisons. That is the usual division of labour: the <em>shape</em> is fixed at compile time, the <em>data</em> flows at run time.</p>
+<div class="warn"><strong>All fields must accept the value.</strong> The line <code>@field(t, f.name) = value</code> is compiled once per field, so it must type-check for every field. Here every field is a <code>u8</code>, so a <code>u8</code> value works. If one field were a <code>u32</code> and another a <code>bool</code>, you would need an inner switch on <code>f.type</code> to convert or skip, exactly as in <code>walk2.zig</code>.</div>
+
+<h3 id="ch27-6">27.6 @hasField, @hasDecl and the decls list</h3>
+<p>Sometimes you do not need to walk everything; you just want to know whether a name exists. <code>@hasField(T, "name")</code> answers for fields, <code>@hasDecl(T, "name")</code> for declarations (functions and constants inside the struct). Both return a compile-time <code>bool</code>, so they combine naturally with <code>if</code> to select code paths per type.</p>
+<p class="file">has.zig</p>
+<pre><code>const std = @import("std");
+
+const Mek = struct {
+    tonnage: u32,
+    pub fn describe(self: Mek) u32 {
+        return self.tonnage;
+    }
+    pub const max_tonnage = 100;
+};
+const Rock = struct { mass: u32 };
+
+fn weightOf(thing: anytype) u32 {
+    const T = @TypeOf(thing);
+    if (@hasField(T, "tonnage")) return thing.tonnage;
+    if (@hasField(T, "mass")) return thing.mass;
+    @compileError(@typeName(T) ++ " has neither tonnage nor mass");
+}
+
+pub fn main() void {
+    std.debug.print("mek: {d}\n", .{weightOf(Mek{ .tonnage = 55 })});
+    std.debug.print("rock: {d}\n", .{weightOf(Rock{ .mass = 3 })});
+    std.debug.print("Mek has describe: {}\n", .{@hasDecl(Mek, "describe")});
+    std.debug.print("Rock has describe: {}\n", .{@hasDecl(Rock, "describe")});
+    inline for (@typeInfo(Mek).@"struct".decls) |d| {
+        std.debug.print("Mek decl: {s}\n", .{d.name});
+    }
+}</code></pre>
+<pre class="term">mek: 55
+rock: 3
+Mek has describe: true
+Rock has describe: false
+Mek decl: describe
+Mek decl: max_tonnage</pre>
+<p><code>weightOf</code> is a small example of what other languages call duck typing, except that it is checked when the program is compiled rather than when the line runs. Pass a type with neither field and the <code>@compileError</code> fires with the type's name in the message. Note that the <code>if</code> statements are not <code>comptime if</code> in any special syntax: because the condition is a compile-time constant, the compiler simply drops the branches that cannot be taken, including the <code>@compileError</code> when it is unreachable.</p>
+<p>The <code>decls</code> list only contains <em>public</em> declarations. Private functions are invisible to reflection from outside, which keeps <code>@hasDecl</code> honest as an interface check: "does this type provide a public <code>describe</code>?"</p>
+
+<h3 id="ch27-7">27.7 Enums under the microscope</h3>
+<p>Enums (<a href="#ch13">Chapter 13</a>) expose their tags through <code>.@"enum".fields</code>, each an <code>EnumField</code> with a <code>name</code> and an integer <code>value</code>. The payload also tells you the tag integer type and whether the enum is exhaustive. The length of the field list is a compile-time integer, so it can size an array.</p>
+<p class="file">enuminfo.zig</p>
+<pre><code>const std = @import("std");
+
+const Stream = enum { combat, market, weather, names };
+
+pub fn main() void {
+    const info = @typeInfo(Stream).@"enum";
+    std.debug.print("tag type {s}, exhaustive={}\n", .{ @typeName(info.tag_type), info.is_exhaustive });
+    inline for (info.fields) |f| {
+        std.debug.print("  {s} = {d}\n", .{ f.name, f.value });
+    }
+    var counters = [_]u32{0} ** info.fields.len;
+    counters[@intFromEnum(Stream.weather)] += 1;
+    std.debug.print("counters has {d} slots\n", .{counters.len});
+    const parsed = std.meta.stringToEnum(Stream, "market");
+    std.debug.print("parsed: {?}\n", .{parsed});
+}</code></pre>
+<pre class="term">tag type u2, exhaustive=true
+  combat = 0
+  market = 1
+  weather = 2
+  names = 3
+counters has 4 slots
+parsed: .market</pre>
+<p>Notice the tag type: the compiler picked <code>u2</code>, the smallest integer that holds four values. The array <code>counters</code> has exactly one slot per tag, and if someone adds a fifth stream to the enum, the array grows with it and no test needs to change. This is precisely how IRON LEDGER sizes its array of random number generators, one per <code>Stream</code>.</p>
+<p><code>std.meta.stringToEnum</code> is the standard library's version of the loop you would write yourself with <code>inline for</code> over the fields and <code>std.mem.eql</code>. Exercise 27.5 has you write it, so you can see there is no magic.</p>
+
+<h3 id="ch27-8">27.8 Making types: @Int and @Enum</h3>
+<p>Reflection also runs in reverse: you can construct a type from a description. Older Zig had one builtin, <code>@Type</code>, that took a <code>std.builtin.Type</code> value. Zig 0.16 removed it and replaced it with one builtin per kind: <code>@Int(signedness, bits)</code>, <code>@Enum(tag_type, mode, names, values)</code>, <code>@Struct(…)</code> and so on. You will rarely need these; the standard library wraps the common ones as <code>std.meta.Int</code>. But they are worth seeing once.</p>
+<p class="file">attype.zig</p>
+<pre><code>const std = @import("std");
+
+const U12 = @Int(.unsigned, 12);
+
+fn Unsigned(comptime bits: u16) type {
+    return @Int(.unsigned, bits);
+}
+
+const Color = @Enum(u8, .exhaustive, &amp;.{ "red", "green", "blue" }, &amp;.{ 0, 1, 2 });
+
+pub fn main() void {
+    const x: U12 = 4095;
+    std.debug.print("{s} max = {d}\n", .{ @typeName(U12), x });
+    const y: Unsigned(20) = 1_000_000;
+    std.debug.print("{s} holds {d}\n", .{ @typeName(@TypeOf(y)), y });
+    std.debug.print("Unsigned(12) == u12: {}\n", .{Unsigned(12) == u12});
+    std.debug.print("std.meta.Int(.signed, 7) == i7: {}\n", .{std.meta.Int(.signed, 7) == i7});
+    const c: Color = .green;
+    std.debug.print("Color.green = {d}\n", .{@intFromEnum(c)});
+}</code></pre>
+<pre class="term">u12 max = 4095
+u20 holds 1000000
+Unsigned(12) == u12: true
+std.meta.Int(.signed, 7) == i7: true
+Color.green = 1</pre>
+<p>Two things to take from this. First, types are compared with <code>==</code> and a constructed <code>u12</code> is the same type as the one you would write by hand; there is only one <code>u12</code>. Second, the arguments to <code>@Enum</code> are ordinary compile-time values (a slice of names, a slice of values), which means a program can compute an enum from a table. That is a deep rabbit hole; for this course, knowing that <code>@Type</code> is gone and <code>@Int</code> exists is enough.</p>
+<div class="warn"><strong>Trap.</strong> If you paste code that calls <code>@Type(.{ .int = … })</code>, 0.16 says <code>error: invalid builtin function: '@Type'</code>. Replace it with <code>@Int(.unsigned, bits)</code> or <code>std.meta.Int(.unsigned, bits)</code>.</div>
+
+<h3 id="ch27-9">27.9 Worked example: validating a tuning table</h3>
+<p>Now the pieces come together. IRON LEDGER keeps every balance constant in one nested struct, <code>Tuning</code>, loaded from a data file (the next chapter explains how). The designers wanted a test that checks every unsigned knob is positive and every basis-point knob (a field whose name ends in <code>_bp</code>) is at most 100,000, and they wanted the test to cover new knobs automatically. Here is the whole thing, with a small stand-in table so the file runs on its own.</p>
+<p class="file">tuning.zig</p>
+<pre><code>const std = @import("std");
+
+const Tuning = struct {
+    person: struct { fatigue_tired: u8, exhausted_fatigue: u8, turnover_target: u8 },
+    market: struct { fab_cost_bp: u32, fab_days: u32, morale_delta: i8 },
+};
+
+const t = Tuning{
+    .person = .{ .fatigue_tired = 30, .exhausted_fatigue = 70, .turnover_target = 3 },
+    .market = .{ .fab_cost_bp = 12_000, .fab_days = 14, .morale_delta = -2 },
+};
+
+fn checkPositive(comptime T: type, value: T, comptime name: []const u8) !void {
+    switch (@typeInfo(T)) {
+        .int =&gt; |info| {
+            if (info.signedness == .signed) return;
+            if (value &lt;= 0) {
+                std.debug.print("tuning field {s} must be positive\n", .{name});
+                return error.BadTuning;
+            }
+            if (std.mem.endsWith(u8, name, "_bp") and value &gt; 100_000) {
+                std.debug.print("tuning field {s} is over 100000 basis points\n", .{name});
+                return error.BadTuning;
+            }
+        },
+        .@"struct" =&gt; |info| inline for (info.fields) |f|
+            try checkPositive(f.type, @field(value, f.name), name ++ "." ++ f.name),
+        else =&gt; {},
+    }
+}
+
+test "every tuning value is positive and every basis-point knob is sane" {
+    try checkPositive(Tuning, t, "t");
+}
+
+test "a zero knob is caught" {
+    var bad = t;
+    bad.market.fab_days = 0;
+    try std.testing.expectError(error.BadTuning, checkPositive(Tuning, bad, "bad"));
+}
+
+test "a silly basis-point knob is caught" {
+    var bad = t;
+    bad.market.fab_cost_bp = 5_000_000;
+    try std.testing.expectError(error.BadTuning, checkPositive(Tuning, bad, "bad"));
+}</code></pre>
+<pre class="term">$ zig test tuning.zig
+1/3 tuning.test.every tuning value is positive and every basis-point knob is sane...OK
+2/3 tuning.test.a zero knob is caught...tuning field bad.market.fab_days must be positive
+OK
+3/3 tuning.test.a silly basis-point knob is caught...tuning field bad.market.fab_cost_bp is over 100000 basis points
+OK
+All 3 tests passed.</pre>
+<p>Walk through <code>checkPositive</code> one arm at a time.</p>
+<ul>
+<li>The <code>.int</code> arm is the only one that does run-time work. Signed integers are skipped entirely (deltas may be negative by design). Unsigned ones are compared against zero, and if the dotted name ends in <code>_bp</code>, against the basis-point ceiling. <code>std.mem.endsWith</code> runs on a <code>comptime</code> string here, so the compiler evaluates it and drops the whole <code>if</code> for fields whose names do not qualify.</li>
+<li>The <code>.@"struct"</code> arm is pure compile-time recursion. For each field it calls <code>checkPositive</code> again with three arguments: the field's type, the field's value read with <code>@field</code>, and a longer name made with <code>++</code>. Because <code>T</code> and <code>name</code> are <code>comptime</code> parameters, each call is a distinct specialisation, and by the time the program runs there is no recursion left, only a flat list of integer checks with their names baked into the error messages.</li>
+<li>The <code>else =&gt; {}</code> arm is deliberate. Floats, enums, booleans and strings are not knobs this test cares about, so it passes over them rather than refusing. This is the one place where a silent <code>else</code> is the right design, because the test is about a specific property, not about supporting every type.</li>
+</ul>
+<p>The payoff is in the last sentence of the guide's description: add a knob to the table and it is covered by this test with no change to the test. Exercise 27.4 asks you to extend the validator with arrays, optionals and floats.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The validator above is lifted almost line for line from <code>game/src/domain/tuning.zig</code>, where the real <code>Tuning</code> struct has seven sections and well over a hundred knobs; the test at the bottom of that file is simply <code>try checkPositive(Tuning, t, "t");</code>. The other big use of reflection is the SQLite binding in <code>game/src/persist/sqlite.zig</code>, which binds any value to a prepared statement by switching on its type:
+<pre><code>pub fn bind(self: Stmt, idx: c_int, value: anytype) Error!void {
+    const T = @TypeOf(value);
+    const rc = switch (@typeInfo(T)) {
+        .int, .comptime_int =&gt; sqlite3_bind_int64(self.h, idx, @intCast(value)),
+        .bool =&gt; sqlite3_bind_int64(self.h, idx, @intFromBool(value)),
+        .@"enum" =&gt; blk: {
+            if (@typeInfo(T).@"enum".is_exhaustive) {
+                const name = @tagName(value);
+                break :blk sqlite3_bind_text(self.h, idx, name.ptr, @intCast(name.len), transient);
+            }
+            break :blk sqlite3_bind_int64(self.h, idx, @intCast(@intFromEnum(value)));
+        },
+        .optional =&gt; if (value) |v| return self.bind(idx, v) else sqlite3_bind_null(self.h, idx),
+        .pointer =&gt; blk: {
+            const s: []const u8 = value;
+            break :blk sqlite3_bind_text(self.h, idx, s.ptr, @intCast(s.len), transient);
+        },
+        else =&gt; @compileError("unsupported bind type " ++ @typeName(T)),
+    };
+    // …
+}</code></pre>
+Read the enum arm: exhaustive enums are stored by name so a save file stays readable, while non-exhaustive typed IDs are stored as integers. That policy lives in one place because reflection let it.</div>
+
+<h3 id="ch27-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 27.1 · Describe a type <span class="level">warm-up</span></h4>
+  <p>Write <code>describe(comptime T: type) []const u8</code> returning a short kind name (distinguish slices from other pointers), <code>bitsOf</code> for ints and floats with a compile error otherwise, and <code>fits(T, n)</code> using <code>std.math.minInt</code> / <code>maxInt</code>. File: <code>exercises/27-reflection/ex1_describe.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 27, exercise 1: describe a type.
+//! Run with:  zig test ex1_describe.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Return a short human description of T, built only from @typeInfo.
+pub fn describe(comptime T: type) []const u8 {
+    return switch (@typeInfo(T)) {
+        .int =&gt; |i| if (i.signedness == .signed) "signed int" else "unsigned int",
+        .float =&gt; "float",
+        .bool =&gt; "bool",
+        .pointer =&gt; |p| if (p.size == .slice) "slice" else "pointer",
+        .array =&gt; "array",
+        .optional =&gt; "optional",
+        .error_union =&gt; "error union",
+        .@"struct" =&gt; "struct",
+        .@"enum" =&gt; "enum",
+        .@"union" =&gt; "union",
+        .@"fn" =&gt; "function",
+        else =&gt; "other",
+    };
+}
+
+/// How many bits an int or float occupies. Compile error for anything else.
+pub fn bitsOf(comptime T: type) u16 {
+    return switch (@typeInfo(T)) {
+        .int =&gt; |i| i.bits,
+        .float =&gt; |f| f.bits,
+        else =&gt; @compileError("bitsOf: not a number: " ++ @typeName(T)),
+    };
+}
+
+/// True when T is an integer that can hold `n` without overflow.
+pub fn fits(comptime T: type, n: comptime_int) bool {
+    return n &gt;= std.math.minInt(T) and n &lt;= std.math.maxInt(T);
+}
+
+test "describe" {
+    try std.testing.expectEqualStrings("unsigned int", describe(u8));
+    try std.testing.expectEqualStrings("signed int", describe(i32));
+    try std.testing.expectEqualStrings("float", describe(f16));
+    try std.testing.expectEqualStrings("slice", describe([]const u8));
+    try std.testing.expectEqualStrings("pointer", describe(*u8));
+    try std.testing.expectEqualStrings("array", describe([3]u8));
+    try std.testing.expectEqualStrings("optional", describe(?u8));
+    try std.testing.expectEqualStrings("error union", describe(anyerror!void));
+    try std.testing.expectEqualStrings("struct", describe(struct { a: u8 }));
+    try std.testing.expectEqualStrings("enum", describe(enum { a, b }));
+    try std.testing.expectEqualStrings("union", describe(union(enum) { a: u8 }));
+    try std.testing.expectEqualStrings("function", describe(@TypeOf(describe)));
+}
+
+test "bitsOf" {
+    try std.testing.expectEqual(@as(u16, 8), bitsOf(u8));
+    try std.testing.expectEqual(@as(u16, 3), bitsOf(u3));
+    try std.testing.expectEqual(@as(u16, 64), bitsOf(f64));
+}
+
+test "fits" {
+    try std.testing.expect(fits(u8, 255));
+    try std.testing.expect(!fits(u8, 256));
+    try std.testing.expect(fits(i8, -128));
+    try std.testing.expect(!fits(i8, 128));
+}</code></pre>
+  <p>The pointer arm captures its payload to look at <code>p.size</code>. <code>fits</code> needs no reflection at all: <code>std.math.maxInt(T)</code> is itself implemented with <code>@typeInfo</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 27.2 · A generic toString <span class="level">practice</span></h4>
+  <p>Write <code>toString(w: *std.Io.Writer, value: anytype)</code> that prints ints, floats, bools, enum tag names, optionals (<code>null</code> or the payload), <code>[]const u8</code> in quotes, arrays as <code>[a, b]</code> and structs as <code>{field=value, …}</code>, recursively. File: <code>exercises/27-reflection/ex2_tostring.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 27, exercise 2: a generic toString.
+//! Run with:  zig test ex2_tostring.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Write a readable form of `value` into `w`, choosing the format by type.
+/// Structs print as {field=value, ...}, enums as their tag name, optionals
+/// as "null" or the payload, []const u8 as quoted text.
+pub fn toString(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int, .comptime_int =&gt; try w.print("{d}", .{value}),
+        .float, .comptime_float =&gt; try w.print("{d:.2}", .{value}),
+        .bool =&gt; try w.print("{}", .{value}),
+        .@"enum" =&gt; try w.print("{s}", .{@tagName(value)}),
+        .optional =&gt; if (value) |v| try toString(w, v) else try w.writeAll("null"),
+        .pointer =&gt; |p| {
+            if (p.size == .slice and p.child == u8) {
+                try w.print("\"{s}\"", .{value});
+            } else if (p.size == .one) {
+                try toString(w, value.*);
+            } else {
+                @compileError("toString: unsupported pointer " ++ @typeName(T));
+            }
+        },
+        .array =&gt; {
+            try w.writeAll("[");
+            for (value, 0..) |item, i| {
+                if (i != 0) try w.writeAll(", ");
+                try toString(w, item);
+            }
+            try w.writeAll("]");
+        },
+        .@"struct" =&gt; |info| {
+            try w.writeAll("{");
+            inline for (info.fields, 0..) |f, i| {
+                if (i != 0) try w.writeAll(", ");
+                try w.print("{s}=", .{f.name});
+                try toString(w, @field(value, f.name));
+            }
+            try w.writeAll("}");
+        },
+        else =&gt; @compileError("toString: unsupported type " ++ @typeName(T)),
+    }
+}
+
+/// Convenience: render into a fixed buffer and return the written slice.
+pub fn toBuf(buf: []u8, value: anytype) ![]u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try toString(&amp;w, value);
+    return w.buffered();
+}
+
+const Role = enum { pilot, tech };
+const Pilot = struct { name: []const u8, role: Role, gunnery: u8, callsign: ?[]const u8 };
+
+test "scalars" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("42", try toBuf(&amp;buf, @as(u8, 42)));
+    try std.testing.expectEqualStrings("true", try toBuf(&amp;buf, true));
+    try std.testing.expectEqualStrings("tech", try toBuf(&amp;buf, Role.tech));
+    try std.testing.expectEqualStrings("null", try toBuf(&amp;buf, @as(?u8, null)));
+    try std.testing.expectEqualStrings("7", try toBuf(&amp;buf, @as(?u8, 7)));
+    try std.testing.expectEqualStrings("\"hi\"", try toBuf(&amp;buf, @as([]const u8, "hi")));
+}
+
+test "arrays and structs" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("[1, 2, 3]", try toBuf(&amp;buf, [_]u8{ 1, 2, 3 }));
+    const p = Pilot{ .name = "Kell", .role = .pilot, .gunnery = 3, .callsign = null };
+    try std.testing.expectEqualStrings(
+        "{name=\"Kell\", role=pilot, gunnery=3, callsign=null}",
+        try toBuf(&amp;buf, p),
+    );
+    const q = Pilot{ .name = "Ana", .role = .tech, .gunnery = 5, .callsign = "Wrench" };
+    try std.testing.expectEqualStrings(
+        "{name=\"Ana\", role=tech, gunnery=5, callsign=\"Wrench\"}",
+        try toBuf(&amp;buf, q),
+    );
+}
+
+test "nested struct" {
+    var buf: [128]u8 = undefined;
+    const Pos = struct { x: i32, y: i32 };
+    const Unit = struct { id: u16, pos: Pos };
+    try std.testing.expectEqualStrings(
+        "{id=9, pos={x=-1, y=4}}",
+        try toBuf(&amp;buf, Unit{ .id = 9, .pos = .{ .x = -1, .y = 4 } }),
+    );
+}</code></pre>
+  <p>Every arm either prints or recurses. The <code>.pointer</code> arm must decide between "a string" and "a pointer to one thing", which is why it inspects <code>p.size</code> and <code>p.child</code>. The <code>inline for</code> with <code>0..</code> gives an index so commas go between fields.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 27.3 · Generic deep equality <span class="level">practice</span></h4>
+  <p>Write <code>eql(a: anytype, b: @TypeOf(a)) bool</code> that compares scalars with <code>==</code>, optionals, arrays and slices element by element (slices by content, not address), structs field by field and tagged unions by tag then payload. File: <code>exercises/27-reflection/ex3_equal.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 27, exercise 3: a generic deep equality.
+//! Run with:  zig test ex3_equal.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Deep structural equality. Slices compare by content, not by address.
+pub fn eql(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    switch (@typeInfo(T)) {
+        .void =&gt; return true,
+        .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" =&gt; return a == b,
+        .optional =&gt; {
+            if (a == null and b == null) return true;
+            if (a == null or b == null) return false;
+            return eql(a.?, b.?);
+        },
+        .array =&gt; {
+            for (a, b) |x, y| if (!eql(x, y)) return false;
+            return true;
+        },
+        .pointer =&gt; |p| switch (p.size) {
+            .one =&gt; return eql(a.*, b.*),
+            .slice =&gt; {
+                if (a.len != b.len) return false;
+                for (a, b) |x, y| if (!eql(x, y)) return false;
+                return true;
+            },
+            else =&gt; @compileError("eql: unsupported pointer " ++ @typeName(T)),
+        },
+        .@"struct" =&gt; |info| {
+            inline for (info.fields) |f| {
+                if (!eql(@field(a, f.name), @field(b, f.name))) return false;
+            }
+            return true;
+        },
+        .@"union" =&gt; |info| {
+            if (info.tag_type == null) @compileError("eql: untagged union " ++ @typeName(T));
+            const Tag = info.tag_type.?;
+            const ta: Tag = a;
+            const tb: Tag = b;
+            if (ta != tb) return false;
+            inline for (info.fields) |f| {
+                if (ta == @field(Tag, f.name)) {
+                    return eql(@field(a, f.name), @field(b, f.name));
+                }
+            }
+            unreachable;
+        },
+        else =&gt; @compileError("eql: unsupported type " ++ @typeName(T)),
+    }
+}
+
+const Pilot = struct { name: []const u8, gunnery: u8, callsign: ?[]const u8 };
+const Event = union(enum) { none, wound: u8, promoted: []const u8 };
+
+test "scalars and optionals" {
+    try std.testing.expect(eql(@as(u8, 3), 3));
+    try std.testing.expect(!eql(@as(u8, 3), 4));
+    try std.testing.expect(eql(@as(?u8, null), null));
+    try std.testing.expect(!eql(@as(?u8, 1), null));
+}
+
+test "slices compare by content" {
+    const a: []const u8 = "Kell";
+    var storage = [_]u8{ 'K', 'e', 'l', 'l' };
+    const b: []const u8 = storage[0..];
+    try std.testing.expect(a.ptr != b.ptr);
+    try std.testing.expect(eql(a, b));
+    try std.testing.expect(!eql(a, @as([]const u8, "Kel")));
+}
+
+test "structs with slices and optionals" {
+    const p = Pilot{ .name = "Kell", .gunnery = 3, .callsign = "Ace" };
+    var q = Pilot{ .name = "Kell", .gunnery = 3, .callsign = "Ace" };
+    try std.testing.expect(eql(p, q));
+    q.callsign = null;
+    try std.testing.expect(!eql(p, q));
+    q.callsign = "Ace";
+    q.gunnery = 4;
+    try std.testing.expect(!eql(p, q));
+}
+
+test "tagged unions" {
+    try std.testing.expect(eql(Event{ .wound = 2 }, Event{ .wound = 2 }));
+    try std.testing.expect(!eql(Event{ .wound = 2 }, Event{ .wound = 3 }));
+    try std.testing.expect(!eql(Event{ .wound = 2 }, Event.none));
+    try std.testing.expect(eql(Event{ .promoted = "Sgt" }, Event{ .promoted = "Sgt" }));
+}
+
+test "arrays of structs" {
+    const a = [_]Pilot{ .{ .name = "A", .gunnery = 1, .callsign = null } };
+    const b = [_]Pilot{ .{ .name = "A", .gunnery = 1, .callsign = null } };
+    try std.testing.expect(eql(a, b));
+}</code></pre>
+  <p>The union arm is the subtle one: coerce both values to the tag type to compare tags, then <code>inline for</code> over the union fields and compare the payload of the matching one. A <code>void</code> payload (like <code>.none</code>) needs its own arm returning <code>true</code>, since <code>==</code> is not defined on <code>void</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 27.4 · A stronger tuning validator <span class="level">challenge</span></h4>
+  <p>Extend the worked example: unsigned ints must be positive, <code>_bp</code> names at most 100,000, floats within 0 and 1, optionals checked when present, arrays element by element, structs recursively. Report the dotted path of the bad knob. File: <code>exercises/27-reflection/ex4_validator.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 27, exercise 4: a tuning-table validator.
+//! Run with:  zig test ex4_validator.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Tuning = struct {
+    person: struct { fatigue_tired: u8, exhausted_fatigue: u8, morale_delta: i8 },
+    market: struct { fab_cost_bp: u32, fab_days: u32, rarity_target: [3]u8 },
+    battle: struct { salvage_bp: u32, retreat_chance: ?f32 },
+};
+
+pub const stock = Tuning{
+    .person = .{ .fatigue_tired = 30, .exhausted_fatigue = 70, .morale_delta = -2 },
+    .market = .{ .fab_cost_bp = 12_000, .fab_days = 14, .rarity_target = .{ 5, 3, 1 } },
+    .battle = .{ .salvage_bp = 2_500, .retreat_chance = 0.25 },
+};
+
+pub const Problem = error{ Zero, TooManyBasisPoints, BadFraction };
+
+/// Walk `value` recursively. Rules:
+///  - unsigned ints must be &gt; 0                     (error.Zero)
+///  - names ending in _bp must be &lt;= 100_000        (error.TooManyBasisPoints)
+///  - floats must be within 0.0 ... 1.0 inclusive   (error.BadFraction)
+///  - signed ints are free, optionals check the payload when present,
+///    arrays check every element, structs recurse into every field.
+/// On failure, print "bad knob: &lt;dotted.path&gt;" to stderr before returning.
+pub fn validate(comptime T: type, value: T, comptime path: []const u8) Problem!void {
+    switch (@typeInfo(T)) {
+        .int =&gt; |info| {
+            if (info.signedness == .signed) return;
+            if (value == 0) return fail(path, error.Zero);
+            const is_bp = comptime std.mem.endsWith(u8, path, "_bp");
+            if (is_bp and value &gt; 100_000) return fail(path, error.TooManyBasisPoints);
+        },
+        .float =&gt; if (value &lt; 0.0 or value &gt; 1.0) return fail(path, error.BadFraction),
+        .optional =&gt; |o| if (value) |v| try validate(o.child, v, path),
+        .array =&gt; |a| for (value) |item| try validate(a.child, item, path ++ "[]"),
+        .@"struct" =&gt; |info| inline for (info.fields) |f|
+            try validate(f.type, @field(value, f.name), path ++ "." ++ f.name),
+        else =&gt; {},
+    }
+}
+
+fn fail(path: []const u8, err: Problem) Problem!void {
+    std.debug.print("bad knob: {s}\n", .{path});
+    return err;
+}
+
+test "stock tuning passes" {
+    try validate(Tuning, stock, "t");
+}
+
+test "zero in a nested struct" {
+    var t = stock;
+    t.market.fab_days = 0;
+    try std.testing.expectError(error.Zero, validate(Tuning, t, "t"));
+}
+
+test "basis points too large" {
+    var t = stock;
+    t.battle.salvage_bp = 200_000;
+    try std.testing.expectError(error.TooManyBasisPoints, validate(Tuning, t, "t"));
+}
+
+test "zero inside an array element" {
+    var t = stock;
+    t.market.rarity_target[2] = 0;
+    try std.testing.expectError(error.Zero, validate(Tuning, t, "t"));
+}
+
+test "optional float out of range, and null is fine" {
+    var t = stock;
+    t.battle.retreat_chance = 1.5;
+    try std.testing.expectError(error.BadFraction, validate(Tuning, t, "t"));
+    t.battle.retreat_chance = null;
+    try validate(Tuning, t, "t");
+}
+
+test "signed ints may be negative" {
+    var t = stock;
+    t.person.morale_delta = -100;
+    try validate(Tuning, t, "t");
+}</code></pre>
+  <p>One trap worth remembering: <code>comptime std.mem.endsWith(…) and value &gt; 100_000</code> makes the <code>comptime</code> keyword apply to the whole <code>and</code> expression, which fails because <code>value</code> is a run-time value. Bind the compile-time part to a constant first.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 27.5 · Enum tables without std.meta <span class="level">practice</span></h4>
+  <p>Write <code>parseEnum(E, text)</code> using only <code>@typeInfo(E).@"enum".fields</code>, <code>names(E)</code> returning a fixed-size array of tag names, and <code>Counter(E)</code>, a struct with one <code>u32</code> per tag. File: <code>exercises/27-reflection/ex5_enumtable.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 27, exercise 5: enum tables from reflection.
+//! Run with:  zig test ex5_enumtable.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Parse a tag name into an enum value, using only @typeInfo (no std.meta).
+pub fn parseEnum(comptime E: type, text: []const u8) ?E {
+    inline for (@typeInfo(E).@"enum".fields) |f| {
+        if (std.mem.eql(u8, f.name, text)) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
+/// All tag names of E, as a comptime array of strings, in declaration order.
+pub fn names(comptime E: type) [@typeInfo(E).@"enum".fields.len][]const u8 {
+    const fields = @typeInfo(E).@"enum".fields;
+    var out: [fields.len][]const u8 = undefined;
+    inline for (fields, 0..) |f, i| out[i] = f.name;
+    return out;
+}
+
+/// A fixed array with one slot per enum tag, indexed by @intFromEnum.
+pub fn Counter(comptime E: type) type {
+    return struct {
+        counts: [@typeInfo(E).@"enum".fields.len]u32 = @splat(0),
+        const Self = @This();
+        pub fn bump(self: *Self, e: E) void {
+            self.counts[@intFromEnum(e)] += 1;
+        }
+        pub fn get(self: Self, e: E) u32 {
+            return self.counts[@intFromEnum(e)];
+        }
+    };
+}
+
+const Role = enum { pilot, tech, medic, admin };
+
+test "parseEnum" {
+    try std.testing.expectEqual(@as(?Role, .medic), parseEnum(Role, "medic"));
+    try std.testing.expectEqual(@as(?Role, null), parseEnum(Role, "cook"));
+}
+
+test "names" {
+    const n = names(Role);
+    try std.testing.expectEqual(@as(usize, 4), n.len);
+    try std.testing.expectEqualStrings("pilot", n[0]);
+    try std.testing.expectEqualStrings("admin", n[3]);
+}
+
+test "Counter" {
+    var c = Counter(Role){};
+    c.bump(.tech);
+    c.bump(.tech);
+    c.bump(.admin);
+    try std.testing.expectEqual(@as(u32, 2), c.get(.tech));
+    try std.testing.expectEqual(@as(u32, 0), c.get(.pilot));
+    try std.testing.expectEqual(@as(usize, 4), c.counts.len);
+}</code></pre>
+  <p>The return type of <code>names</code> uses the field count directly in an array type, which is legal because <code>@typeInfo</code> is evaluated at compile time. <code>@splat(0)</code> fills the counter array whatever its length.</p></details>
+</div>
+
+<h3 id="ch27-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is <code>@TypeOf(1 + @as(u16, 2))</code>? <details class="answer"><summary>Answer</summary><code>u16</code>. The untyped literal adopts the concrete type of the other operand.</details></li>
+  <li>How do you spell the struct tag of <code>@typeInfo</code> in 0.16, and why? <details class="answer"><summary>Answer</summary><code>.@"struct"</code>. <code>struct</code> is a keyword, so the identifier must be quoted with <code>@"…"</code>. The same applies to <code>.@"enum"</code>, <code>.@"union"</code>, <code>.@"fn"</code> and <code>.@"opaque"</code>.</details></li>
+  <li>Which kind does <code>[]const u8</code> report, and how do you tell it apart from <code>*u8</code>? <details class="answer"><summary>Answer</summary>Both are <code>.pointer</code>. The payload's <code>size</code> field is <code>.slice</code> for the first and <code>.one</code> for the second.</details></li>
+  <li>Why must a loop over <code>@typeInfo(T).@"struct".fields</code> be an <code>inline for</code>? <details class="answer"><summary>Answer</summary>Each field has a different type, so the loop body must be compiled separately per field. <code>inline for</code> unrolls the loop at compile time so each iteration sees a constant field descriptor.</details></li>
+  <li>What does <code>@field(value, "x")</code> require of its second argument? <details class="answer"><summary>Answer</summary>It must be known at compile time. A run-time string cannot be used directly; you loop over the fields and compare with <code>std.mem.eql</code>, as <code>setByName</code> does.</details></li>
+  <li>Does <code>@hasDecl(T, "helper")</code> see a private <code>fn helper</code> from another file? <details class="answer"><summary>Answer</summary>No. Reflection over declarations only sees <code>pub</code> declarations, so <code>@hasDecl</code> is effectively an interface check.</details></li>
+  <li>What replaced <code>@Type</code> in Zig 0.16? <details class="answer"><summary>Answer</summary>Per-kind builtins: <code>@Int</code>, <code>@Enum</code>, <code>@Struct</code> and friends, wrapped by helpers such as <code>std.meta.Int</code>.</details></li>
+  <li>In the tuning validator, how much of the recursion survives into the compiled program? <details class="answer"><summary>Answer</summary>None. Because the type and the name are <code>comptime</code>, every recursive call is a separate specialisation resolved during compilation; only the integer comparisons remain at run time.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>@TypeOf</code> gives the type of any expression; <code>@typeName</code> prints it.</li>
+<li><code>@typeInfo(T)</code> is a tagged union; switch on it at compile time. Tags are lower-case, with <code>.@"struct"</code>, <code>.@"enum"</code>, <code>.@"union"</code>, <code>.@"fn"</code> quoted.</li>
+<li>Payloads carry the details: bits and signedness for ints, <code>child</code> for optionals and pointers, <code>fields</code> and <code>decls</code> for structs and enums.</li>
+<li><code>inline for</code> over <code>fields</code> plus <code>@field</code> lets one function walk any struct, reading or writing fields by name.</li>
+<li><code>@hasField</code> and <code>@hasDecl</code> answer yes-or-no questions; end reflective switches with <code>@compileError</code> unless skipping is intended.</li>
+<li>Enum field lists size arrays automatically and let you write your own <code>stringToEnum</code>.</li>
+<li><code>@Type</code> is gone in 0.16; <code>@Int</code>, <code>@Enum</code> and <code>std.meta.Int</code> build types.</li>
+<li>Compile-time recursion over a nested struct gives you a validator that covers new fields for free.</li>
+</ul></div>
+</section>

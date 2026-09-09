@@ -1,0 +1,277 @@
+<section id="ch45">
+<h2>45. Money without floats</h2>
+<p class="goals"><strong>In this chapter</strong> you see how a game whose whole subject is money gets by without a single floating-point number. Every amount is a 64-bit integer, every multiplier is basis points, and money moves in exactly one way: a ledger entry and a treasury balance changing together. You will read that one function, the ledger it feeds, and the summaries built on top, and you will test the rounding rule that makes it all reproducible.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch04">Chapter 4</a> (<code>i64</code>, <code>@divTrunc</code> versus <code>@divFloor</code>, and why signed division must name its rounding), <a href="#ch05">Chapter 5</a> (why floats are not exact and why that matters for money), <a href="#ch14">Chapter 14</a> (a small tagged union, <code>Treasury</code>, switched on with payload captures), <a href="#ch12">Chapter 12</a> (a struct with defaulted fields used as a record), <a href="#ch21">Chapter 21</a> (a list you only ever append to) and <a href="#ch27">Chapter 27</a> (an array sized by an enum's variant count).</div>
+
+<h3 id="ch45-1">45.1 Two types and one function</h3>
+<p>The entire monetary type system of IRON LEDGER is at the top of <code>src/domain/types.zig</code>:</p>
+<div class="file">src/domain/types.zig</div>
+<pre><code>/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points (1/100 of a percent) for all multiplier math, so payment
+/// formulas stay in integer arithmetic. 10_000 bp == ×1.0.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+test "basis point math stays in integers" {
+    try std.testing.expectEqual(@as(CBills, 1_500), applyBp(1_500, 10_000));
+    try std.testing.expectEqual(@as(CBills, 900), applyBp(1_500, 6_000));
+    try std.testing.expectEqual(@as(CBills, 4_800), applyBp(1_500, 32_000));
+}</code></pre>
+<p>Both are aliases for <code>i64</code>. The aliases buy readability, not safety: the compiler will happily let you add a <code>Bp</code> to a <code>CBills</code>, and the discipline of not doing so is a house rule enforced by review and by the fact that every multiplier goes through <code>applyBp</code>. A 10 percent markup is <code>applyBp(cost, 11_000)</code>. A green pilot's 0.6 salary multiplier is <code>6_000</code>. An elite pilot's 3.2 is <code>32_000</code>. The test pins those three.</p>
+<p>Why not a <code>f64</code> and <code>cost * 1.1</code>? <a href="#ch05">Chapter 5</a> gave the general answer: 0.1 is not representable in binary floating point, so a chain of multiplications drifts, and two machines (or two compiler versions) can drift differently. For a game whose determinism test hashes the treasury balance, "differently" is a failing build. With integers, <code>1_500 * 6_000 / 10_000</code> is 900 on every machine ever made.</p>
+<p>The one subtlety is rounding. <code>amount * bp</code> is exact in <code>i64</code> for any amount the game will see (a trillion C-bills times a hundred thousand basis points is far inside 63 bits). The division is where a fraction of a C-bill is lost, and Zig makes you say how: <code>@divTrunc</code> rounds toward zero, so <code>applyBp(-1_500, 6_000)</code> is <code>-900</code> and <code>applyBp(-1, 5_000)</code> is <code>0</code>, not <code>-1</code>. <code>@divFloor</code> would give <code>-1</code> for the latter. Neither is wrong; what would be wrong is not choosing, and Zig does not let you write <code>/</code> on signed integers at runtime for exactly that reason (<a href="#ch04">Chapter 4</a>, and appendix <a href="#appA4">A4</a> shows the error).</p>
+
+<h3 id="ch45-2">45.2 The ledger</h3>
+<p>Money is recorded in one place, a list of transactions that only ever grows:</p>
+<div class="file">src/econ/finance.zig</div>
+<pre><code>pub const Category = enum {
+    contract_payment,
+    advance,
+    salvage,
+    battle_loss_comp,
+    breach_clawback,
+    payroll,
+    hardship_pay, // remote-deployment payroll bonus (ARCH §9.6)
+    maintenance,
+    hull_upkeep, // per-hull monthly carry cost, running or not (ARCH §9.8)
+    parts,
+    supplies,
+    local_supplies, // bought beyond the ring at 2–4× (ARCH §9.6)
+    freight,
+    unit_purchase,
+    unit_sale,
+    fabrication, // structural parts made at a regional HQ (ARCH §9.8)
+    fund_transfer, // outfit treasury ↔ company local funds (ARCH §9.8)
+    hq_construction,
+    hq_upkeep,
+    transport_charter,
+    loan_principal,
+    loan_interest,
+    event,
+    misc,
+};
+
+pub const Transaction = struct {
+    day: u32,
+    amount: types.CBills, // signed: income +, expense −
+    category: Category,
+    /// Cost/profit center; .none = outfit-level overhead.
+    company: types.ForceId = .none,
+    /// HQ cost center (Stage 9A).
+    hq: types.HqId = .none,
+    contract: types.ContractId = .none,
+    note: []const u8 = "",
+};
+
+pub const Ledger = struct {
+    transactions: std.ArrayListUnmanaged(Transaction) = .empty,
+
+    pub fn post(self: *Ledger, alloc: std.mem.Allocator, txn: Transaction) !void {
+        try self.transactions.append(alloc, txn);
+    }
+
+    pub fn balance(self: *const Ledger) types.CBills {
+        var total: types.CBills = 0;
+        for (self.transactions.items) |t| total += t.amount;
+        return total;
+    }
+
+    /// Net for one company over [from_day, to_day] — the monthly P&amp;L view.
+    pub fn companyNet(self: *const Ledger, company: types.ForceId, from_day: u32, to_day: u32) types.CBills {
+        var total: types.CBills = 0;
+        for (self.transactions.items) |t| {
+            if (t.company == company and t.day &gt;= from_day and t.day &lt;= to_day) total += t.amount;
+        }
+        return total;
+    }
+};</code></pre>
+<p>A <code>Transaction</code> is a record: a day, a signed amount, a category, and three typed-ID tags that default to <code>.none</code>. The sign convention is in the comment and nowhere else; income is positive, expense negative, and every caller writes <code>.amount = -cost</code> when spending. The tags are what make the ledger a database rather than a log: "the P&amp;L of Alpha Company for March" is <code>companyNet</code>, a filter over the same list, and "what has this contract paid so far" is another filter. There is no second copy of any total anywhere that could disagree with the list.</p>
+<p><code>Ledger</code> stores no allocator; <code>post</code> takes one, and in the game it is always the campaign arena via <code>gs.allocator()</code>. The two finance tests at the bottom of the file use <code>std.testing.allocator</code> and call <code>ledger.deinit(alloc)</code>, which is the only reason that method exists.</p>
+
+<h3 id="ch45-3">45.3 The only way money moves</h3>
+<p>A ledger on its own would let a balance and its history drift apart. The game prevents that by having exactly one function that does both:</p>
+<div class="file">src/sim/state.zig</div>
+<pre><code>/// Where money lives (Stage 9A, ARCH §11): the outfit's central treasury,
+/// an HQ's funds, or a deployed company's operating fund. Spending resolves
+/// where the spender stands — the treasury cannot teleport.
+pub const Treasury = union(enum) {
+    outfit,
+    hq: types.HqId,
+    company: types.ForceId,
+};
+
+/// Post to the outfit's central treasury (the common case).
+pub fn postTransaction(self: *GameState, txn: finance_mod.Transaction) !void {
+    try self.postTreasury(.outfit, txn);
+}
+
+/// The only way money moves: ledger entry + the named treasury's balance,
+/// in lockstep. Balances MAY go negative (obligations don't wait);
+/// purchases that should refuse instead call `debitOrRefuse` first.
+pub fn postTreasury(self: *GameState, treasury: Treasury, txn: finance_mod.Transaction) !void {
+    try self.ledger.post(self.allocator(), txn);
+    switch (treasury) {
+        .outfit =&gt; self.funds += txn.amount,
+        .hq =&gt; |id| if (self.hqs.getPtr(id)) |h| {
+            h.funds += txn.amount;
+        },
+        .company =&gt; |id| if (self.forces.getPtr(id)) |f| {
+            f.local_funds += txn.amount;
+        },
+    }
+}
+
+pub fn treasuryBalance(self: *GameState, treasury: Treasury) types.CBills {
+    return switch (treasury) {
+        .outfit =&gt; self.funds,
+        .hq =&gt; |id| if (self.hqs.getPtr(id)) |h| h.funds else 0,
+        .company =&gt; |id| if (self.forces.getPtr(id)) |f| f.local_funds else 0,
+    };
+}</code></pre>
+<p><code>Treasury</code> is the small tagged union the guide mentioned: "which till" is a typed value, and a switch over it is exhaustive, so a fourth kind of treasury would have to be handled in both functions before the program compiled. <code>postTreasury</code> appends to the ledger and then adjusts the one named balance, in that order, in one function, with no early return between them. If <code>post</code> fails (out of memory), the balance is untouched and the error propagates. There is no code path in which one happens without the other.</p>
+<p>Read the doc comment's second sentence: balances may go negative. Payroll on the first of the month is posted whether or not the outfit can pay it; the consequence is an insolvent turn (<a href="#ch42">Chapter 42</a>'s <code>advance</code>), not a skipped payroll. Purchases that should refuse are a separate, four-line function in <code>commands.zig</code>:</p>
+<pre><code>fn debitPurchase(gs: *GameState, treasury: state_mod.Treasury, txn: @import("../econ/finance.zig").Transaction) Error!void {
+    if (gs.treasuryBalance(treasury) &lt; -txn.amount) return Error.InsufficientTreasury;
+    try gs.postTreasury(treasury, txn);
+}</code></pre>
+<p>Check, then post. Because <code>txn.amount</code> is negative for a purchase, the comparison is against <code>-txn.amount</code>. This is the "all checks, then all effects" discipline of <a href="#ch42">Chapter 42</a> in its smallest form.</p>
+
+<h3 id="ch45-4">45.4 Sums with different filters</h3>
+<p>Every report about money is a pass over the list with a filter. The P&amp;L view is the most general:</p>
+<div class="file">src/econ/finance.zig</div>
+<pre><code>/// Which entity's books to read (Stage 9A).
+pub const EntityFilter = union(enum) {
+    all,
+    company: types.ForceId,
+    hq: types.HqId,
+
+    pub fn matches(self: EntityFilter, t: *const Transaction) bool {
+        return switch (self) {
+            .all =&gt; true,
+            .company =&gt; |id| t.company == id,
+            .hq =&gt; |id| t.hq == id,
+        };
+    }
+};
+
+pub const Summary = struct {
+    income: types.CBills = 0,
+    expenses: types.CBills = 0, // stored positive
+    by_category: [category_count]types.CBills = @splat(0),
+
+    pub const category_count = @typeInfo(Category).@"enum".fields.len;
+
+    pub fn net(self: *const Summary) types.CBills {
+        return self.income - self.expenses;
+    }
+
+    pub fn category(self: *const Summary, cat: Category) types.CBills {
+        return self.by_category[@intFromEnum(cat)];
+    }
+};
+
+/// Summarize [from_day, to_day] for the whole outfit or one entity's books.
+pub fn summarize(ledger: *const Ledger, from_day: u32, to_day: u32, filter: EntityFilter) Summary {
+    var s: Summary = .{};
+    for (ledger.transactions.items) |*t| {
+        if (t.day &lt; from_day or t.day &gt; to_day) continue;
+        if (!filter.matches(t)) continue;
+        s.by_category[@intFromEnum(t.category)] += t.amount;
+        if (t.amount &gt;= 0) s.income += t.amount else s.expenses -= t.amount;
+    }
+    return s;
+}</code></pre>
+<p>Two things from Part 3 are doing quiet work here. <code>by_category</code> is an array sized by <code>@typeInfo(Category).@"enum".fields.len</code> and indexed by <code>@intFromEnum</code>, so adding a category grows the array and the totals with no other change (Exercise 45.3 confirms it). And <code>@splat(0)</code> fills the array with zeros in the default value. The function itself is a filter and two accumulators, kept separate so a statement can show income and expenses rather than one net number, which is what the Ledger screen draws.</p>
+<p>The rest of the money code is variations on this: <code>gs.monthlyPayroll()</code> sums <code>monthlySalary()</code> over active people; a person's salary is <code>applyBp(applyBp(role.baseSalary(), experience.salaryMultBp()), rank.payBp())</code>, three integers multiplied in two steps; a contract's monthly net is base pay through a chain of basis-point terms; a rating letter's pay multiplier is a <code>Bp</code> looked up from a table. There is not a float anywhere in <code>src/econ</code>, and a grep for <code>f64</code> under <code>src/sim</code> and <code>src/domain</code> finds only the star map's coordinates, which are distances, not money.</p>
+
+<h3 id="ch45-5">45.5 Where a C-bill is lost</h3>
+<p>With integer division, every multiplication that is not by a whole number loses a fraction, and it is worth knowing where. The rule the code follows is: multiply everything first, divide once, truncate toward zero. <code>applyBp(applyBp(x, a), b)</code> truncates twice, which is a design choice the salary formula accepts: a pilot's pay is computed the same way every payday, so the truncation is consistent, and a C-bill a month is not gameplay. What would be gameplay is a truncation that differs between the amount debited and the amount credited, which is why <code>transferFunds</code> moves one computed amount to both sides rather than computing it twice.</p>
+<p>The exercise below asks you to pin the truncation direction in a test, so that anyone who later "fixes" <code>@divTrunc</code> to <code>@divFloor</code> learns from the suite that negative amounts round differently.</p>
+
+<h3 id="ch45-reading">Guided reading</h3>
+<ol>
+<li><code>src/domain/types.zig</code>, the first twenty lines and the two enums with methods (<code>ExperienceLevel.salaryMultBp</code>, <code>Quality.maintenanceModifier</code>). Note that the multiplier table is in basis points.</li>
+<li><code>src/econ/finance.zig</code>, all of it (162 lines). The two tests at the bottom are the clearest specification of the ledger's semantics.</li>
+<li><code>src/sim/state.zig</code>: <code>Treasury</code>, <code>postTransaction</code>, <code>postTreasury</code>, <code>treasuryBalance</code>, <code>treasuryTags</code>, <code>transferFunds</code>, <code>monthlyPayroll</code>.</li>
+<li><code>src/sim/commands.zig</code>: <code>debitPurchase</code>, then the <code>.transfer</code>, <code>.take_loan</code> and <code>.buy_listing</code> arms to see the check-then-post pattern with different treasuries.</li>
+<li><code>src/domain/person.zig</code>: <code>monthlySalary</code> and <code>severance</code>, two formulas that are nothing but <code>applyBp</code> and <code>@divTrunc</code>.</li>
+<li><code>src/sim/queries.zig</code>: <code>ledger</code> and <code>money</code> (the thousands-separator formatter), to see how integers become the text on the Ledger screen.</li>
+</ol>
+
+<h3 id="ch45-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 45.1 · Pin the rounding <span class="level">warm-up</span></h4>
+<p>Add a test to <code>types.zig</code> that fixes the behaviour of <code>applyBp</code> on negative amounts and on fractions below one C-bill: <code>applyBp(-1_500, 6_000)</code>, <code>applyBp(-1, 5_000)</code>, <code>applyBp(1, 5_000)</code> and a ten percent markup on 1,500. Predict each value before running.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "basis points truncate toward zero on both signs" {
+    try std.testing.expectEqual(@as(CBills, -900), applyBp(-1_500, 6_000));
+    try std.testing.expectEqual(@as(CBills, 0), applyBp(-1, 5_000));
+    try std.testing.expectEqual(@as(CBills, 0), applyBp(1, 5_000));
+    try std.testing.expectEqual(@as(CBills, 1_650), applyBp(1_500, 11_000));
+}</code></pre>
+<p>Half a C-bill truncates to zero in both directions, which is the <code>@divTrunc</code> behaviour. Had the function used <code>@divFloor</code>, the second case would be <code>-1</code> and the test would fail, which is the point: the direction is now a documented decision rather than an accident of which builtin someone reached for.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 45.2 · One till, not the other <span class="level">practice</span></h4>
+<p>Write a test in <code>state.zig</code> that creates a commander (which founds an HQ with its own treasury), posts a 1,000 C-bill expense to that HQ with <code>postTreasury</code>, and asserts three things: the HQ's balance fell by exactly 1,000, the outfit's <code>funds</code> did not change, and the ledger grew by one entry. Then use <code>finance.summarize</code> with an <code>.hq</code> filter and check the expense appears.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "an HQ treasury pays and the outfit's does not" {
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 3 });
+    defer gs.deinit();
+    _ = try gs.createCommander("T", .LC, .paymaster);
+    const hq = gs.hqs.keys()[0];
+    const outfit_before = gs.funds;
+    const hq_before = gs.treasuryBalance(.{ .hq = hq });
+    const txns = gs.ledger.transactions.items.len;
+    try gs.postTreasury(.{ .hq = hq }, .{
+        .day = gs.clock.day_index,
+        .amount = -1_000,
+        .category = .misc,
+        .hq = hq,
+        .note = "exercise",
+    });
+    try std.testing.expectEqual(hq_before - 1_000, gs.treasuryBalance(.{ .hq = hq }));
+    try std.testing.expectEqual(outfit_before, gs.funds);
+    try std.testing.expectEqual(txns + 1, gs.ledger.transactions.items.len);
+    const s = finance_mod.summarize(&amp;gs.ledger, 0, 0, .{ .hq = hq });
+    try std.testing.expect(s.expenses &gt;= 1_000);
+}</code></pre>
+<p>Two details. The transaction is tagged with <code>.hq = hq</code> as well as being posted to the <code>.hq</code> treasury: the treasury says whose balance moves, the tag says whose books it is on, and they are usually but not always the same (an HQ can pay for a company's supplies). And the summary is <code>&gt;= 1_000</code> rather than equal, because founding an HQ already posted its own expenses on day 0; a test should assert what it set up, not what the fixture happened to do.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 45.3 · Add a category and see what moves <span class="level">practice</span></h4>
+<p>Add a <code>charity</code> variant to <code>finance.Category</code>. Before building, predict which files will fail to compile. Build, then write a test that proves <code>Summary</code> already has room for it.</p>
+<details class="answer"><summary>Solution</summary>
+<p>Nothing fails. <code>Summary.by_category</code> is sized from the enum, <code>summarize</code> indexes it with <code>@intFromEnum</code>, the ledger stores the category as a value, and the save store writes it as its tag name (<a href="#ch47">Chapter 47</a>). No <code>switch</code> over <code>Category</code> exists anywhere in the program; the Ledger screen prints <code>@tagName</code>. The test:</p>
+<pre><code>test "a new category needs no other change" {
+    try std.testing.expectEqual(@as(usize, Summary.category_count), @typeInfo(Category).@"enum".fields.len);
+    var s: Summary = .{};
+    s.by_category[@intFromEnum(Category.charity)] = -5;
+    try std.testing.expectEqual(@as(types.CBills, -5), s.category(.charity));
+}</code></pre>
+<p>Contrast this with adding a variant to <code>Command</code> (<a href="#ch42">Chapter 42</a>) or to <code>Effect</code> (<a href="#ch46">Chapter 46</a>), where the compiler lists several switches. Both outcomes are correct: a category is data that flows through, a command is behaviour that must be handled.</p></details>
+</div>
+
+<h3 id="ch45-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>What is <code>applyBp(cost, 11_000)</code>? <details class="answer"><summary>Answer</summary>A ten percent markup: <code>cost * 11_000 / 10_000</code>, truncated toward zero.</details></li>
+<li>Why <code>@divTrunc</code> and not <code>/</code>? <details class="answer"><summary>Answer</summary><code>CBills</code> is signed and Zig refuses <code>/</code> on runtime signed integers, because truncation and flooring differ on negatives and the programmer must choose.</details></li>
+<li>What two things does <code>postTreasury</code> do, and why in one function? <details class="answer"><summary>Answer</summary>It appends the transaction to the ledger and adjusts the named treasury's balance. Doing both in one place means the balance and the history can never disagree.</details></li>
+<li>Can a treasury go negative? Where is that refused? <details class="answer"><summary>Answer</summary>Yes; obligations like payroll post regardless. Purchases that should refuse go through <code>debitPurchase</code>, which checks the balance first, and a negative outfit treasury holds the turn in <code>advance</code>.</details></li>
+<li>How is "Alpha Company's profit this month" computed? <details class="answer"><summary>Answer</summary>As a filter over the one transaction list: <code>ledger.companyNet(alpha, from, to)</code> or <code>summarize(…, .{ .company = alpha })</code>, summing entries tagged with that company in the day range.</details></li>
+<li>Why does adding a <code>Category</code> not break any switch? <details class="answer"><summary>Answer</summary>Nothing switches on it; totals live in an array sized by the enum and indexed with <code>@intFromEnum</code>, and display uses <code>@tagName</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>CBills</code> and <code>Bp</code> are both <code>i64</code>; every multiplier is basis points applied by <code>applyBp</code>, which truncates toward zero.</li>
+<li>The ledger is an append-only list of tagged transactions; every total and report is a filtered sum over it, so there is no second copy to drift.</li>
+<li><code>postTreasury</code> is the only function that moves money: one ledger entry and one balance change, together.</li>
+<li>Balances may go negative by design; refusals are a separate check-then-post step, and insolvency holds the turn.</li>
+<li>Reflection sizes the per-category totals, so categories are pure data; behaviour-carrying unions are the ones the compiler makes you handle.</li>
+</ul></div>
+</section>

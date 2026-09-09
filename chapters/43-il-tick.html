@@ -1,0 +1,253 @@
+<section id="ch43">
+<h2>43. The daily tick</h2>
+<p class="goals"><strong>In this chapter</strong> you read the function that makes a day happen. It is a fixed list of phases in a fixed order, and the order carries meaning: deliveries land before supplies are eaten, maintenance runs before battles, payroll runs last. You will learn how to read a phase, how the phases are tested in isolation, and how to add one of your own without disturbing the golden master.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch06">Chapter 6</a> (<code>while</code> with a continue expression, index loops that remove items, <code>%</code> for "every seventh day"), <a href="#ch16">Chapter 16</a> (a function that returns <code>!void</code> and a chain of <code>try</code> calls), <a href="#ch22">Chapter 22</a> (walking a map with an iterator and mutating through <code>value_ptr</code>), <a href="#ch12">Chapter 12</a> (the <code>Date</code> struct from <code>clock.zig</code>, which you may remember from the original guide's section on methods) and <a href="#ch08">Chapter 8</a>.</div>
+
+<h3 id="ch43-1">43.1 Two clocks</h3>
+<p>Time in IRON LEDGER is two numbers that move together:</p>
+<div class="file">src/sim/clock.zig</div>
+<pre><code>pub const Clock = struct {
+    date: Date = Date.campaign_default,
+    day_index: u32 = 0, // days since campaign start; the canonical timestamp
+
+    pub fn advance(self: *Clock) void {
+        self.date = self.date.next();
+        self.day_index += 1;
+    }
+};</code></pre>
+<p><code>day_index</code> is the timestamp the whole simulation uses: a delivery has an <code>eta_day</code>, a wound has a <code>wound_heal_day</code>, an event has a <code>deadline_day</code>, all as plain <code>u32</code> days since the campaign began. Comparing two of them is integer comparison. The <code>Date</code> beside it exists for two purposes only: to be printed, and to answer "is it the first of the month?" (<code>isPayday</code>). The house rule is that the calendar is rendered only at the edges. There is no <code>std.Io.Clock.now</code> anywhere in the core, because there is no <code>io</code> to call it with (<a href="#ch39">Chapter 39</a>).</p>
+<p><code>Date.next</code> is the by-value method you may have already read: copy <code>self</code>, bump the day, roll the month and year over, return the copy. <code>Clock.advance</code> takes a pointer and mutates. Both styles appear throughout the codebase and the choice is deliberate each time: a <code>Date</code> is a small value that is pleasant to treat as immutable; a <code>Clock</code> is a field of the state that moves in place.</p>
+
+<h3 id="ch43-2">43.2 The phase list</h3>
+<p>Here is the whole of a day, exactly as the source has it:</p>
+<div class="file">src/sim/tick.zig</div>
+<pre><code>pub fn advanceDay(gs: *GameState) !void {
+    gs.clock.advance();
+    gs.refreshHqStaffing(); // the back office is people (Stage 9C)
+
+    // Phase order per clock.DayPhase — stubs marked with their stage.
+    if (gs.clock.day_index % 7 == 0) network.resetWeeklyThroughput(gs); // links' week (Stage 9D)
+    try runTravel(gs); // deliveries, couriers, transfers
+    try runPolicies(gs); // standing cash top-ups and resupply (Stage 12: daily)
+    try runStockPolicies(gs); // warehouse reorder points (Stage 12)
+    try hq_ops.runDaily(gs); // bays, fabrication, construction (Stage 9C)
+    try runSupplyConsumption(gs); // supply_consumption phase (Stage 9B)
+    try medical.runDailyHealing(gs); // medical phase
+    try runMarkets(gs); // acquisition_and_markets
+    if (gs.clock.day_index % 7 == 0 and gs.clock.day_index &gt; 0) {
+        try maintenance.runWeeklyMaintenance(gs); // maintenance phase
+        try maintenance.runWeeklyRepairs(gs);
+    }
+    try medical.runDailyTraining(gs); // training phase
+    try runContracts(gs); // contract lifecycle
+    try contract_control.runReturns(gs); // companies travelling home arrive
+    if (gs.clock.date.day == 1) try contract_events.rollMonthly(gs); // event decks
+    if (gs.clock.day_index % 7 == 3) try contract_events.rollWeekly(gs); // weekly happenings (Stage 12)
+    try battle.runDaily(gs); // battle_resolution: due engagements resolve
+    try contract_control.checkEffectiveness(gs); // the ineffectiveness clock (Stage 9E)
+    if (gs.clock.day_index % 7 == 0 and gs.clock.day_index &gt; 0) {
+        try medical.runWeeklyRest(gs); // morale_fatigue phase
+        runTrainingLances(gs); // lance roles (Stage 12)
+    }
+    try runFinances(gs);
+    try contract_events.expireDue(gs); // decisions phase: deadlines pass
+}</code></pre>
+<p>Read it as a sentence. The clock ticks. Anything in transit lands (<code>runTravel</code>). Standing orders top up cash and supplies. The HQ's bays and construction crews do a day's work. Deployed companies eat a day's supplies. The wounded heal a day. Markets refresh. Once a week, every hull gets its maintenance check and the repair queue moves. Training programs progress. Contracts start, end, and are scored; companies travelling home arrive. On the first of the month an event is drawn for each contract; on the third day of each week a smaller one. Battles that are due today are resolved. The ineffectiveness clock is checked. Once a week, everyone at home rests and training lances train. Finance runs. Decisions past their deadline default.</p>
+<p>Now read it as code. Every phase is a function that takes <code>*GameState</code> and returns <code>!void</code>, called with <code>try</code>, so the first phase to fail stops the day and the error propagates up to <code>advance</code> and out of <code>execute</code>. Weekly phases are gated by <code>day_index % 7 == 0</code> (with <code>day_index > 0</code> so that day zero is not a maintenance day) and monthly ones by <code>date.day == 1</code>, which is the one place the calendar participates in a rule. Two phases are called without <code>try</code> because they cannot fail: <code>network.resetWeeklyThroughput</code> and <code>runTrainingLances</code> return <code>void</code>, and the compiler would reject a <code>try</code> on them.</p>
+<p>The comments name the stage that introduced each phase. That is not decoration: the enum <code>DayPhase</code> in <code>clock.zig</code> was written at the start of the project as the intended order, and each stage filled in a stub. Reading the two side by side shows how a design sketch became code over time.</p>
+
+<h3 id="ch43-3">43.3 Why the order is the rule</h3>
+<p>The original guide put it in four sentences worth keeping: deliveries land before consumption so a convoy that arrives today feeds today. Maintenance runs before battles on the same day, so a hull that broke down this week does not fight. Finance runs last so the day's costs are on the books when payroll is counted. When you add a mechanic, the first question is which phase it belongs in and what must already have happened.</p>
+<p>There is a fourth example hiding in the list: <code>runReturns</code> (companies arriving home) runs before the weekly <code>runWeeklyRest</code>, so a company that lands on a rest day rests. And a fifth: <code>rollMonthly</code> runs before <code>battle.runDaily</code>, because a monthly event may have spawned the very engagement that resolves today; the doc comment on <code>DayPhase</code> says so explicitly.</p>
+<p>None of this is enforced by the compiler. It is enforced by tests that build a state where the order matters and check the outcome, which is the next section.</p>
+
+<h3 id="ch43-4">43.4 Reading a phase</h3>
+<p>Phases are small and shaped alike. Here is the start of <code>runTravel</code>, the first one:</p>
+<pre><code>pub fn runTravel(gs: *GameState) !void {
+    // Failed sourcing attempts stay visible for two weeks, then clear.
+    var fi: usize = 0;
+    while (fi &lt; gs.part_orders.items.len) {
+        const o = gs.part_orders.items[fi];
+        if (o.status == .failed and o.ordered_day + 14 &lt;= gs.clock.day_index) _ = gs.part_orders.orderedRemove(fi) else fi += 1;
+    }
+    for (gs.part_orders.items) |*order| {
+        if (order.status != .in_transit) continue;
+        if (order.eta_day != null and gs.clock.day_index &gt;= order.eta_day.?) {
+            order.status = .delivered;
+            // Land at the destination site; anything the warehouse or the
+            // trucks can't hold is lost on the dock (Stage 9B).
+            const dest: types.Site = if (order.dest == .outfit) gs.defaultSite() else order.dest;
+            const room = gs.siteFreeTons(dest) / @max(1, part_mod.tons(order.part_key));
+            const landed = @min(order.quantity, room);
+            try gs.addStock(dest, order.part_key, landed);
+            const tags = GameState.treasuryTags(GameState.siteTreasury(dest));
+            try gs.log(.delivery, .{ .company = tags.company, .hq = tags.hq }, "[delivery] {s} x{d} received{s}", .{
+                order.part_key, landed,
+                if (landed &lt; order.quantity) " — NO ROOM for the rest, written off" else "",
+            });
+        }
+    }
+    // … couriers, unit transfers …
+}</code></pre>
+<p>Two loop forms from <a href="#ch06">Chapter 6</a>, chosen for a reason each. The first is an index loop because the body removes items: after <code>orderedRemove(fi)</code> the next item has slid into slot <code>fi</code>, so the index must not advance. The second is a <code>for</code> by pointer (<code>|*order|</code>) because the body mutates the item in place and removes nothing. The "is it due?" test is <code>gs.clock.day_index >= order.eta_day.?</code>, integer against integer, after an explicit null check; this is the pattern for every scheduled thing in the game.</p>
+<p>And here is the phase that runs last, <code>runFinances</code>, abridged:</p>
+<pre><code>fn runFinances(gs: *GameState) !void {
+    if (!gs.clock.date.isPayday()) return;
+
+    var it = gs.people.iterator();
+    while (it.next()) |entry| {
+        const p = entry.value_ptr;
+        if (p.status == .active) p.xp += monthly_service_xp;
+    }
+    // Seats and experience set ranks before pay is counted (12B.4); service
+    // awards come due (12B.5).
+    _ = try @import("personnel.zig").refreshRanks(gs);
+    _ = @import("personnel.zig").refreshShares(gs);
+    // New Year's Day (12C.8): the rating goes in the book.
+    if (gs.clock.date.month == 1) {
+        // … append a rating snapshot; log the designs entering service this year …
+    }
+    _ = try @import("personnel.zig").checkAllAwards(gs);
+    // Notice is handed in on payday (Stage 12.20); grudges fade (12.21).
+    _ = try @import("medical.zig").runMonthlyTurnover(gs);
+    @import("contract_control.zig").driftStanding(gs);
+
+    const payroll = gs.monthlyPayroll();
+    if (payroll != 0) {
+        try gs.postTransaction(.{
+            .day = gs.clock.day_index,
+            .amount = -payroll,
+            .category = .payroll,
+            .note = "monthly payroll",
+        });
+    }
+    // … hull upkeep, HQ upkeep, loans, standing policies …
+}</code></pre>
+<p>The first line is the whole monthly gate: not payday, nothing to do. Then a sequence of sub-phases whose order is again meaning (ranks are refreshed <em>before</em> payroll is summed, because rank scales pay). <code>_ = try f(gs)</code> discards a count the phase returns but a test wants; <code>_ = f(gs)</code> without <code>try</code> is a function that cannot fail. The map walk with <code>entry.value_ptr</code> is how every phase touches every person: a pointer, so the change sticks (<a href="#ch22">Chapter 22</a>).</p>
+
+<h3 id="ch43-5">43.5 Testing a phase on its own</h3>
+<p>Phases are called from <code>advanceDay</code>, but their tests do not go through it. <code>medical.runMonthlyTurnover</code> is called from <code>runFinances</code> on payday; its test calls it directly on a hand-built state:</p>
+<div class="file">src/sim/medical.zig</div>
+<pre><code>test "12.20/12.25: the restless hand in notice after a year (an inbox decision), the content stay" {
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 1220 });
+    defer gs.deinit();
+    _ = try gs.createCommander("T", .LC, .paymaster);
+    _ = try @import("../gen/company_gen.zig").generateInto(&amp;gs, "Alpha");
+    // Content and fresh (and all thirty — age rolls are 12C.4's business):
+    // nobody stirs however low the dice.
+    gs.clock.day_index = 400;
+    var ait = gs.people.iterator();
+    while (ait.next()) |e| e.value_ptr.born_day = -30 * 365;
+    try std.testing.expectEqual(@as(u32, 0), try runMonthlyTurnover(&amp;gs));
+    // Everyone miserable with a year in: notices land in the inbox, nobody has left yet.
+    var pit = gs.people.iterator();
+    while (pit.next()) |e| {
+        e.value_ptr.morale = 5;
+        e.value_ptr.fatigue = 90;
+    }
+    const notices = try runMonthlyTurnover(&amp;gs);
+    try std.testing.expect(notices &gt; 0 and notices &lt; gs.people.count());
+    // Exhausted and unhappy is one in six a month (2d6 &lt;= 4), not a stampede.
+    const pct = notices * 100 / @as(u32, @intCast(gs.people.count()));
+    try std.testing.expect(pct &gt;= 6 and pct &lt;= 30);
+    try std.testing.expectEqual(@as(usize, notices), gs.event_queue.pending.items.len);
+    // …
+}</code></pre>
+<p>This is the general testing style of the simulation, and it is worth naming its parts. Build the smallest state that exercises the rule (a commander and one generated company). Set the clock and the fields directly, which tests may do. Call the phase. Assert on state, including a statistical bound (<code>pct</code> between 6 and 30) that is safe because the dice are seeded and the number is in fact fixed. The test also documents the rule in its name and comments better than any prose could.</p>
+<p>The one test that <em>does</em> go through <code>advanceDay</code> is the payday test at the bottom of <code>tick.zig</code>:</p>
+<pre><code>test "payday fires on the 1st and only on the 1st" {
+    var gs = GameState.init(std.testing.allocator, .{ .start_funds = 1_000_000 });
+    defer gs.deinit();
+    _ = try gs.hirePerson("Natasha", "Kerensky", .mekwarrior); // 1500/mo regular → Corporal ×1.1 on payday (12B.4)
+
+    // Jan 1 (day 0) start → advancing 30 days lands on Jan 31: no payroll yet.
+    for (0..30) |_| _ = try advanceDay(&amp;gs);
+    try std.testing.expectEqual(@as(i64, 1_000_000), gs.funds);
+
+    // One more day → Feb 1: payroll posts, a month of service XP lands.
+    _ = try advanceDay(&amp;gs);
+    try std.testing.expectEqual(@as(i64, 998_350), gs.funds);
+    try std.testing.expectEqual(@as(usize, 1), gs.ledger.transactions.items.len);
+    try std.testing.expectEqual(@as(u32, monthly_service_xp), gs.people.values()[0].xp);
+}</code></pre>
+<p>Thirty-one days on a fresh state with one hire, and an exact number: 1,650 C-bills, which is 1,500 for a regular mekwarrior times 1.1 for the corporal's rank she is promoted to on the same payday, in that order, because <code>refreshRanks</code> runs before <code>monthlyPayroll</code>. If someone reorders those two lines, this number changes and the test says so.</p>
+
+<h3 id="ch43-reading">Guided reading</h3>
+<ol>
+<li><code>src/sim/clock.zig</code>: <code>Date</code>, <code>DayPhase</code> (read its doc comment about order), <code>Clock</code>, and the leap-year test.</li>
+<li><code>src/sim/tick.zig</code>: <code>advanceDay</code>, then in order <code>runPolicies</code>, <code>runStockPolicies</code>, <code>runTravel</code>, <code>runSupplyConsumption</code>, <code>runMarkets</code>, <code>runContracts</code>, <code>runFinances</code>. Each is under a hundred lines. For each, write down in one line what must already have happened today for it to be correct.</li>
+<li>One phase in another file, fully: <code>medical.runDailyHealing</code> in <code>src/sim/medical.zig</code>. Note the same map-walk-and-mutate shape.</li>
+<li><code>battle.runDaily</code> in <code>src/sim/battle.zig</code>: fifteen lines that decide whether today is a battle day for each contract. <a href="#ch46">Chapter 46</a> follows the call into <code>resolveEngagement</code>.</li>
+<li>The tests at the bottom of <code>tick.zig</code> and the turnover test in <code>medical.zig</code>.</li>
+</ol>
+
+<h3 id="ch43-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 43.1 · The two clocks stay in step <span class="level">warm-up</span></h4>
+<p>Write a test in <code>tick.zig</code> that advances a fresh default campaign 365 days and asserts both that <code>day_index</code> is 365 and that the date is 1 January 3026. Is 3025 a leap year? What would the date be if it were?</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "the calendar and the day index move in lockstep" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    for (0..365) |_| try advanceDay(&amp;gs);
+    try std.testing.expectEqual(@as(u32, 365), gs.clock.day_index);
+    const clock_mod = @import("clock.zig");
+    try std.testing.expectEqual(clock_mod.Date{ .year = 3026, .month = 1, .day = 1 }, gs.clock.date);
+}</code></pre>
+<p>3025 is not divisible by 4, so it has 365 days and the year rolls over exactly. In a leap year (3024 is one, as the clock test in <code>clock.zig</code> checks) 365 days from 1 January lands on 31 December. <code>expectEqual</code> compares the two <code>Date</code> structs field by field. Note that the full year of ticks, with all phases, runs in well under a second: the phases are cheap when there is nothing to do.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 43.2 · Add a phase <span class="level">challenge</span></h4>
+<p>Add a weekly phase <code>runWeeklyPeace</code> that increments a new counter <code>gs.stats.weeks_at_peace</code> whenever a week ends with no active contract. Decide where in <code>advanceDay</code> it belongs and say why. Write a test on a hand-built state. Then confirm the golden-master test still passes and explain why it was never at risk.</p>
+<details class="answer"><summary>Solution</summary>
+<div class="file">src/sim/state.zig, in <code>Stats</code></div>
+<pre><code>    people_kia: u32 = 0,
+    /// Weeks with no contract under way.
+    weeks_at_peace: u32 = 0,</code></pre>
+<div class="file">src/sim/tick.zig</div>
+<pre><code>    if (gs.clock.day_index % 7 == 0 and gs.clock.day_index &gt; 0) {
+        try medical.runWeeklyRest(gs); // morale_fatigue phase
+        runTrainingLances(gs); // lance roles (Stage 12)
+        runWeeklyPeace(gs);
+    }
+
+/// A week with no contract under way is a week of peace.
+fn runWeeklyPeace(gs: *GameState) void {
+    var it = gs.contracts.iterator();
+    while (it.next()) |entry| if (entry.value_ptr.status == .active) return;
+    gs.stats.weeks_at_peace += 1;
+}
+
+test "peace is counted weekly and only without an active contract" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    for (0..14) |_| try advanceDay(&amp;gs);
+    try std.testing.expectEqual(@as(u32, 2), gs.stats.weeks_at_peace);
+}</code></pre>
+<p>It belongs in the existing weekly block after <code>runContracts</code> and <code>runReturns</code> have run, so that a contract that ended today counts as over, and after <code>runWeeklyRest</code> so it reads naturally with the other "end of week" bookkeeping. It returns <code>void</code> and is called without <code>try</code>. Days 7 and 14 are the two weekly ticks in fourteen days, hence 2. The golden master was never at risk because the new phase reads only state and a seeded clock: two campaigns with the same seed still do the same thing. It would have been at risk had the phase read anything outside the state, which is the subject of <a href="#ch49">Chapter 49</a>. (<code>Stats</code> is saved field by field in <code>store.zig</code>, so the new counter is not persisted until you add it there; <a href="#ch47">Chapter 47</a> shows how.)</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 43.3 · Find the phase <span class="level">practice</span></h4>
+<p>Without running anything, answer from the source: (a) which phase turns a wounded person's <code>wound_heal_day</code> into a healed status, and what must be true of <code>medbay_admitted</code> first? (b) Which phase moves money on a standing cash policy, and what stops it from sending twice? (c) If you moved <code>runFinances</code> to the top of <code>advanceDay</code>, name one test that would change its expected number.</p>
+<details class="answer"><summary>Solution</summary>
+<p>(a) <code>medical.runDailyHealing</code>; a wound only starts healing once the player has admitted the person (<code>medbay_admitted</code>), which is the rule the <code>Person</code> field's comment states and the test "wounded only heal once admitted" in <code>commands.zig</code> checks. (b) <code>runPolicies</code> in <code>tick.zig</code>; it skips an entity whose balance is at or above the floor, whose monthly cap is spent, or that already has a courier in flight (<code>in_flight</code>). (c) Any test that pins a balance after a payday, because costs posted by the day's other phases would no longer be on the books when payroll is counted; the payday test's 998,350 is the obvious one, and the round-trip test in <code>store.zig</code> compares hashes that include funds.</p></details>
+</div>
+
+<h3 id="ch43-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>What is the canonical timestamp, and what is the calendar for? <details class="answer"><summary>Answer</summary><code>day_index: u32</code>, days since campaign start, used for every deadline and comparison; the <code>Date</code> is for rendering and for detecting the first of the month.</details></li>
+<li>Why is there a <code>day_index > 0</code> in the weekly gate? <details class="answer"><summary>Answer</summary>Because <code>0 % 7 == 0</code>: without it, the weekly phases would run on the campaign's first day.</details></li>
+<li>Why are <code>resetWeeklyThroughput</code> and <code>runTrainingLances</code> called without <code>try</code>? <details class="answer"><summary>Answer</summary>They return <code>void</code>, not an error union; <code>try</code> on a non-error value is a compile error.</details></li>
+<li>Give two orderings in <code>advanceDay</code> that carry meaning. <details class="answer"><summary>Answer</summary>Deliveries (<code>runTravel</code>) before consumption; maintenance before battles; <code>rollMonthly</code> before <code>battle.runDaily</code>; <code>runFinances</code> last; <code>refreshRanks</code> before <code>monthlyPayroll</code> inside finance.</details></li>
+<li>How is a phase like <code>runMonthlyTurnover</code> tested? <details class="answer"><summary>Answer</summary>Directly, on a hand-built state with fields set to force the situation, asserting on the resulting state (inbox length, statuses), not by advancing the calendar to a payday.</details></li>
+<li>Why does the index loop in <code>runTravel</code> not always increment? <details class="answer"><summary>Answer</summary>After <code>orderedRemove(fi)</code> the following item slides into slot <code>fi</code>, so incrementing would skip it.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A day is <code>advanceDay</code>: the clock ticks, then a fixed list of phases runs, each a function from <code>*GameState</code> to <code>!void</code>.</li>
+<li>Weekly and monthly phases are gated by integer arithmetic on <code>day_index</code> and by <code>date.day == 1</code>; nothing reads a wall clock.</li>
+<li>Order is meaning: what lands, heals, breaks or is paid depends on what ran before it, and tests pin those consequences with exact numbers.</li>
+<li>Phases are tested in isolation on hand-built states; the whole pipeline is tested by a few end-to-end numbers like the payday test.</li>
+<li>Adding a mechanic means choosing its phase, writing it as a function over the state, and testing it the same way.</li>
+</ul></div>
+</section>

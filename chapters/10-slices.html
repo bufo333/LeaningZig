@@ -1,0 +1,571 @@
+<section id="ch10">
+<h2>10. Slices</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn the type you will use more than any other in Zig: the slice. A slice is a pointer plus a length, a window onto some array that lives elsewhere. You will make slices from arrays, read and write through them, learn why <code>[]const T</code> and <code>[]T</code> differ, see the bounds check that protects you, meet the sentinel-terminated and many-item cousins briefly, and understand why nearly every function you write from now on takes a slice instead of an array.</p>
+
+<h3 id="ch10-1">10.1 A window onto an array</h3>
+<p>The previous chapter ended on a wall: a function taking <code>[4]u8</code> cannot accept a <code>[3]u8</code>. Slices are how Zig climbs that wall without losing safety. A slice does not own any elements. It says "start <em>here</em>, and there are <em>this many</em>". Make one by writing a range in square brackets after an array:</p>
+<p class="file">basics.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const roster = [_]u8{ 10, 20, 30, 40, 50 };
+    const middle = roster[1..4]; // elements 1, 2, 3 (4 is excluded)
+    std.debug.print("{any}\n", .{middle});
+    std.debug.print("len {d}, first {d}\n", .{ middle.len, middle[0] });
+    std.debug.print("type: {any}\n", .{@TypeOf(middle)});
+}</code></pre>
+<pre class="term">{ 20, 30, 40 }
+len 3, first 20
+type: *const [3]u8</pre>
+<p><code>roster[1..4]</code> means "from index 1 up to but not including index 4": elements 1, 2 and 3. The end is exclusive, exactly like Python's <code>roster[1:4]</code>, so <code>end - start</code> is the length. The result knows its length, <code>3</code>, and you index it from zero: <code>middle[0]</code> is <code>roster[1]</code>.</p>
+<p>Look at the printed type, though: <code>*const [3]u8</code>, a pointer to a three-element array, not a slice. That is a small 0.16 detail worth knowing. When both bounds are compile-time constants, Zig can work out the length and gives you the more precise pointer-to-array type. It coerces to a slice the moment you need one, so in practice you treat it as a slice. Use runtime bounds, or write the slice type explicitly, and you get a real slice:</p>
+<p class="file">forms.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var roster = [_]u8{ 10, 20, 30, 40, 50 };
+    const tail = roster[2..]; // from index 2 to the end
+    const head = roster[0..2]; // first two
+    const all: []u8 = &amp;roster; // &amp;array coerces to a slice of the whole thing
+    var n: usize = 1;
+    n += 2;
+    const runtime = roster[n..]; // the bounds can be runtime values
+    std.debug.print("tail {any}\n", .{tail});
+    std.debug.print("head {any}\n", .{head});
+    std.debug.print("all  {any} (type {any})\n", .{ all, @TypeOf(all) });
+    std.debug.print("runtime {any} (type {any})\n", .{ runtime, @TypeOf(runtime) });
+}</code></pre>
+<pre class="term">tail { 30, 40, 50 }
+head { 10, 20 }
+all  { 10, 20, 30, 40, 50 } (type []u8)
+runtime { 40, 50 } (type []u8)</pre>
+<p>Three forms to memorise:</p>
+<ul>
+<li><code>arr[a..b]</code>: from <code>a</code> to <code>b</code> exclusive.</li>
+<li><code>arr[a..]</code>: from <code>a</code> to the end.</li>
+<li><code>&amp;arr</code>: the whole array. A pointer to an array coerces to a slice whenever a slice is expected, which is why you passed <code>&amp;a</code> to <code>std.mem.eql</code> in the last chapter.</li>
+</ul>
+<p>The type <code>[]u8</code> reads "slice of <code>u8</code>". No number in the brackets, because the length is not part of the type any more; it is a field of the value.</p>
+
+<h3 id="ch10-2">10.2 A slice is a view, not a copy</h3>
+<p>This is the fact that separates slices from arrays. Assigning an array copies it; making a slice copies nothing. The slice points into the original memory, and writing through it changes the original.</p>
+<p class="file">view.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var roster = [_]u8{ 10, 20, 30, 40, 50 };
+    const window = roster[1..3];
+    window[0] = 99; // writes through to roster[1]
+    std.debug.print("roster: {any}\n", .{roster});
+    std.debug.print("window: {any}\n", .{window});
+    std.debug.print("same memory: {}\n", .{&amp;window[0] == &amp;roster[1]});
+}</code></pre>
+<pre class="term">roster: { 10, 99, 30, 40, 50 }
+window: { 99, 30 }
+same memory: true</pre>
+<p><code>window[0] = 99</code> wrote into <code>roster[1]</code>, because that is where the window starts. The last line proves it: the address of <code>window[0]</code> is the address of <code>roster[1]</code>. There are two names for one byte.</p>
+<p>Under the hood a slice is two machine words: a pointer to the first element and a <code>usize</code> length. You can look at them as <code>.ptr</code> and <code>.len</code>. Copying a slice copies those two words, not the elements. That makes slices cheap to pass around and dangerous in exactly one way: the array they point at must outlive them. Zig catches the most common version of that mistake at compile time:</p>
+<p class="file">dangling.zig</p>
+<pre><code>const std = @import("std");
+
+fn makeSlice() []const u8 {
+    var local = [_]u8{ 1, 2, 3 };
+    local[0] = 9;
+    return &amp;local; // points at a variable that is about to disappear
+}
+
+pub fn main() void {
+    std.debug.print("{any}\n", .{makeSlice()});
+}</code></pre>
+<pre class="term">dangling.zig:6:13: error: returning address of expired local variable 'local'
+    return &amp;local; // points at a variable that is about to disappear
+            ^~~~~
+dangling.zig:4:9: note: declared runtime-known here
+    var local = [_]u8{ 1, 2, 3 };
+        ^~~~~</pre>
+<p><code>local</code> lives on the stack frame of <code>makeSlice</code>, which is torn down when the function returns. A slice pointing into it would point at garbage. The compiler refuses. When you want a function to hand back text or data, either the caller provides the buffer (the pattern in 10.6 and in every <code>bufPrint</code> call) or the function allocates (<a href="#ch19">Chapter 19</a>).</p>
+
+<h3 id="ch10-3">10.3 <code>[]const T</code> and <code>[]T</code></h3>
+<p>A slice type says whether you may write through it. <code>[]u8</code> allows writes; <code>[]const u8</code> does not. The rule for coercion is one-way: a mutable slice can become a const slice for free, never the reverse.</p>
+<p class="file">constness.zig</p>
+<pre><code>const std = @import("std");
+
+fn sum(xs: []const u8) u32 {
+    var t: u32 = 0;
+    for (xs) |x| t += x;
+    return t;
+}
+
+fn zero(xs: []u8) void {
+    for (xs) |*x| x.* = 0;
+}
+
+pub fn main() void {
+    var a = [_]u8{ 1, 2, 3 };
+    const b = [_]u8{ 4, 5, 6 };
+    std.debug.print("{d} {d}\n", .{ sum(&amp;a), sum(&amp;b) }); // []u8 coerces to []const u8
+    zero(&amp;a);
+    std.debug.print("{any}\n", .{a});
+}</code></pre>
+<pre class="term">6 15
+{ 0, 0, 0 }</pre>
+<p><code>sum</code> only reads, so it takes <code>[]const u8</code>, and both the <code>var</code> array and the <code>const</code> array can be passed to it. <code>zero</code> writes, so it takes <code>[]u8</code>, and only the <code>var</code> array works. Try the other way and the compiler says exactly what is wrong:</p>
+<pre><code>const std = @import("std");
+
+fn zero(xs: []u8) void {
+    for (xs) |*x| x.* = 0;
+}
+
+pub fn main() void {
+    const b = [_]u8{ 4, 5, 6 };
+    zero(&amp;b);
+    std.debug.print("{any}\n", .{b});
+}</code></pre>
+<pre class="term">constness_err.zig:9:10: error: expected type '[]u8', found '*const [3]u8'
+    zero(&amp;b);
+         ^~
+constness_err.zig:9:10: note: cast discards const qualifier
+constness_err.zig:3:13: note: parameter type declared here
+fn zero(xs: []u8) void {
+            ^~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p><code>cast discards const qualifier</code> is the phrase to recognise. It means "you are trying to get write access to something that was declared read-only".</p>
+<div class="note"><strong>Rule of thumb.</strong> Declare a slice parameter <code>[]const T</code> unless the function needs to modify the elements. It documents intent, it accepts more arguments, and the compiler holds you to it. Nearly every string parameter in IRON LEDGER is <code>[]const u8</code>.</div>
+
+<h3 id="ch10-4">10.4 Bounds are checked here too</h3>
+<p>A slice knows its length, so indexing and re-slicing are checked just as with arrays. Because the bounds are usually runtime values, the check is usually at runtime:</p>
+<p class="file">bounds.zig</p>
+<pre><code>const std = @import("std");
+
+fn firstN(xs: []const u8, n: usize) []const u8 {
+    return xs[0..n];
+}
+
+pub fn main() void {
+    const roster = [_]u8{ 10, 20, 30 };
+    std.debug.print("{any}\n", .{firstN(&amp;roster, 2)});
+    std.debug.print("{any}\n", .{firstN(&amp;roster, 5)});
+}</code></pre>
+<pre class="term">{ 10, 20 }
+thread 5972081 panic: index out of bounds: index 5, len 3
+ch10/bounds.zig:4:14: in firstN (bounds)
+    return xs[0..n];
+             ^
+ch10/bounds.zig:10:40: in main (bounds)
+    std.debug.print("{any}\n", .{firstN(&amp;roster, 5)});
+                                       ^
+&lt;zig&gt;/lib/std/start.zig:698:59: in callMain (bounds)
+    if (fn_info.params.len == 0) return wrapMain(root.main());
+                                                          ^
+???:?:?: in start (/usr/lib/dyld)</pre>
+<p>The first trace line points at <code>xs[0..n]</code> inside <code>firstN</code>, the second at the call in <code>main</code>. You get to see both where the bad slice was made and who asked for it.</p>
+<p>Note also what the check is guarding. Slicing does not copy, so the check is the only thing standing between your program and reading memory it has no business with. In C the equivalent call quietly returns a pointer past the end of the buffer.</p>
+
+<h3 id="ch10-5">10.5 Why functions take slices</h3>
+<p>Now the payoff. Rewrite the average with a slice parameter and it works for four elements, twelve, a window of four in the middle of twelve, or none at all:</p>
+<p class="file">why.zig</p>
+<pre><code>const std = @import("std");
+
+fn average(xs: []const u32) u32 {
+    if (xs.len == 0) return 0;
+    var t: u32 = 0;
+    for (xs) |x| t += x;
+    return t / @as(u32, @intCast(xs.len));
+}
+
+pub fn main() void {
+    const lance = [_]u32{ 55, 65, 70, 50 };
+    const company = [_]u32{ 55, 65, 70, 50, 80, 85, 75, 60, 35, 40, 30, 45 };
+    std.debug.print("lance avg {d}\n", .{average(&amp;lance)});
+    std.debug.print("company avg {d}\n", .{average(&amp;company)});
+    std.debug.print("heavy lance avg {d}\n", .{average(company[4..8])});
+    std.debug.print("nothing avg {d}\n", .{average(&amp;[_]u32{})});
+}</code></pre>
+<pre class="term">lance avg 60
+company avg 57
+heavy lance avg 75
+nothing avg 0</pre>
+<p>One function, any length. <code>company[4..8]</code> hands it the middle of an array without copying anything. <code>&amp;[_]u32{}</code> is an empty array's address, which coerces to an empty slice; the <code>len == 0</code> guard handles it.</p>
+<p>The <code>@intCast</code> is because <code>xs.len</code> is a <code>usize</code> and the arithmetic is in <code>u32</code>; Zig will not silently narrow a 64-bit value to 32 bits. You will write this cast often when mixing lengths with other integers.</p>
+<p>This is why the standard library is written in terms of slices. <code>std.mem.eql</code>, <code>std.mem.indexOf</code>, <code>std.fmt.bufPrint</code>, the writer <code>print</code> methods: all of them take and return slices, so they compose with arrays of any size, with pieces of arrays, and, once you have an allocator, with memory from the heap.</p>
+
+<h3 id="ch10-6">10.6 Loops and mutation through a slice</h3>
+<p>Slices loop exactly like arrays. The pointer-capture form is how you modify elements in place, and it needs no <code>&amp;</code> in front, because a slice is already a kind of pointer:</p>
+<p class="file">iter.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var hp = [_]u8{ 12, 7, 0, 3 };
+    const wounded: []u8 = &amp;hp;
+
+    for (wounded, 0..) |h, i| {
+        std.debug.print("pilot {d}: {d} hp\n", .{ i, h });
+    }
+    for (wounded) |*h| { // capture a pointer to mutate in place
+        if (h.* &gt; 0) h.* += 1;
+    }
+    std.debug.print("{any}\n", .{hp});
+
+    // Two slices of equal length walked together.
+    const names = [_][]const u8{ "Kai", "Nat", "Bo", "Ivy" };
+    for (names, wounded) |n, h| {
+        std.debug.print("{s}={d} ", .{ n, h });
+    }
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">pilot 0: 12 hp
+pilot 1: 7 hp
+pilot 2: 0 hp
+pilot 3: 3 hp
+{ 13, 8, 0, 4 }
+Kai=13 Nat=8 Bo=0 Ivy=4 </pre>
+<p>Three loops: <code>(slice, 0..) |v, i|</code> gives value and index; <code>(slice) |*v|</code> gives a pointer for writing; <code>(a, b) |x, y|</code> walks two slices in step. That last form requires equal lengths and panics otherwise, which is a feature: it turns a silent mismatch into a loud one.</p>
+<p>For bulk copies and fills there are two builtins and two helpers:</p>
+<p class="file">copies.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var buf: [8]u8 = undefined;
+    @memset(&amp;buf, '.'); // fill every byte
+    std.debug.print("{s}\n", .{&amp;buf});
+
+    const src = "mek";
+    @memcpy(buf[0..src.len], src); // lengths must match exactly
+    std.debug.print("{s}\n", .{&amp;buf});
+
+    // Overlapping copy: shift "mek" two places right.
+    std.mem.copyForwards(u8, buf[2..5], buf[0..3]);
+    std.debug.print("{s}\n", .{&amp;buf});
+    std.mem.copyBackwards(u8, buf[3..6], buf[1..4]);
+    std.debug.print("{s}\n", .{&amp;buf});
+}</code></pre>
+<pre class="term">........
+mek.....
+memem...
+mememe..</pre>
+<p><code>@memset</code> fills every element with one value. <code>@memcpy(dst, src)</code> copies, and insists that the two lengths are exactly equal:</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var buf: [8]u8 = undefined;
+    @memcpy(&amp;buf, "mek");
+    std.debug.print("{s}\n", .{&amp;buf});
+}</code></pre>
+<pre class="term">memcpy_len.zig:5:5: error: non-matching copy lengths
+    @memcpy(&amp;buf, "mek");
+    ^~~~~~~~~~~~~~~~~~~~
+memcpy_len.zig:5:13: note: length 8 here
+    @memcpy(&amp;buf, "mek");
+            ^~~~
+memcpy_len.zig:5:19: note: length 3 here
+    @memcpy(&amp;buf, "mek");
+                  ^~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>That is why the working version slices the destination first: <code>buf[0..src.len]</code>. <code>@memcpy</code> also requires that the regions do not overlap. When they might, as when shifting bytes inside one buffer, use <code>std.mem.copyForwards</code> (safe when the destination starts before the source) or <code>std.mem.copyBackwards</code> (safe when it starts after). The output above shows each one shifting <code>mek</code> along the buffer.</p>
+
+<h3 id="ch10-7">10.7 Sentinel-terminated slices</h3>
+<p>A string literal is not quite a plain array. Its type carries an extra promise: there is a zero byte just past the end.</p>
+<p class="file">sentinel.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const lit = "Alpha"; // *const [5:0]u8: five bytes plus a hidden 0
+    const s: [:0]const u8 = lit; // sentinel-terminated slice
+    const plain: []const u8 = lit; // ordinary slice, sentinel forgotten
+    std.debug.print("{any}\n", .{@TypeOf(lit)});
+    std.debug.print("{any} len {d}, byte after end: {d}\n", .{ @TypeOf(s), s.len, s[s.len] });
+    std.debug.print("{any} len {d}\n", .{ @TypeOf(plain), plain.len });
+}</code></pre>
+<pre class="term">*const [5:0]u8
+[:0]const u8 len 5, byte after end: 0
+[]const u8 len 5</pre>
+<p><code>*const [5:0]u8</code> reads "pointer to a constant array of 5 bytes, terminated by 0". The <code>:0</code> is the <em>sentinel</em>. A slice can carry the same promise, <code>[:0]const u8</code>, and it is allowed to read the element at <code>len</code>, which a plain slice may not. The promise is what C needs (C strings find their end by looking for the zero), so you meet this type mostly at the edge where Zig calls C (<a href="#ch35">Chapter 35</a>) and in <code>std.process</code> arguments. The rest of the time you drop the sentinel by coercing to <code>[]const u8</code>, as the third line shows, and nothing is lost: the length is still there.</p>
+
+<h3 id="ch10-8">10.8 Many-item pointers, briefly</h3>
+<p>The <code>.ptr</code> field of a slice has type <code>[*]T</code>, a <em>many-item pointer</em>. It is a pointer to some number of elements, with no idea how many. You can index it and it will not check anything.</p>
+<p class="file">many.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const roster = [_]u8{ 10, 20, 30, 40, 50 };
+    const slice: []const u8 = &amp;roster;
+    const p: [*]const u8 = slice.ptr; // many-item pointer: no length
+    std.debug.print("{d} {d}\n", .{ p[0], p[4] });
+    // p[5] would compile and read garbage: nothing knows where the end is.
+    const back: []const u8 = p[0..3]; // give it a length again
+    std.debug.print("{any}\n", .{back});
+}</code></pre>
+<pre class="term">10 50
+{ 10, 20, 30 }</pre>
+<p>This is the C pointer, and Zig keeps it for talking to C and for the rare data structure that tracks its own lengths. In ordinary code you should almost never write <code>[*]T</code>; if you find yourself reaching for it, a slice is what you want. Knowing it exists helps you read error messages like <code>expected '[]u8', found '[*]u8'</code>: something lost its length, and <code>p[0..n]</code> gives it back.</p>
+
+<h3 id="ch10-9">10.9 Slices of slices</h3>
+<p>The element type of a slice can be a slice. A list of names is the everyday example: <code>[]const []const u8</code>, a slice of strings.</p>
+<p class="file">nested.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const names = [_][]const u8{ "1st Lance", "2nd Lance", "3rd Lance" };
+    const some: []const []const u8 = names[1..];
+    for (some, 0..) |name, i| {
+        std.debug.print("{d}: {s} ({d} bytes)\n", .{ i, name, name.len });
+    }
+    const one = names[0];
+    std.debug.print("{s}\n", .{one[0..3]}); // slicing a slice
+}</code></pre>
+<pre class="term">0: 2nd Lance (9 bytes)
+1: 3rd Lance (9 bytes)
+1st</pre>
+<p>Read it inside out: <code>[]const u8</code> is one string; <code>[]const ([]const u8)</code> is a slice of them. <code>names[1..]</code> takes the last two strings without copying any characters, and <code>one[0..3]</code> slices a string, which is what the next chapter is all about.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The command parser is built entirely on slices. Every function in <code>src/sim/cli.zig</code> takes a <code>[]const u8</code> and returns a slice or a parsed value, so the same code handles a keystroke buffer in the terminal and a line from a script file:
+<pre><code>// src/sim/cli.zig
+pub fn parseSite(tok: []const u8) ParseError!types.Site { ... }
+pub fn parseTreasury(tok: []const u8) ParseError!Treasury { ... }
+pub fn need(tok: ?[]const u8) ParseError![]const u8 { ... }
+pub fn usage(verb: []const u8) ?[]const u8 { ... }</code></pre>
+<p>Notice <code>?[]const u8</code>: an optional slice, meaning "maybe a token, maybe nothing" (<a href="#ch15">Chapter 15</a>). The terminal reads keys into a fixed byte array and hands slices of it to the decoder, so no memory is allocated per keypress. And the guide's one-liner for a file's base name is pure slicing: <code>if (std.mem.lastIndexOfScalar(u8, path, '/')) |k| path[k + 1 ..] else path</code>.</p></div>
+
+<h3 id="ch10-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 10.1 · Slice basics <span class="level">warm-up</span></h4>
+  <p>Write <code>lastN</code>, <code>inner</code> and <code>halves</code>, each returning slices of the input without copying. Name the file: <code>exercises/10-slices/ex1_slice_basics.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 10, exercise 1: slice basics.
+//! Run with:  zig test ex1_slice_basics.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// The last `n` elements of `xs`. If n is larger than xs.len, return all of xs.
+fn lastN(xs: []const u8, n: usize) []const u8 {
+    if (n &gt;= xs.len) return xs;
+    return xs[xs.len - n ..];
+}
+
+/// Everything except the first and last element. Empty if xs has fewer than 3.
+fn inner(xs: []const u8) []const u8 {
+    if (xs.len &lt; 3) return xs[0..0];
+    return xs[1 .. xs.len - 1];
+}
+
+/// Split `xs` in half. The first half gets the extra element when odd.
+fn halves(xs: []const u8) [2][]const u8 {
+    const mid = (xs.len + 1) / 2;
+    return .{ xs[0..mid], xs[mid..] };
+}
+
+test "lastN" {
+    const d = [_]u8{ 1, 2, 3, 4, 5 };
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 4, 5 }, lastN(&amp;d, 2));
+    try std.testing.expectEqualSlices(u8, &amp;d, lastN(&amp;d, 9));
+    try std.testing.expectEqual(@as(usize, 0), lastN(&amp;d, 0).len);
+}
+
+test "inner" {
+    const d = [_]u8{ 1, 2, 3, 4, 5 };
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 2, 3, 4 }, inner(&amp;d));
+    try std.testing.expectEqual(@as(usize, 0), inner(d[0..2]).len);
+}
+
+test "halves" {
+    const d = [_]u8{ 1, 2, 3, 4, 5 };
+    const h = halves(&amp;d);
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 1, 2, 3 }, h[0]);
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 4, 5 }, h[1]);
+    const e = halves(d[0..0]);
+    try std.testing.expectEqual(@as(usize, 0), e[0].len + e[1].len);
+}</code></pre>
+  <p>The empty slice <code>xs[0..0]</code> is a legitimate value: pointer to the start, length zero. <code>halves</code> returns an array of two slices; the array is copied out (two pointer-length pairs), the data is not.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 10.2 · Mutating through slices <span class="level">practice</span></h4>
+  <p>Write <code>heal</code> (saturating add on every element), <code>raiseFloor</code>, and <code>padCopy</code> using <code>@memcpy</code> and <code>@memset</code>. Note that the tests pass sub-slices like <code>xs[2..]</code> and <code>buf[4..]</code>. Name the file: <code>exercises/10-slices/ex2_mutate.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 10, exercise 2: mutating through slices.
+//! Run with:  zig test ex2_mutate.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Add `delta` to every element, saturating at 255.
+fn heal(hp: []u8, delta: u8) void {
+    for (hp) |*h| h.* +|= delta;
+}
+
+/// Set every element that is below `floor` to `floor`.
+fn raiseFloor(xs: []i32, floor: i32) void {
+    for (xs) |*x| {
+        if (x.* &lt; floor) x.* = floor;
+    }
+}
+
+/// Copy `src` into the front of `dst` and fill the rest with `pad`.
+/// Returns dst.len. Panics if src is longer than dst (that is a caller bug).
+fn padCopy(dst: []u8, src: []const u8, pad: u8) usize {
+    @memcpy(dst[0..src.len], src);
+    @memset(dst[src.len..], pad);
+    return dst.len;
+}
+
+test "heal saturates" {
+    var hp = [_]u8{ 250, 10, 0 };
+    heal(&amp;hp, 10);
+    try std.testing.expectEqual([3]u8{ 255, 20, 10 }, hp);
+}
+
+test "raiseFloor" {
+    var xs = [_]i32{ -5, 0, 5 };
+    raiseFloor(&amp;xs, 0);
+    try std.testing.expectEqual([3]i32{ 0, 0, 5 }, xs);
+    raiseFloor(xs[2..], 100); // only the tail
+    try std.testing.expectEqual([3]i32{ 0, 0, 100 }, xs);
+}
+
+test "padCopy" {
+    var buf: [8]u8 = undefined;
+    const n = padCopy(&amp;buf, "mek", ' ');
+    try std.testing.expectEqual(@as(usize, 8), n);
+    try std.testing.expectEqualStrings("mek     ", &amp;buf);
+    _ = padCopy(buf[4..], "ab", '-');
+    try std.testing.expectEqualStrings("mek ab--", &amp;buf);
+}</code></pre>
+  <p><code>+|=</code> is saturating addition (<a href="#ch04">Chapter 4</a>). <code>padCopy</code> works on any buffer size because <code>dst</code> is a slice; the second call in the test fills only the last four bytes.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 10.3 · Searching and windows <span class="level">practice</span></h4>
+  <p>Write <code>argMax</code> (returning an optional index), <code>from</code> (a suffix slice starting at the first element over a threshold), and <code>bestWindow</code> (the largest sum of <code>w</code> consecutive elements). Name the file: <code>exercises/10-slices/ex3_search.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 10, exercise 3: searching and windows.
+//! Run with:  zig test ex3_search.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Index of the largest element, or null when the slice is empty.
+fn argMax(xs: []const i32) ?usize {
+    if (xs.len == 0) return null;
+    var best: usize = 0;
+    for (xs, 0..) |x, i| {
+        if (x &gt; xs[best]) best = i;
+    }
+    return best;
+}
+
+/// The slice of `xs` that starts at the first element &gt;= `threshold`.
+/// Empty slice at the end if nothing qualifies.
+fn from(xs: []const i32, threshold: i32) []const i32 {
+    for (xs, 0..) |x, i| {
+        if (x &gt;= threshold) return xs[i..];
+    }
+    return xs[xs.len..];
+}
+
+/// The largest sum of any `w` consecutive elements. Requires w &lt;= xs.len and w &gt; 0.
+fn bestWindow(xs: []const i32, w: usize) i32 {
+    var best: i32 = std.math.minInt(i32);
+    var start: usize = 0;
+    while (start + w &lt;= xs.len) : (start += 1) {
+        var s: i32 = 0;
+        for (xs[start .. start + w]) |x| s += x;
+        if (s &gt; best) best = s;
+    }
+    return best;
+}
+
+test "argMax" {
+    try std.testing.expectEqual(@as(?usize, 2), argMax(&amp;[_]i32{ 1, 5, 9, 3 }));
+    try std.testing.expectEqual(@as(?usize, 0), argMax(&amp;[_]i32{ 9, 9, 9 }));
+    try std.testing.expectEqual(@as(?usize, null), argMax(&amp;[_]i32{}));
+}
+
+test "from" {
+    const d = [_]i32{ 1, 4, 2, 8, 3 };
+    try std.testing.expectEqualSlices(i32, &amp;[_]i32{ 4, 2, 8, 3 }, from(&amp;d, 4));
+    try std.testing.expectEqualSlices(i32, &amp;[_]i32{ 8, 3 }, from(&amp;d, 5));
+    try std.testing.expectEqual(@as(usize, 0), from(&amp;d, 100).len);
+}
+
+test "bestWindow" {
+    const d = [_]i32{ 1, 4, 2, 8, 3 };
+    try std.testing.expectEqual(@as(i32, 8), bestWindow(&amp;d, 1));
+    try std.testing.expectEqual(@as(i32, 11), bestWindow(&amp;d, 2));
+    try std.testing.expectEqual(@as(i32, 18), bestWindow(&amp;d, 5));
+}</code></pre>
+  <p><code>bestWindow</code> slides a sub-slice <code>xs[start .. start + w]</code> along the input; each window is a view, so the loop allocates nothing. <code>xs[xs.len..]</code> is the empty slice at the very end, a legal way to say "no elements qualified".</p></details>
+</div>
+<div class="exercise"><h4>Exercise 10.4 · A fixed-size log <span class="level">challenge</span></h4>
+  <p>A struct keeps the last four values pushed into a ring. Implement <code>push</code>, <code>ordered</code> (oldest first, written into a caller's buffer) and <code>raw</code> (a slice of the valid part of the internal array). This previews structs from <a href="#ch12">Chapter 12</a>; the method syntax is explained there. Name the file: <code>exercises/10-slices/ex4_ring.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 10, exercise 4: a fixed-size log with a slice view (challenge).
+//! Run with:  zig test ex4_ring.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Keeps the last `cap` values pushed. Older values are overwritten.
+const Log = struct {
+    buf: [4]u32 = undefined,
+    len: usize = 0, // how many slots are valid (0..4)
+    next: usize = 0, // where the next push goes
+
+    fn push(self: *Log, v: u32) void {
+        self.buf[self.next] = v;
+        self.next = (self.next + 1) % self.buf.len;
+        if (self.len &lt; self.buf.len) self.len += 1;
+    }
+
+    /// Copy the valid values, oldest first, into `out` and return the filled part.
+    fn ordered(self: Log, out: []u32) []u32 {
+        const start = if (self.len &lt; self.buf.len) 0 else self.next;
+        var i: usize = 0;
+        while (i &lt; self.len) : (i += 1) {
+            out[i] = self.buf[(start + i) % self.buf.len];
+        }
+        return out[0..self.len];
+    }
+
+    /// The valid part of the raw buffer (no reordering).
+    fn raw(self: *const Log) []const u32 {
+        return self.buf[0..self.len];
+    }
+};
+
+test "fills up then wraps" {
+    var log = Log{};
+    var out: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), log.ordered(&amp;out).len);
+    log.push(1);
+    log.push(2);
+    try std.testing.expectEqualSlices(u32, &amp;[_]u32{ 1, 2 }, log.ordered(&amp;out));
+    log.push(3);
+    log.push(4);
+    log.push(5); // overwrites 1
+    try std.testing.expectEqualSlices(u32, &amp;[_]u32{ 2, 3, 4, 5 }, log.ordered(&amp;out));
+    try std.testing.expectEqualSlices(u32, &amp;[_]u32{ 5, 2, 3, 4 }, log.raw());
+}</code></pre>
+  <p><code>raw</code> returns a slice into the struct's own array, so it takes <code>self</code> by pointer: a by-value <code>self</code> would be a copy that dies when the function returns, and the compiler would reject the slice, as in 10.2. <code>ordered</code> writes into the caller's buffer instead, so it can take <code>self</code> by value.</p></details>
+</div>
+
+<h3 id="ch10-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What two pieces of information make up a slice? <details class="answer"><summary>Answer</summary>A pointer to the first element (<code>.ptr</code>) and a length (<code>.len</code>).</details></li>
+  <li>How many elements does <code>arr[2..5]</code> have, and which ones? <details class="answer"><summary>Answer</summary>Three: indexes 2, 3 and 4. The end bound is exclusive.</details></li>
+  <li>Does writing through a slice change the original array? <details class="answer"><summary>Answer</summary>Yes. A slice is a view; it does not copy the elements.</details></li>
+  <li>Can you pass a <code>[]u8</code> where <code>[]const u8</code> is expected? The reverse? <details class="answer"><summary>Answer</summary>Yes to the first, no to the second. Mutable coerces to const; going the other way is a compile error ("cast discards const qualifier").</details></li>
+  <li>Why does <code>return &amp;local;</code> fail to compile when <code>local</code> is an array inside the function? <details class="answer"><summary>Answer</summary>The array lives in the function's stack frame and is gone after the return; a slice into it would be dangling. Have the caller supply a buffer instead.</details></li>
+  <li>What does <code>[:0]const u8</code> promise that <code>[]const u8</code> does not? <details class="answer"><summary>Answer</summary>That the element just past <code>len</code> is a zero byte. C APIs rely on it.</details></li>
+  <li>What is wrong with <code>@memcpy(&amp;buf, "mek")</code> when <code>buf</code> is <code>[8]u8</code>? <details class="answer"><summary>Answer</summary>The lengths differ (8 versus 3) and <code>@memcpy</code> requires them to match. Slice the destination: <code>@memcpy(buf[0..3], "mek")</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A slice <code>[]T</code> is a pointer and a length: a window onto an array, not a copy.</li>
+<li>Make one with <code>arr[a..b]</code>, <code>arr[a..]</code>, or <code>&amp;arr</code>. Compile-time bounds give <code>*const [N]T</code>, which coerces to a slice.</li>
+<li><code>[]const T</code> for reading, <code>[]T</code> for writing; mutable coerces to const, never the reverse.</li>
+<li>Indexing and slicing are bounds-checked; a slice must not outlive its array, and the compiler catches returning a local's address.</li>
+<li>Functions take slices so one signature serves any length or sub-range.</li>
+<li><code>for (s) |*v|</code> mutates in place; <code>@memset</code>, <code>@memcpy</code> (equal lengths, no overlap) and <code>std.mem.copyForwards</code>/<code>copyBackwards</code> do bulk work.</li>
+<li><code>[:0]T</code> adds a sentinel for C; <code>[*]T</code> is a length-less many-item pointer you rarely need.</li>
+</ul></div>
+</section>

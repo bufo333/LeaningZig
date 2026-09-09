@@ -1,0 +1,778 @@
+<section id="ch12">
+<h2>12. Structs and methods</h2>
+<p class="goals"><strong>In this chapter</strong> you will group related values into a struct, give fields default values, attach functions to the type and call them with dot syntax, and learn the one decision that matters most about a method: whether it takes <code>self</code> by value or by pointer. You will also nest structs, compare them, meet tuples, and teach a struct how to print itself.</p>
+
+<h3 id="ch12-1">12.1 Grouping values</h3>
+<p>A pilot has a name and two skill numbers. Passing those around as three separate values gets old fast; a struct bundles them under one name.</p>
+<p class="file">basics.zig</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    name: []const u8,
+    gunnery: u8,
+    piloting: u8,
+};
+
+pub fn main() void {
+    const kai = Pilot{ .name = "Kai Allard", .gunnery = 2, .piloting = 3 };
+    std.debug.print("{s}: {d}/{d}\n", .{ kai.name, kai.gunnery, kai.piloting });
+
+    var rookie: Pilot = .{ .name = "Rookie", .gunnery = 5, .piloting = 6 };
+    rookie.gunnery -= 1; // fields of a var struct can change
+    std.debug.print("{s}: {d}/{d}\n", .{ rookie.name, rookie.gunnery, rookie.piloting });
+}</code></pre>
+<pre class="term">Kai Allard: 2/3
+Rookie: 4/6</pre>
+<p>The declaration <code>const Pilot = struct { ... };</code> makes a new type. Each line inside is a <em>field</em>: a name, a colon, a type. Zig types are values, so a type is declared with <code>const</code> like anything else, and by convention type names are capitalised.</p>
+<p>To make a value, write the type name followed by braces and every field with a leading dot: <code>Pilot{ .name = ..., .gunnery = ..., .piloting = ... }</code>. You read fields with a dot, <code>kai.name</code>, and if the variable is a <code>var</code> you can assign to them.</p>
+<p>The second value uses the form you will see most: a type on the left of the colon and an <em>anonymous</em> literal <code>.{ ... }</code> on the right. The dot-brace literal has no type of its own; it takes whatever type the context expects. You have been using it since <a href="#ch02">Chapter 2</a>, where the arguments to <code>print</code> are a <code>.{ ... }</code> that becomes a tuple.</p>
+<p>Every field must be given a value. Leave one out and the compiler tells you which:</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    name: []const u8,
+    gunnery: u8,
+    piloting: u8,
+};
+
+pub fn main() void {
+    const kai = Pilot{ .name = "Kai Allard", .gunnery = 2 };
+    std.debug.print("{s}\n", .{kai.name});
+}</code></pre>
+<pre class="term">missing.zig:10:22: error: missing struct field: piloting
+    const kai = Pilot{ .name = "Kai Allard", .gunnery = 2 };
+                ~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+missing.zig:3:15: note: struct declared here
+const Pilot = struct {
+              ^~~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>This is different from C, where a forgotten field is silently garbage, and from JavaScript, where it is silently <code>undefined</code>. If you truly want to leave a field uninitialised for now, say <code>.field = undefined</code> explicitly.</p>
+
+<h3 id="ch12-2">12.2 Default values</h3>
+<p>A field can carry a default, written after <code>=</code> in the declaration. Then it may be omitted from the literal.</p>
+<p class="file">defaults.zig</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    name: []const u8,
+    gunnery: u8 = 4, // the "green" defaults
+    piloting: u8 = 5,
+    injured: bool = false,
+};
+
+pub fn main() void {
+    const a = Pilot{ .name = "Kai" };
+    const b = Pilot{ .name = "Nat", .gunnery = 2 };
+    std.debug.print("{s}: {d}/{d} injured={}\n", .{ a.name, a.gunnery, a.piloting, a.injured });
+    std.debug.print("{s}: {d}/{d} injured={}\n", .{ b.name, b.gunnery, b.piloting, b.injured });
+    std.debug.print("{any}\n", .{a});
+}</code></pre>
+<pre class="term">Kai: 4/5 injured=false
+Nat: 2/5 injured=false
+.{ .name = { 75, 97, 105 }, .gunnery = 4, .piloting = 5, .injured = false }</pre>
+<p><code>name</code> has no default and must be supplied; the other three are optional in the literal. When every field has a default, <code>Pilot{}</code> is a complete value. IRON LEDGER's <code>GameState</code> has about forty fields, most with defaults, so that <code>init</code> only has to set the few that depend on the configuration.</p>
+<p>The last line prints the whole struct with <code>{any}</code>. Handy for debugging, with one surprise: the <code>name</code> came out as <code>{ 75, 97, 105 }</code>. A <code>[]const u8</code> is a slice of bytes, and <code>{any}</code> does not know it is text. Section 12.9 fixes that.</p>
+
+<h3 id="ch12-3">12.3 Methods</h3>
+<p>A struct can contain functions as well as fields. A function whose first parameter is the struct type can be called with dot syntax, and that is all a "method" is in Zig: a namespaced function with a convenient call form.</p>
+<p class="file">methods.zig</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    name: []const u8,
+    gunnery: u8 = 4,
+    piloting: u8 = 5,
+    xp: u32 = 0,
+
+    /// Reads only: self is a copy.
+    pub fn skillTotal(self: Pilot) u8 {
+        return self.gunnery + self.piloting;
+    }
+
+    /// Mutates: self is a pointer to the caller's value.
+    pub fn train(self: *Pilot, points: u32) void {
+        self.xp += points;
+        if (self.xp &gt;= 10 and self.gunnery &gt; 0) {
+            self.gunnery -= 1;
+            self.xp -= 10;
+        }
+    }
+};
+
+pub fn main() void {
+    var kai = Pilot{ .name = "Kai", .gunnery = 3 };
+    std.debug.print("total {d}\n", .{kai.skillTotal()});
+    kai.train(6);
+    kai.train(6);
+    std.debug.print("gunnery {d}, xp {d}\n", .{ kai.gunnery, kai.xp });
+    std.debug.print("total {d}\n", .{Pilot.skillTotal(kai)}); // the same call, spelled out
+}</code></pre>
+<pre class="term">total 8
+gunnery 2, xp 2
+total 7</pre>
+<p>Two methods, two different first parameters, and the difference is the heart of this chapter.</p>
+<p><code>skillTotal(self: Pilot)</code> takes the struct <em>by value</em>. <code>self</code> is a copy of <code>kai</code>. The function can read it, and it could even modify its copy (after copying into a <code>var</code>), but the caller's <code>kai</code> is untouched. This is the right choice for anything that only reads.</p>
+<p><code>train(self: *Pilot, ...)</code> takes a <em>pointer</em> to the struct. <code>self</code> is the address of <code>kai</code>, and <code>self.xp += points</code> writes into the caller's value. Zig lets you write <code>self.xp</code> rather than <code>self.*.xp</code>; field access through a pointer follows the pointer automatically (there is no <code>-&gt;</code> as in C).</p>
+<p>The last line shows there is no magic: <code>kai.skillTotal()</code> is exactly <code>Pilot.skillTotal(kai)</code>. The dot form passes the thing before the dot as the first argument. For <code>kai.train(6)</code> Zig passes <code>&amp;kai</code>, because the parameter is a pointer.</p>
+<p>The compiler enforces the distinction in both directions. A pointer method on a <code>const</code> value is refused, because the method might write:</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    xp: u32 = 0,
+    pub fn train(self: *Pilot, points: u32) void {
+        self.xp += points;
+    }
+};
+
+pub fn main() void {
+    const kai = Pilot{};
+    kai.train(5);
+    std.debug.print("{d}\n", .{kai.xp});
+}</code></pre>
+<pre class="term">method_const.zig:12:8: error: expected type '*method_const.Pilot', found '*const method_const.Pilot'
+    kai.train(5);
+    ~~~^~~~~~
+method_const.zig:12:8: note: cast discards const qualifier
+method_const.zig:5:24: note: parameter type declared here
+    pub fn train(self: *Pilot, points: u32) void {
+                       ^~~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>And a by-value method cannot write, because parameters are immutable:</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct {
+    xp: u32 = 0,
+    pub fn train(self: Pilot, points: u32) void {
+        self.xp += points;
+    }
+};
+
+pub fn main() void {
+    var kai = Pilot{};
+    kai.train(5);
+    std.debug.print("{d}\n", .{kai.xp});
+}</code></pre>
+<pre class="term">method_value.zig:6:13: error: cannot assign to constant
+        self.xp += points;
+        ~~~~^~~
+referenced by:
+    main: method_value.zig:12:14
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=5' to see all references</pre>
+<div class="note"><strong>Choosing <code>self</code>.</strong> Take <code>self: T</code> when the method only reads and the struct is small. Take <code>self: *T</code> when it modifies anything. Take <code>self: *const T</code> when it only reads but the struct is large enough that copying it would be wasteful, or when it returns a slice or pointer into the struct (a copy would vanish when the method returned, as <a href="#ch10">Chapter 10</a> warned). Whatever you choose, call it <code>self</code>; the language does not require the name, but every Zig programmer expects it.</div>
+
+<h3 id="ch12-4">12.4 <code>@This()</code> and namespaced declarations</h3>
+<p>Besides fields and methods, a struct can hold constants and plain functions. They live in the struct's namespace and are reached with <code>Type.name</code>.</p>
+<p class="file">this.zig</p>
+<pre><code>const std = @import("std");
+
+const Money = struct {
+    cbills: i64,
+
+    const Self = @This();
+
+    pub const zero: Self = .{ .cbills = 0 };
+    pub const bp_scale: i64 = 10_000;
+
+    pub fn fromThousands(k: i64) Self {
+        return .{ .cbills = k * 1000 };
+    }
+
+    pub fn applyBp(self: Self, bp: i64) Self {
+        return .{ .cbills = @divTrunc(self.cbills * bp, bp_scale) };
+    }
+
+    pub fn add(self: *Self, other: Self) void {
+        self.cbills += other.cbills;
+    }
+};
+
+pub fn main() void {
+    var funds = Money.fromThousands(500);
+    funds.add(Money.zero);
+    funds.add(.{ .cbills = 250 });
+    const with_bonus = funds.applyBp(12_500); // times 1.25
+    std.debug.print("{d} -&gt; {d}\n", .{ funds.cbills, with_bonus.cbills });
+}</code></pre>
+<pre class="term">500250 -&gt; 625312</pre>
+<p><code>@This()</code> returns the type currently being defined. Writing <code>const Self = @This();</code> at the top of a struct lets the methods say <code>Self</code> instead of repeating the type's name, which pays off when the name is long or when the struct is anonymous or generated (<a href="#ch26">Chapter 26</a>). <code>Money.zero</code> is a constant of the type stored inside the type. <code>fromThousands</code> has no <code>self</code>; it is a plain function that happens to live in <code>Money</code>, and it plays the role a constructor plays elsewhere. Note the call <code>funds.add(.{ .cbills = 250 })</code>: the anonymous literal becomes a <code>Money</code> because that is the parameter type.</p>
+<p>The <code>@divTrunc</code> is Zig insisting you say which kind of integer division you mean (<a href="#ch04">Chapter 4</a>); IRON LEDGER's <code>applyBp</code> in <code>src/domain/types.zig</code> is this exact function.</p>
+
+<h3 id="ch12-5">12.5 Nested structs</h3>
+<p>A field's type can be another struct, named or written inline:</p>
+<p class="file">nested.zig</p>
+<pre><code>const std = @import("std");
+
+const Date = struct { year: u16, month: u8, day: u8 };
+
+const Contract = struct {
+    name: []const u8,
+    start: Date,
+    end: Date,
+    pay: struct { advance: i64, monthly: i64 }, // an inline anonymous struct type
+};
+
+pub fn main() void {
+    const c = Contract{
+        .name = "Garrison duty",
+        .start = .{ .year = 3025, .month = 1, .day = 1 },
+        .end = .{ .year = 3025, .month = 7, .day = 1 },
+        .pay = .{ .advance = 100_000, .monthly = 45_000 },
+    };
+    std.debug.print("{s}: {d}/{d} to {d}/{d}, {d}/month\n", .{
+        c.name, c.start.month, c.start.year, c.end.month, c.end.year, c.pay.monthly,
+    });
+}</code></pre>
+<pre class="term">Garrison duty: 1/3025 to 7/3025, 45000/month</pre>
+<p>Nested literals stay anonymous: <code>.start = .{ .year = 3025, ... }</code> becomes a <code>Date</code> because the field is a <code>Date</code>. The <code>pay</code> field uses an inline struct type, which is fine for a one-off grouping; give it a name the moment a second place needs it. Access chains with dots: <code>c.pay.monthly</code>.</p>
+
+<h3 id="ch12-6">12.6 Structs are values; pointers reach in</h3>
+<p>Like arrays, structs copy on assignment:</p>
+<p class="file">copy.zig</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct { name: []const u8, hp: u8 };
+
+pub fn main() void {
+    const a = Pilot{ .name = "Kai", .hp = 10 };
+    var b = a; // a copy of both fields
+    b.hp = 0;
+    std.debug.print("a.hp={d} b.hp={d}\n", .{ a.hp, b.hp });
+}</code></pre>
+<pre class="term">a.hp=10 b.hp=0</pre>
+<p>Note that copying the struct copied the <em>slice</em> <code>name</code>, not the bytes it points at; both values still point at the same <code>"Kai"</code>. A struct holding slices or pointers is a shallow copy, the same as in C or Go.</p>
+<p>To share a struct rather than copy it, pass a pointer, and read fields through it without any extra syntax:</p>
+<p class="file">ptr_access.zig</p>
+<pre><code>const std = @import("std");
+
+const Pilot = struct { name: []const u8, hp: u8 };
+
+fn wound(p: *Pilot, dmg: u8) void {
+    p.hp -|= dmg; // no arrow, no explicit deref: Zig follows the pointer for you
+    std.debug.print("{s} now at {d}\n", .{ p.name, p.hp });
+}
+
+pub fn main() void {
+    var kai = Pilot{ .name = "Kai", .hp = 10 };
+    const ptr = &amp;kai;
+    wound(ptr, 3);
+    wound(&amp;kai, 30);
+    std.debug.print("{d} {d}\n", .{ kai.hp, ptr.*.hp }); // ptr.*.hp is the long form
+}</code></pre>
+<pre class="term">Kai now at 7
+Kai now at 0
+0 0</pre>
+<p><code>p.hp</code> on a <code>*Pilot</code> reads the caller's <code>hp</code>; <code>ptr.*.hp</code> is the same thing spelled out. <code>-|=</code> is saturating subtraction so the second wound stops at zero instead of panicking on underflow.</p>
+
+<h3 id="ch12-7">12.7 Comparing structs</h3>
+<p>By now you can guess: no <code>==</code>.</p>
+<pre><code>const std = @import("std");
+
+const Date = struct { year: u16, month: u8, day: u8 };
+
+pub fn main() void {
+    const a = Date{ .year = 3025, .month = 1, .day = 1 };
+    const b = Date{ .year = 3025, .month = 1, .day = 1 };
+    std.debug.print("{}\n", .{a == b});
+}</code></pre>
+<pre class="term">equality_op.zig:8:33: error: operator == not allowed for type 'equality_op.Date'
+    std.debug.print("{}\n", .{a == b});
+                              ~~^~~~
+equality_op.zig:3:14: note: struct declared here
+const Date = struct { year: u16, month: u8, day: u8 };
+             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>Use <code>std.meta.eql</code>, which compares field by field (and recurses into nested structs and arrays), or write the comparison yourself when only some fields matter:</p>
+<p class="file">equality.zig</p>
+<pre><code>const std = @import("std");
+
+const Date = struct { year: u16, month: u8, day: u8 };
+
+pub fn main() void {
+    const a = Date{ .year = 3025, .month = 1, .day = 1 };
+    const b = Date{ .year = 3025, .month = 1, .day = 1 };
+    std.debug.print("{}\n", .{std.meta.eql(a, b)});
+    std.debug.print("{}\n", .{a.year == b.year and a.month == b.month and a.day == b.day});
+}</code></pre>
+<pre class="term">true
+true</pre>
+<p>In tests, <code>expectEqual</code> compares structs field by field too, which is why IRON LEDGER can write <code>expectEqual(Date{ .year = 3024, .month = 2, .day = 29 }, d)</code>. One caution: for a field that is a slice, <code>std.meta.eql</code> compares the pointer and length, not the bytes, the same rule as <code>expectEqual</code> in <a href="#ch08">Chapter 8</a>.</p>
+
+<h3 id="ch12-8">12.8 Tuples, briefly</h3>
+<p>A tuple is a struct whose fields are numbered instead of named. You have been making them all along: <code>.{ 1, "x" }</code> is a tuple literal. They are the natural way to return two values.</p>
+<p class="file">tuples.zig</p>
+<pre><code>const std = @import("std");
+
+fn minMax(xs: []const i32) struct { i32, i32 } {
+    var lo = xs[0];
+    var hi = xs[0];
+    for (xs) |x| {
+        if (x &lt; lo) lo = x;
+        if (x &gt; hi) hi = x;
+    }
+    return .{ lo, hi };
+}
+
+pub fn main() void {
+    const pair = minMax(&amp;[_]i32{ 4, -2, 9, 0 });
+    std.debug.print("min {d}, max {d}\n", .{ pair[0], pair[1] });
+    const lo, const hi = minMax(&amp;[_]i32{ 7, 3 }); // destructuring
+    std.debug.print("{d} {d}\n", .{ lo, hi });
+    std.debug.print("{any}\n", .{pair});
+}</code></pre>
+<pre class="term">min -2, max 9
+3 7
+.{ -2, 9 }</pre>
+<p><code>struct { i32, i32 }</code> declares a tuple type with two <code>i32</code> fields; you index it with <code>[0]</code> and <code>[1]</code>, and you can pull it apart into two names in one <code>const lo, const hi = ...</code> statement. If the two values have different meanings, prefer a named struct: <code>struct { lo: i32, hi: i32 }</code> costs nothing more and reads better six months later.</p>
+
+<h3 id="ch12-9">12.9 Printing a struct: <code>{any}</code> and a <code>format</code> method</h3>
+<p><code>{any}</code> prints every field, which is fine for debugging and wrong for users. A struct can define how it prints by providing a method named <code>format</code>. In Zig 0.16 the signature is fixed:</p>
+<pre><code>pub fn format(self: T, w: *std.Io.Writer) std.Io.Writer.Error!void</code></pre>
+<p>It receives a writer, the same interface as stdout and fixed buffers, and prints whatever it likes to it. You then ask for it with the <code>{f}</code> specifier:</p>
+<p class="file">format.zig</p>
+<pre><code>const std = @import("std");
+
+const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+
+    pub fn format(self: Date, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{d:0&gt;4}-{d:0&gt;2}-{d:0&gt;2}", .{ self.year, self.month, self.day });
+    }
+};
+
+const Plain = struct { year: u16, month: u8, day: u8 };
+
+pub fn main() !void {
+    const d = Date{ .year = 3025, .month = 3, .day = 7 };
+    const p = Plain{ .year = 3025, .month = 3, .day = 7 };
+    std.debug.print("{any}\n", .{p});
+    std.debug.print("{f}\n", .{d});
+    var buf: [32]u8 = undefined;
+    const s = try std.fmt.bufPrint(&amp;buf, "start {f}", .{d});
+    std.debug.print("{s}\n", .{s});
+}</code></pre>
+<pre class="term">.{ .year = 3025, .month = 3, .day = 7 }
+3025-03-07
+start 3025-03-07</pre>
+<p><code>{f}</code> works anywhere a format string does: <code>std.debug.print</code>, <code>bufPrint</code>, a file writer. This is how a <code>Date</code> can print as <code>3025-03-07</code> in one place and be a plain three-field struct everywhere else.</p>
+<div class="warn"><strong><code>{any}</code> ignores your <code>format</code>.</strong> In 0.16, <code>{any}</code> (and a bare <code>{}</code>) always print the raw fields, even when the type has a <code>format</code> method:
+<pre><code>const std = @import("std");
+
+const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    pub fn format(self: Date, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{d}-{d}-{d}", .{ self.year, self.month, self.day });
+    }
+};
+
+pub fn main() void {
+    const d = Date{ .year = 3025, .month = 3, .day = 7 };
+    std.debug.print("{any}\n", .{d});
+}</code></pre>
+<pre class="term">.{ .year = 3025, .month = 3, .day = 7 }</pre>
+<p>Only <code>{f}</code> calls your method. Older Zig picked the method up automatically, so older code and tutorials write <code>{}</code> and expect the custom output; in 0.16 that prints fields. If your nicely formatted struct comes out as <code>.{ .year = ... }</code>, change the specifier to <code>{f}</code>.</p></div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The campaign calendar is a small, complete struct: fields, a namespaced constant, plain functions, a by-value method that returns a new value, and a predicate. It is the shape you should copy for your own small value types:
+<pre><code>// src/sim/clock.zig
+pub const Date = struct {
+    year: u16,
+    month: u8, // 1-12
+    day: u8, // 1-31
+
+    pub const campaign_default: Date = .{ .year = 3025, .month = 1, .day = 1 };
+
+    pub fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    pub fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+
+    pub fn isPayday(self: Date) bool {
+        return self.day == 1;
+    }
+};</code></pre>
+<p><code>next</code> copies <code>self</code> into a <code>var</code>, changes the copy and returns it; nothing is mutated in place, by choice. The other style lives in <code>src/sim/state.zig</code>, where <code>GameState</code> has forty-odd fields, most with defaults, and every method takes <code>self: *GameState</code> because a game state is far too large to copy and is meant to change. Both are correct; the size and the intent decide.</p></div>
+
+<h3 id="ch12-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 12.1 · A Date with methods <span class="level">warm-up</span></h4>
+  <p>Complete IRON LEDGER's <code>Date</code>: <code>isLeapYear</code>, <code>daysInMonth</code>, a by-value <code>next</code> and a by-pointer <code>advance</code> that reuses it. The tests are the game's own, plus one for <code>advance</code>. Name the file: <code>exercises/12-structs/ex1_date.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 12, exercise 1: a Date struct with methods.
+//! Run with:  zig test ex1_date.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Date = struct {
+    year: u16,
+    month: u8, // 1..12
+    day: u8, // 1..31
+
+    pub const campaign_default: Date = .{ .year = 3025, .month = 1, .day = 1 };
+
+    pub fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    pub fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+            4, 6, 9, 11 =&gt; 30,
+            2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+            else =&gt; unreachable,
+        };
+    }
+
+    /// The day after self, as a new value.
+    pub fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+
+    /// Advance self in place by n days.
+    pub fn advance(self: *Date, n: u32) void {
+        var i: u32 = 0;
+        while (i &lt; n) : (i += 1) self.* = self.next();
+    }
+
+    pub fn isPayday(self: Date) bool {
+        return self.day == 1;
+    }
+};
+
+test "leap years" {
+    try std.testing.expect(Date.isLeapYear(3024));
+    try std.testing.expect(!Date.isLeapYear(3025));
+    try std.testing.expect(!Date.isLeapYear(3100));
+    try std.testing.expect(Date.isLeapYear(3200));
+}
+
+test "next rolls over months and years" {
+    var d: Date = .{ .year = 3024, .month = 2, .day = 28 };
+    d = d.next();
+    try std.testing.expectEqual(Date{ .year = 3024, .month = 2, .day = 29 }, d);
+    d = .{ .year = 3025, .month = 12, .day = 31 };
+    try std.testing.expectEqual(Date{ .year = 3026, .month = 1, .day = 1 }, d.next());
+}
+
+test "advance mutates in place" {
+    var d = Date.campaign_default;
+    d.advance(31);
+    try std.testing.expectEqual(Date{ .year = 3025, .month = 2, .day = 1 }, d);
+    try std.testing.expect(d.isPayday());
+    d.advance(1);
+    try std.testing.expect(!d.isPayday());
+}</code></pre>
+  <p><code>advance</code> shows the two styles cooperating: it takes <code>*Date</code> so it can change the caller's value, and does so by assigning <code>self.* = self.next()</code>, the by-value method's result. The <code>@as(u8, 29)</code> inside the switch gives the <code>if</code> expression a concrete type so that both branches agree.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 12.2 · Defaults, nesting and <code>format</code> <span class="level">practice</span></h4>
+  <p>Add three defaulted fields to <code>Unit</code> (an <code>Armor</code> struct, an optional pilot name, a destroyed flag), implement <code>totalArmor</code> and <code>hitFront</code>, and write a <code>format</code> method that prints <code>Atlas (100t, 47/14) piloted by Kai [DESTROYED]</code> style output, checked through <code>bufPrint</code> with <code>{f}</code>. Name the file: <code>exercises/12-structs/ex2_unit.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 12, exercise 2: defaults, nesting and a format method.
+//! Run with:  zig test ex2_unit.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Armor = struct { front: u16, rear: u16 };
+
+const Unit = struct {
+    name: []const u8,
+    tons: u8,
+    armor: Armor = .{ .front = 0, .rear = 0 },
+    pilot: ?[]const u8 = null,
+    destroyed: bool = false,
+
+    pub fn totalArmor(self: Unit) u32 {
+        return @as(u32, self.armor.front) + self.armor.rear;
+    }
+
+    /// Apply damage to the front armor; anything left over destroys the unit.
+    pub fn hitFront(self: *Unit, dmg: u16) void {
+        if (dmg &gt;= self.armor.front) {
+            self.armor.front = 0;
+            self.destroyed = true;
+        } else {
+            self.armor.front -= dmg;
+        }
+    }
+
+    pub fn format(self: Unit, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const a = self.armor;
+        try w.print("{s} ({d}t, {d}/{d})", .{ self.name, self.tons, a.front, a.rear });
+        if (self.pilot) |p| try w.print(" piloted by {s}", .{p});
+        if (self.destroyed) try w.writeAll(" [DESTROYED]");
+    }
+};
+
+test "defaults" {
+    const u = Unit{ .name = "Locust", .tons = 20 };
+    try std.testing.expectEqual(@as(u32, 0), u.totalArmor());
+    try std.testing.expectEqual(@as(?[]const u8, null), u.pilot);
+    try std.testing.expect(!u.destroyed);
+}
+
+test "damage" {
+    var u = Unit{ .name = "Atlas", .tons = 100, .armor = .{ .front = 47, .rear = 14 } };
+    u.hitFront(10);
+    try std.testing.expectEqual(@as(u32, 51), u.totalArmor());
+    try std.testing.expect(!u.destroyed);
+    u.hitFront(40);
+    try std.testing.expect(u.destroyed);
+    try std.testing.expectEqual(@as(u16, 0), u.armor.front);
+}
+
+test "format" {
+    var buf: [96]u8 = undefined;
+    var u = Unit{
+        .name = "Atlas",
+        .tons = 100,
+        .armor = .{ .front = 47, .rear = 14 },
+        .pilot = "Kai",
+    };
+    try std.testing.expectEqualStrings(
+        "Atlas (100t, 47/14) piloted by Kai",
+        try std.fmt.bufPrint(&amp;buf, "{f}", .{u}),
+    );
+    u.hitFront(99);
+    try std.testing.expectEqualStrings(
+        "Atlas (100t, 0/14) piloted by Kai [DESTROYED]",
+        try std.fmt.bufPrint(&amp;buf, "{f}", .{u}),
+    );
+}</code></pre>
+  <p><code>totalArmor</code> widens to <code>u32</code> before adding, since two <code>u16</code> can overflow a <code>u16</code>. The optional pilot is unwrapped with <code>if (self.pilot) |p|</code>, a preview of <a href="#ch15">Chapter 15</a>. The <code>format</code> method uses <code>w.print</code> and <code>w.writeAll</code>, the same calls as any writer.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 12.3 · A lance of meks <span class="level">practice</span></h4>
+  <p>A <code>Lance</code> holds a <code>[4]Mek</code>. Implement <code>tonnage</code>, <code>readyCount</code>, a pointer-receiver <code>damage</code> that marks one mek by name, and <code>heaviestReady</code>, which returns a pointer into the lance or <code>null</code>. Name the file: <code>exercises/12-structs/ex3_lance.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 12, exercise 3: a struct that holds an array of structs.
+//! Run with:  zig test ex3_lance.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Mek = struct {
+    name: []const u8,
+    tons: u8,
+    ready: bool = true,
+};
+
+const Lance = struct {
+    name: []const u8,
+    meks: [4]Mek,
+
+    const Self = @This();
+
+    pub fn tonnage(self: Self) u32 {
+        var t: u32 = 0;
+        for (self.meks) |m| t += m.tons;
+        return t;
+    }
+
+    pub fn readyCount(self: Self) usize {
+        var n: usize = 0;
+        for (self.meks) |m| {
+            if (m.ready) n += 1;
+        }
+        return n;
+    }
+
+    /// Mark the mek called `name` as not ready. Returns false if no such mek.
+    pub fn damage(self: *Self, name: []const u8) bool {
+        for (&amp;self.meks) |*m| {
+            if (std.mem.eql(u8, m.name, name)) {
+                m.ready = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The heaviest ready mek, or null if none is ready.
+    pub fn heaviestReady(self: *const Self) ?*const Mek {
+        var best: ?*const Mek = null;
+        for (&amp;self.meks) |*m| {
+            if (!m.ready) continue;
+            if (best == null or m.tons &gt; best.?.tons) best = m;
+        }
+        return best;
+    }
+};
+
+fn sampleLance() Lance {
+    return .{
+        .name = "Alpha",
+        .meks = .{
+            .{ .name = "Atlas", .tons = 100 },
+            .{ .name = "Locust", .tons = 20 },
+            .{ .name = "Marauder", .tons = 75 },
+            .{ .name = "Shadow Hawk", .tons = 55 },
+        },
+    };
+}
+
+test "tonnage and readiness" {
+    const l = sampleLance();
+    try std.testing.expectEqual(@as(u32, 250), l.tonnage());
+    try std.testing.expectEqual(@as(usize, 4), l.readyCount());
+}
+
+test "damage through a pointer" {
+    var l = sampleLance();
+    try std.testing.expect(l.damage("Atlas"));
+    try std.testing.expect(!l.damage("Urbanmech"));
+    try std.testing.expectEqual(@as(usize, 3), l.readyCount());
+    try std.testing.expectEqual(@as(u32, 250), l.tonnage()); // tonnage unchanged
+}
+
+test "heaviest ready" {
+    var l = sampleLance();
+    try std.testing.expectEqualStrings("Atlas", l.heaviestReady().?.name);
+    _ = l.damage("Atlas");
+    try std.testing.expectEqualStrings("Marauder", l.heaviestReady().?.name);
+    for (&amp;l.meks) |*m| m.ready = false;
+    try std.testing.expect(l.heaviestReady() == null);
+}</code></pre>
+  <p><code>damage</code> loops over <code>&amp;self.meks</code> with <code>|*m|</code> so the write to <code>m.ready</code> lands in the struct, not in a copy. <code>heaviestReady</code> takes <code>*const Self</code> because it returns a pointer into the struct; with a by-value <code>self</code> the pointer would refer to a copy that no longer exists.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 12.4 · A tiny ledger <span class="level">challenge</span></h4>
+<p>A <code>Ledger</code> keeps up to eight <code>Entry</code> values in a fixed array with a <code>len</code> counter. Implement <code>post</code> (returning <code>error.Full</code> when out of room), <code>balance</code>, <code>balanceOn(day)</code> and <code>biggestExpense</code>. Only <code>entries[0..len]</code> are meaningful; the rest is <code>undefined</code>. Name the file: <code>exercises/12-structs/ex4_ledger.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 12, exercise 4: a tiny ledger (challenge).
+//! Run with:  zig test ex4_ledger.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Entry = struct {
+    day: u32,
+    label: []const u8,
+    amount: i64, // positive = income, negative = expense
+};
+
+const Ledger = struct {
+    entries: [8]Entry = undefined,
+    len: usize = 0,
+    opening: i64,
+
+    const Self = @This();
+
+    /// Record an entry. Returns error.Full when the fixed array is used up.
+    pub fn post(self: *Self, day: u32, label: []const u8, amount: i64) !void {
+        if (self.len == self.entries.len) return error.Full;
+        self.entries[self.len] = .{ .day = day, .label = label, .amount = amount };
+        self.len += 1;
+    }
+
+    pub fn balance(self: Self) i64 {
+        var b = self.opening;
+        for (self.entries[0..self.len]) |e| b += e.amount;
+        return b;
+    }
+
+    /// Balance as it stood at the end of `day`.
+    pub fn balanceOn(self: Self, day: u32) i64 {
+        var b = self.opening;
+        for (self.entries[0..self.len]) |e| {
+            if (e.day &lt;= day) b += e.amount;
+        }
+        return b;
+    }
+
+    /// The largest single expense (most negative amount), or null.
+    pub fn biggestExpense(self: *const Self) ?Entry {
+        var best: ?Entry = null;
+        for (self.entries[0..self.len]) |e| {
+            if (e.amount &gt;= 0) continue;
+            if (best == null or e.amount &lt; best.?.amount) best = e;
+        }
+        return best;
+    }
+};
+
+test "post and balance" {
+    var l = Ledger{ .opening = 1_000_000 };
+    try l.post(1, "contract advance", 250_000);
+    try l.post(1, "salaries", -60_000);
+    try l.post(15, "spare parts", -12_500);
+    try std.testing.expectEqual(@as(i64, 1_177_500), l.balance());
+    try std.testing.expectEqual(@as(i64, 1_190_000), l.balanceOn(1));
+    try std.testing.expectEqual(@as(i64, 1_000_000), l.balanceOn(0));
+}
+
+test "biggest expense" {
+    var l = Ledger{ .opening = 0 };
+    try std.testing.expect(l.biggestExpense() == null);
+    try l.post(1, "income", 500);
+    try l.post(2, "salaries", -60_000);
+    try l.post(3, "repairs", -75_000);
+    try std.testing.expectEqualStrings("repairs", l.biggestExpense().?.label);
+}
+
+test "full ledger" {
+    var l = Ledger{ .opening = 0 };
+    var i: u32 = 0;
+    while (i &lt; 8) : (i += 1) try l.post(i, "x", 1);
+    try std.testing.expectError(error.Full, l.post(9, "one too many", 1));
+    try std.testing.expectEqual(@as(i64, 8), l.balance());
+}</code></pre>
+  <p>Every reader slices <code>self.entries[0..self.len]</code> so it never looks at the undefined tail. This array-plus-length pattern is what <code>ArrayList</code> does for you with a growable buffer in <a href="#ch21">Chapter 21</a>; building it by hand once makes the real thing obvious.</p></details>
+</div>
+
+<h3 id="ch12-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What happens if you omit a field without a default from a struct literal? <details class="answer"><summary>Answer</summary>A compile error naming the missing field. Zig never leaves a field silently uninitialised; write <code>.f = undefined</code> if that is what you mean.</details></li>
+  <li>What is the difference between <code>fn f(self: T)</code> and <code>fn f(self: *T)</code>? <details class="answer"><summary>Answer</summary>By value, <code>self</code> is a copy and the method cannot change the caller's struct. By pointer, it can. Calling a pointer method on a <code>const</code> value is a compile error.</details></li>
+  <li>Is <code>kai.train(6)</code> different from <code>Pilot.train(&amp;kai, 6)</code>? <details class="answer"><summary>Answer</summary>No. Method-call syntax passes the value before the dot (or its address, for pointer parameters) as the first argument.</details></li>
+  <li>How do you read a field through a pointer to a struct? <details class="answer"><summary>Answer</summary>With a plain dot: <code>p.hp</code>. Zig follows the pointer; <code>p.*.hp</code> is the explicit form and there is no <code>-&gt;</code>.</details></li>
+  <li>How do you compare two structs for equality? <details class="answer"><summary>Answer</summary><code>std.meta.eql(a, b)</code>, or field by field. <code>==</code> is not defined for structs. Slice fields are compared by pointer and length.</details></li>
+  <li>What does <code>@This()</code> return? <details class="answer"><summary>Answer</summary>The type being defined at that point, usually stored as <code>const Self = @This();</code>. At file scope it is the file's own struct type.</details></li>
+  <li>You wrote a <code>format</code> method and <code>print("{}", .{d})</code> still shows raw fields. Why? <details class="answer"><summary>Answer</summary>In 0.16 only the <code>{f}</code> specifier calls a type's <code>format</code> method; <code>{}</code> and <code>{any}</code> print the fields.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>const T = struct { field: Type, ... };</code> declares a type; <code>T{ .field = v }</code> or a typed <code>.{ ... }</code> builds a value. Every non-defaulted field is required.</li>
+<li>Defaults (<code>field: Type = value</code>) make fields optional in literals.</li>
+<li>Methods are functions in the struct whose first parameter is the type; <code>v.method()</code> is <code>T.method(v)</code>.</li>
+<li><code>self: T</code> reads a copy; <code>self: *T</code> mutates the original; <code>self: *const T</code> reads without copying.</li>
+<li>Field access through a pointer needs no special syntax. Structs copy on assignment (shallowly).</li>
+<li><code>@This()</code> names the current type; constants and plain functions can live inside a struct.</li>
+<li>Compare with <code>std.meta.eql</code>. Tuples are structs with numbered fields.</li>
+<li><code>pub fn format(self: T, w: *std.Io.Writer) std.Io.Writer.Error!void</code> plus the <code>{f}</code> specifier gives custom printing; <code>{any}</code> shows raw fields.</li>
+</ul></div>
+</section>

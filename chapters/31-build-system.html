@@ -1,0 +1,514 @@
+<section id="ch31">
+<h2>31. The build system</h2>
+<p class="goals"><strong>In this chapter</strong> you will stop typing <code>zig run file.zig</code> and start describing your program in <code>build.zig</code>: a Zig program that builds a graph of steps. You will create a project with <code>zig init</code>, read every line it generates, add modules, options, run and test steps, choose optimisation modes, and finally read IRON LEDGER's real build script from top to bottom.</p>
+
+<h3 id="ch31-1">31.1 zig init</h3>
+<p>There is one tool, <code>zig</code>. It compiles, tests, formats and runs. For anything bigger than one file it reads <code>build.zig</code>, and the quickest way to get a correct one is to let it write one. In an empty directory:</p>
+<pre class="term">$ mkdir init &amp;&amp; cd init &amp;&amp; zig init
+info: created build.zig
+info: created build.zig.zon
+info: created src/main.zig
+info: created src/root.zig
+info: see `zig build --help` for a menu of options</pre>
+<p>Four files. <code>build.zig.zon</code> is the package manifest you met in <a href="#ch28">Chapter 28</a>. <code>src/root.zig</code> is a library with one function and a test. <code>src/main.zig</code> is an executable that imports the library. And <code>build.zig</code> is about 150 lines, most of them comments, describing how the two fit together. Trimmed of its comments it is this:</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const mod = b.addModule("init", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "init",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &amp;.{
+                .{ .name = "init", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_step = b.step("run", "Run the app");
+    const run_cmd = b.addRunArtifact(exe);
+    run_step.dependOn(&amp;run_cmd.step);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+
+    const mod_tests = b.addTest(.{ .root_module = mod });
+    const run_mod_tests = b.addRunArtifact(mod_tests);
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&amp;run_mod_tests.step);
+    test_step.dependOn(&amp;run_exe_tests.step);
+}</code></pre>
+<p>The rest of this chapter explains each of those lines, with a slightly smaller project of our own so the output fits on a page.</p>
+
+<h3 id="ch31-2">31.2 A build script does not build</h3>
+<p>Read the signature: <code>pub fn build(b: *std.Build) void</code>. When you type <code>zig build</code>, the compiler first compiles <em>this function</em> into a small program called the build runner, runs it, and the function <em>describes</em> the work by adding steps to <code>b</code>. Nothing is compiled while <code>build()</code> executes. Only after it returns does the runner look at the graph, decide which steps the user asked for, work out what is cached, and execute the rest, in parallel where dependencies allow.</p>
+<p>That is why the calls are named the way they are: <code>addExecutable</code>, <code>addTest</code>, <code>addRunArtifact</code>. Each adds a node. <code>dependOn</code> adds an edge. <code>b.step("name", …)</code> creates a named entry point the user can type. Everything else is plumbing between nodes.</p>
+
+<h3 id="ch31-3">31.3 Anatomy of build.zig</h3>
+<p>Here is the project for this chapter: a library module <code>money</code> in <code>lib/</code>, an executable in <code>src/</code>, two options, build-time constants, and run and test steps. Every line is numbered by the comment above it.</p>
+<p class="file">ledger/build.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    // 1. Options the user can pass on the command line.
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const verbose = b.option(bool, "verbose", "Print every transaction") orelse false;
+    const company = b.option([]const u8, "company", "Company name baked into the binary") orelse "Unnamed";
+
+    // 2. A library module other code can import as "money".
+    const money = b.addModule("money", .{
+        .root_source_file = b.path("lib/money.zig"),
+        .target = target,
+    });
+
+    // 3. Build-time constants, visible in code as @import("build_options").
+    const opts = b.addOptions();
+    opts.addOption(bool, "verbose", verbose);
+    opts.addOption([]const u8, "company", company);
+
+    // 4. The executable: its own root module that imports the library.
+    const exe = b.addExecutable(.{
+        .name = "ledger",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &amp;.{
+                .{ .name = "money", .module = money },
+                .{ .name = "build_options", .module = opts.createModule() },
+            },
+        }),
+    });
+    b.installArtifact(exe);
+
+    // 5. `zig build run -- args`
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the ledger");
+    run_step.dependOn(&amp;run_cmd.step);
+
+    // 6. `zig build test`: one test binary per module.
+    const lib_tests = b.addTest(.{ .root_module = money });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&amp;b.addRunArtifact(lib_tests).step);
+    test_step.dependOn(&amp;b.addRunArtifact(exe_tests).step);
+}</code></pre>
+<p class="file">ledger/lib/money.zig</p>
+<pre><code>//! The "money" module: C-bills as integers, never floats.
+const std = @import("std");
+
+pub const CBills = i64;
+
+pub fn fromCbills(n: i64) CBills {
+    return n * 100;
+}
+
+pub fn format(buf: []u8, amount: CBills) ![]u8 {
+    const sign: []const u8 = if (amount &lt; 0) "-" else "";
+    const abs: u64 = @abs(amount);
+    return std.fmt.bufPrint(buf, "{s}{d}.{d:0&gt;2} C-bills", .{ sign, abs / 100, abs % 100 });
+}
+
+test "format" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("12.05 C-bills", try format(&amp;buf, 1205));
+    try std.testing.expectEqualStrings("-0.50 C-bills", try format(&amp;buf, -50));
+}</code></pre>
+<p class="file">ledger/src/main.zig</p>
+<pre><code>const std = @import("std");
+const money = @import("money");
+const build_options = @import("build_options");
+
+pub fn main(init: std.process.Init) !void {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+
+    var balance: money.CBills = money.fromCbills(1000);
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.next();
+    while (it.next()) |arg| {
+        const delta = try std.fmt.parseInt(i64, arg, 10);
+        balance += delta;
+        if (build_options.verbose) try out.print("  {s:&gt;8} -&gt; {d}\n", .{ arg, balance });
+    }
+    var fbuf: [64]u8 = undefined;
+    try out.print("{s}: {s}\n", .{ build_options.company, try money.format(&amp;fbuf, balance) });
+    try out.flush();
+}
+
+test "main module compiles and sees the library" {
+    try std.testing.expectEqual(@as(money.CBills, 200), money.fromCbills(2));
+}</code></pre>
+<p><strong>1. Options.</strong> <code>b.standardTargetOptions</code> registers <code>-Dtarget</code> and <code>-Dcpu</code>, so anyone can cross-compile your project without editing the script. <code>b.standardOptimizeOption</code> registers <code>-Doptimize</code>. <code>b.option(T, name, description)</code> declares your own flag; it returns <code>?T</code>, <code>null</code> when the user did not pass it, and you supply the default with <code>orelse</code>. Supported <code>T</code>s include <code>bool</code>, integers, <code>[]const u8</code>, enums, and lists of strings.</p>
+<p><strong>2. Modules.</strong> A module is a tree of source files with one root, plus the settings needed to compile it. <code>b.addModule("money", …)</code> creates one and makes it available under that name to <em>other packages</em> that depend on yours. <code>b.createModule(…)</code> creates one that is private to this build. Both take the same options: <code>root_source_file</code>, <code>target</code>, <code>optimize</code>, and an <code>imports</code> list that says which other modules this one may <code>@import</code> by name.</p>
+<p><strong>3. Build options.</strong> <code>b.addOptions()</code> creates a step that writes a tiny generated Zig file, and <code>addOption(T, name, value)</code> adds a constant to it. <code>opts.createModule()</code> turns that into a module you can import. In the source, <code>@import("build_options").verbose</code> is then a compile-time <code>bool</code>, and <code>if (build_options.verbose)</code> compiles to nothing at all when it is false.</p>
+<p><strong>4. The executable.</strong> <code>b.addExecutable</code> takes a name and a <code>root_module</code>. The root module is where <code>main</code> lives, and its <code>imports</code> list is how the source's <code>@import("money")</code> finds the library. <code>b.installArtifact(exe)</code> says "when the user runs the default step, copy this into the install prefix", which is <code>zig-out/bin/</code> unless changed.</p>
+<p><strong>5. Run.</strong> <code>b.addRunArtifact(exe)</code> creates a step that executes the built program. Making it depend on the install step means it runs the installed copy. <code>b.args</code> is the optional list of words after <code>--</code> on the command line, forwarded with <code>addArgs</code>. Finally <code>b.step("run", …)</code> creates the entry point and <code>dependOn</code> wires it to the run step.</p>
+<p><strong>6. Tests.</strong> <code>b.addTest</code> compiles a module as a test binary. A test binary covers <em>one module</em>, so a project with a library and an executable makes two and runs both under one <code>test</code> step. Steps run in parallel when nothing orders them.</p>
+
+<h3 id="ch31-4">31.4 Running it</h3>
+<pre class="term">$ zig build
+$ find zig-out -type f
+zig-out/bin/ledger
+$ zig build run -- 500 -25
+Unnamed: 1004.75 C-bills
+$ zig build run -Dverbose -Dcompany="Kell Hounds" -- 500 -25
+       500 -&gt; 100500
+       -25 -&gt; 100475
+Kell Hounds: 1004.75 C-bills
+$ zig build test --summary all
+Build Summary: 6/6 steps succeeded; 2/2 tests passed
+test success
++- run test 1 pass (1 total) 297ms MaxRSS:2M
+|  +- compile test Debug native success 1s MaxRSS:272M
++- run test 1 pass (1 total) 164ms MaxRSS:2M
+   +- compile test Debug native success 1s MaxRSS:272M
+      +- options cached</pre>
+<p>Three things to notice. A plain <code>zig build</code> prints nothing on success; the artifact appears under <code>zig-out</code>. Words after <code>--</code> go to the program, words before it (starting with <code>-D</code>) go to the build script. And <code>--summary all</code> shows the step tree, including which steps were served from the cache: the options step did not need to rerun.</p>
+<p>The generated help lists your options next to the standard ones, with the description text you wrote:</p>
+<pre class="term">$ zig build --help
+Usage: /opt/homebrew/Cellar/zig/0.16.0_1/bin/zig build [steps] [options]
+
+Steps:
+  install (default)            Copy build artifacts to prefix path
+  uninstall                    Remove build artifacts from prefix path
+  run                          Run the ledger
+  test                         Run all tests
+
+Project-Specific Options:
+  -Dtarget=[string]            The CPU architecture, OS, and ABI to build for
+  -Dcpu=[string]               Target CPU features to add or subtract
+  -Dofmt=[string]              Target object format
+  -Ddynamic-linker=[string]    Path to interpreter on the target system
+  -Doptimize=[enum]            Prioritize performance, safety, or binary size
+                                 Supported Values:
+                                   Debug
+                                   ReleaseSafe
+                                   ReleaseFast
+                                   ReleaseSmall
+  -Dverbose=[bool]             Print every transaction
+  -Dcompany=[string]           Company name baked into the binary</pre>
+<p><code>zig build -l</code> prints just the steps. A misspelled option is an error, not a silent ignore: <code>zig build -Dnope=1</code> stops with <code>error: invalid option: -Dnope</code>.</p>
+
+<h3 id="ch31-5">31.5 Optimisation modes</h3>
+<p>The <code>-Doptimize</code> flag chooses one of four modes, and the choice changes what the language guarantees:</p>
+<table>
+<tr><th>Mode</th><th>Speed</th><th>Safety checks</th><th>Use it for</th></tr>
+<tr><td><code>Debug</code> (default)</td><td>slow</td><td>on: overflow, bounds, null, leak detection</td><td>development, every test run</td></tr>
+<tr><td><code>ReleaseSafe</code></td><td>fast</td><td>on: overflow, bounds, null still panic</td><td>shipping software that must fail loudly</td></tr>
+<tr><td><code>ReleaseFast</code></td><td>fastest</td><td>off: undefined behaviour on overflow</td><td>benchmarks, code you have tested to exhaustion</td></tr>
+<tr><td><code>ReleaseSmall</code></td><td>fast</td><td>off, plus size over speed</td><td>embedded, downloads where size matters</td></tr>
+</table>
+<pre class="term">$ zig build -Doptimize=ReleaseSmall --prefix /tmp/ledger-small
+$ zig build -Doptimize=ReleaseFast -p /tmp/ledger-fast
+$ ls -l zig-out/bin/ledger /tmp/ledger-small/bin/ledger /tmp/ledger-fast/bin/ledger
+2065784 zig-out/bin/ledger
+ 396936 /tmp/ledger-fast/bin/ledger
+ 165272 /tmp/ledger-small/bin/ledger</pre>
+<p>The same program is two megabytes in Debug (full debug info and safety code), 400 KB in ReleaseFast, and 165 KB in ReleaseSmall. <code>--prefix</code> (short form <code>-p</code>) redirects the install from <code>zig-out</code> to any directory, which is how you produce a release tree.</p>
+<div class="warn"><strong>Do not test in ReleaseFast.</strong> The safety checks that make Debug and ReleaseSafe catch overflow and out-of-bounds are switched off in ReleaseFast. A bug that panics in Debug may silently corrupt memory there. Develop and test in Debug, ship ReleaseSafe unless you have measured a need for more, and use <code>std.math.add</code>-style checked functions for arithmetic that must be correct in every mode (Exercise 31.4).</div>
+
+<h3 id="ch31-6">31.6 The cache and the output directory</h3>
+<p>Two directories appear beside <code>build.zig</code>. <code>zig-out/</code> is the install prefix: <code>bin/</code> for executables, <code>lib/</code> for libraries, whatever <code>installDirectory</code> adds. It is yours to ship or delete. <code>.zig-cache/</code> holds compiled objects keyed by a hash of their inputs, so a second <code>zig build</code> that changes nothing does nothing. There is also a global cache (<code>~/.cache/zig</code> on this machine, see <code>zig env</code>) for the standard library and fetched packages. Both caches are safe to delete; the next build simply takes longer. Add both directories to <code>.gitignore</code>.</p>
+
+<h3 id="ch31-7">31.7 Data files and C libraries</h3>
+<p>Two more module calls round out the vocabulary. <code>module.addAnonymousImport("name", .{ .root_source_file = path })</code> binds a file anywhere on disk to an import name; you saw it in <a href="#ch28">Chapter 28</a> for ZON tables. And for C:</p>
+<pre><code>mod.link_libc = true;
+mod.linkSystemLibrary("sqlite3", .{});</code></pre>
+<p>The first links the C standard library into the module; the second asks the system linker for <code>libsqlite3</code>. <a href="#ch35">Chapter 35</a> shows what the Zig side of such a binding looks like. Both are set on the <em>module</em>, and any executable or test that uses the module inherits them, which is why IRON LEDGER's tests can open a database without repeating the linker flags.</p>
+
+<h3 id="ch31-8">31.8 Reading IRON LEDGER's build.zig</h3>
+<p>Now the real thing, <code>game/build.zig</code>. It is the <code>zig init</code> template grown up, and you can read it in the order the template used. Comments are trimmed.</p>
+<pre><code>pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const mod = b.addModule("game", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+    });</code></pre>
+<p>The simulation core is a module named <code>game</code>, rooted at the <code>root.zig</code> you read in <a href="#ch30">Chapter 30</a>. Then the data tables:</p>
+<pre><code>    const data_dir = b.option([]const u8, "data", "Directory overlaying data/*.zon and data/tables/*.zon (mod support)");
+    const DataFile = struct { import_name: []const u8, rel: []const u8 };
+    const data_files = [_]DataFile{
+        .{ .import_name = "chassis_zon", .rel = "chassis.zon" },
+        .{ .import_name = "planets_zon", .rel = "planets.zon" },
+        .{ .import_name = "parts_zon", .rel = "parts.zon" },
+        .{ .import_name = "tuning_zon", .rel = "tables/tuning.zon" },
+        // … nine more
+    };
+    var overlaid = std.ArrayList([]const u8).empty;
+    for (data_files) |f| {
+        var path: std.Build.LazyPath = b.path(b.fmt("data/{s}", .{f.rel}));
+        if (data_dir) |dir| {
+            const candidate = b.pathJoin(&amp;.{ dir, f.rel });
+            const exists = if (std.fs.path.isAbsolute(candidate))
+                std.Io.Dir.accessAbsolute(b.graph.io, candidate, .{})
+            else
+                b.build_root.handle.access(b.graph.io, candidate, .{});
+            if (exists) |_| {
+                path = if (std.fs.path.isAbsolute(candidate)) .{ .cwd_relative = candidate } else b.path(candidate);
+                overlaid.append(b.allocator, f.rel) catch @panic("OOM");
+            } else |_| {}
+        }
+        mod.addAnonymousImport(f.import_name, .{ .root_source_file = path });
+    }</code></pre>
+<p>This is build.zig as a program, not a config file. A table of thirteen data files, a loop, and inside the loop a real file-system check (<code>access</code> through the build's own <code>io</code>) to see whether a mod directory supplies a replacement. Whatever path wins is bound with <code>addAnonymousImport</code>. The list of overlaid files is collected so the binary can report it:</p>
+<pre><code>    const build_options = b.addOptions();
+    build_options.addOption(?[]const u8, "data_dir", data_dir);
+    build_options.addOption([]const []const u8, "data_overlays", overlaid.items);
+    mod.addImport("build_options", build_options.createModule());
+
+    mod.link_libc = true;
+    mod.linkSystemLibrary("sqlite3", .{});</code></pre>
+<p>Options can be optionals and lists of strings; <code>root.zig</code>'s <code>dataProvenance</code> function reads them to print "stock tables" or "mod &lt;dir&gt;: 3 files overlaid" on the settings screen. Then SQLite is linked into the module, once. The executable follows the template exactly:</p>
+<pre><code>    const exe = b.addExecutable(.{
+        .name = "game",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &amp;.{ .{ .name = "game", .module = mod } },
+        }),
+    });
+    b.installArtifact(exe);</code></pre>
+<p>Packaging adds something the template lacks, <code>installDirectory</code>, with an opt-in for the large soundtrack:</p>
+<pre><code>    const bundle_music = b.option(bool, "bundle-music", "Copy data/music into the install prefix (large)") orelse false;
+    if (bundle_music) b.installDirectory(.{
+        .source_dir = b.path("data/music"),
+        .install_dir = .prefix,
+        .install_subdir = "share/iron-ledger/music",
+    });
+    b.installDirectory(.{
+        .source_dir = b.path("docs/logos"),
+        .install_dir = .prefix,
+        .install_subdir = "share/iron-ledger/logos",
+        .include_extensions = &amp;.{".png"},
+    });</code></pre>
+<p>And the run and test steps are the template's, with one addition worth learning from:</p>
+<pre><code>    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&amp;run_mod_tests.step);
+    test_step.dependOn(&amp;run_exe_tests.step);
+    // A green test run must also mean the client builds: the tests compile
+    // the TUI as tests, so an exe-only compile error stayed invisible while
+    // `zig-out/bin/game` went stale under a passing suite (2026-09-06).
+    test_step.dependOn(b.getInstallStep());</code></pre>
+<p>A test step that also depends on install means "the tests passed <em>and</em> the binary builds". That line exists because of a real afternoon lost to a green test suite and a stale executable. Build scripts accumulate this kind of knowledge, and because they are ordinary Zig, the comment can sit right next to the fix.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The commands you will use daily in the <code>game/</code> directory are <code>zig build</code> (compile and install to <code>zig-out/bin/game</code>), <code>zig build test --summary all</code> (every test block in both modules, plus the install), <code>zig build run -- --tui</code> (build and launch the terminal client), and <code>zig build -Ddata=mymod</code> (overlay tables from a mod directory). Run <code>zig build --help</code> there: the <code>-Ddata</code> and <code>-Dbundle-music</code> options you see are the two <code>b.option</code> calls above, and Zig generated the help text from their descriptions. The whole script is <code>game/build.zig</code>; read it once with this chapter beside you and it will hold no surprises.</div>
+
+<h3 id="ch31-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 31.1 · Two modules <span class="level">warm-up</span></h4>
+  <p>In <code>exercises/31-build-system/ex1_two_modules/</code>, expose <code>lib/dice.zig</code> as a module named <code>dice</code>, import it from the executable, and add a <code>test</code> step that runs the tests of <em>both</em> modules. Check with <code>zig build run -- 3025</code> and <code>zig build test --summary all</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">build.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // The library module, importable as "dice".
+    const dice = b.addModule("dice", .{
+        .root_source_file = b.path("lib/dice.zig"),
+        .target = target,
+    });
+
+    // The executable imports it.
+    const exe = b.addExecutable(.{
+        .name = "roll",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &amp;.{.{ .name = "dice", .module = dice }},
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
+    b.step("run", "Roll some dice").dependOn(&amp;run_cmd.step);
+
+    const lib_tests = b.addTest(.{ .root_module = dice });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const test_step = b.step("test", "Run tests in both modules");
+    test_step.dependOn(&amp;b.addRunArtifact(lib_tests).step);
+    test_step.dependOn(&amp;b.addRunArtifact(exe_tests).step);
+}</code></pre>
+<pre class="term">$ zig build run -- 3025
+seed 3025: 4 + 1 = 5
+$ zig build test --summary all
+Build Summary: 5/5 steps succeeded; 3/3 tests passed
+test success</pre>
+  <p>Two <code>addTest</code> calls, one per module, both hanging off the same step. <code>b.step(…)</code> returns the step so <code>.dependOn</code> can be chained directly.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 31.2 · Options become constants <span class="level">practice</span></h4>
+  <p>In <code>exercises/31-build-system/ex2_options/</code>, wire <code>-Ddifficulty</code> (an enum), <code>-Dfunds</code> (a <code>u32</code>) and <code>-Dcheats</code> (a <code>bool</code>) through <code>addOptions</code> into <code>@import("build_options")</code>. Try <code>zig build run -Ddifficulty=hard -Dfunds=500000 -Dcheats</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">build.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const difficulty = b.option(enum { easy, normal, hard }, "difficulty", "Starting difficulty") orelse .normal;
+    const start_funds = b.option(u32, "funds", "Starting C-bills") orelse 1_000_000;
+    const cheats = b.option(bool, "cheats", "Enable cheat commands") orelse false;
+
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "difficulty", @tagName(difficulty));
+    opts.addOption(u32, "start_funds", start_funds);
+    opts.addOption(bool, "cheats", cheats);
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addOptions("build_options", opts);
+
+    const exe = b.addExecutable(.{ .name = "options", .root_module = mod });
+    b.installArtifact(exe);
+    b.step("run", "Print the baked-in settings").dependOn(&amp;b.addRunArtifact(exe).step);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    b.step("test", "Run tests").dependOn(&amp;b.addRunArtifact(tests).step);
+}</code></pre>
+<pre class="term">$ zig build run
+difficulty normal, funds 1000000, cheats false
+$ zig build run -Ddifficulty=hard -Dfunds=500000 -Dcheats
+difficulty hard, funds 250000, cheats true
+cheat commands enabled</pre>
+  <p>An enum option lists its values in <code>--help</code> automatically. The enum is converted to its tag name before being stored, because a build option must be a type the generated file can spell. <code>mod.addOptions("build_options", opts)</code> is a shorthand for adding the options module as an import.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 31.3 · Custom steps <span class="level">practice</span></h4>
+  <p>In <code>exercises/31-build-system/ex3_steps/</code>, add a <code>demo</code> step that runs the program with three fixed arguments, a <code>fmt</code> step using <code>b.addFmt</code> with <code>.check = true</code>, and make <code>test</code> depend on the format check. <code>zig build -l</code> should list all of them.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">build.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const exe = b.addExecutable(.{ .name = "steps", .root_module = mod });
+    b.installArtifact(exe);
+
+    // A "run" step that forwards `zig build run -- args`.
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    b.step("run", "Run the program").dependOn(&amp;run_cmd.step);
+
+    // A "demo" step that always runs the program with fixed arguments.
+    const demo_cmd = b.addRunArtifact(exe);
+    demo_cmd.addArgs(&amp;.{ "alpha", "beta", "gamma" });
+    b.step("demo", "Run with three fixed arguments").dependOn(&amp;demo_cmd.step);
+
+    // A "fmt" step: zig fmt --check over src/.
+    const fmt = b.addFmt(.{ .paths = &amp;.{"src"}, .check = true });
+    b.step("fmt", "Check formatting").dependOn(&amp;fmt.step);
+
+    // "test" depends on tests AND on the format check.
+    const tests = b.addTest(.{ .root_module = mod });
+    const test_step = b.step("test", "Run tests and the format check");
+    test_step.dependOn(&amp;b.addRunArtifact(tests).step);
+    test_step.dependOn(&amp;fmt.step);
+}</code></pre>
+<pre class="term">$ zig build -l
+  install (default)            Copy build artifacts to prefix path
+  uninstall                    Remove build artifacts from prefix path
+  run                          Run the program
+  demo                         Run with three fixed arguments
+  fmt                          Check formatting
+  test                         Run tests and the format check
+$ zig build demo
+3 argument(s)</pre>
+  <p>Two run steps of the same executable are two nodes; each gets its own arguments. A format check that gates the test step is a cheap way to keep a repository tidy.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 31.4 · Which mode am I in? <span class="level">warm-up</span></h4>
+  <p>A single file that prints <code>@import("builtin").mode</code>, says whether safety checks are on, and uses <code>std.math.add</code> to detect overflow in a way that works in every mode. Run it with <code>zig run</code> and again with <code>zig run -O ReleaseFast</code>. File: <code>exercises/31-build-system/ex4_mode.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 31, exercise 4: see the optimize mode from inside the program.
+//! Run with:  zig run ex4_mode.zig
+//! Then try:  zig run -O ReleaseFast ex4_mode.zig
+//! Expected output (Debug):
+//!   mode: Debug
+//!   safety checks: on
+//!   overflow check: caught error.Overflow
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub fn main() void {
+    std.debug.print("mode: {s}\n", .{@tagName(builtin.mode)});
+    const safe = switch (builtin.mode) {
+        .Debug, .ReleaseSafe =&gt; true,
+        .ReleaseFast, .ReleaseSmall =&gt; false,
+    };
+    std.debug.print("safety checks: {s}\n", .{if (safe) "on" else "off"});
+    // Never rely on a panic to catch overflow: use the checked builtin.
+    const big: u8 = 250;
+    if (std.math.add(u8, big, 10)) |v| {
+        std.debug.print("overflow check: {d}\n", .{v});
+    } else |err| {
+        std.debug.print("overflow check: caught {s}\n", .{@errorName(err)});
+    }
+}</code></pre>
+<pre class="term">$ zig run ex4_mode.zig
+mode: Debug
+safety checks: on
+overflow check: caught Overflow
+$ zig run -O ReleaseFast ex4_mode.zig
+mode: ReleaseFast
+safety checks: off
+overflow check: caught Overflow</pre>
+  <p><code>@import("builtin")</code> is a compiler-generated module describing the current build: mode, target, endianness. The checked <code>std.math.add</code> returns an error union, so the overflow is caught in ReleaseFast too, where <code>big + 10</code> would silently wrap.</p></details>
+</div>
+
+<h3 id="ch31-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Does <code>build()</code> compile anything while it runs? <details class="answer"><summary>Answer</summary>No. It adds steps and dependencies to a graph; the build runner executes the graph afterwards.</details></li>
+  <li>What is the difference between <code>b.addModule</code> and <code>b.createModule</code>? <details class="answer"><summary>Answer</summary>Both create a module; <code>addModule</code> also exposes it by name to packages that depend on yours, <code>createModule</code> keeps it private to this build.</details></li>
+  <li>How does <code>@import("money")</code> in <code>src/main.zig</code> find <code>lib/money.zig</code>? <details class="answer"><summary>Answer</summary>Through the executable's root module <code>imports</code> list, which maps the name <code>"money"</code> to the module whose root is <code>lib/money.zig</code>.</details></li>
+  <li>Where do words after <code>--</code> on the <code>zig build run</code> command line go? <details class="answer"><summary>Answer</summary>Into <code>b.args</code>, which the script forwards to the run step with <code>addArgs</code>; the program sees them as its arguments.</details></li>
+  <li>What does <code>b.option(bool, "verbose", "…")</code> return when the user passes nothing? <details class="answer"><summary>Answer</summary><code>null</code>; the script supplies a default with <code>orelse</code>.</details></li>
+  <li>Which optimisation modes keep safety checks on? <details class="answer"><summary>Answer</summary><code>Debug</code> and <code>ReleaseSafe</code>. <code>ReleaseFast</code> and <code>ReleaseSmall</code> turn them off.</details></li>
+  <li>Why does one project need two <code>addTest</code> calls? <details class="answer"><summary>Answer</summary>A test binary covers one module. A library module and an executable module each need their own.</details></li>
+  <li>What does <code>--prefix</code> change, and what is its short form? <details class="answer"><summary>Answer</summary>The install directory, <code>zig-out</code> by default; <code>-p</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>zig init</code> writes <code>build.zig</code>, <code>build.zig.zon</code>, <code>src/main.zig</code> and <code>src/root.zig</code>.</li>
+<li><code>build()</code> describes a graph of steps; the runner executes it with caching and parallelism.</li>
+<li><code>standardTargetOptions</code>, <code>standardOptimizeOption</code> and <code>b.option</code> declare <code>-D</code> flags; <code>zig build --help</code> lists them.</li>
+<li><code>addModule</code>/<code>createModule</code> define modules; <code>imports</code> connects them by name; <code>addExecutable</code> takes a <code>root_module</code>.</li>
+<li><code>installArtifact</code>, <code>addRunArtifact</code>, <code>b.args</code>, <code>b.step</code> and <code>dependOn</code> build run steps; <code>addTest</code> per module builds test steps.</li>
+<li><code>addOptions</code> turns flags into <code>@import("build_options")</code> constants; <code>addAnonymousImport</code> binds data files; <code>link_libc</code> and <code>linkSystemLibrary</code> pull in C.</li>
+<li>Debug and ReleaseSafe keep safety checks; ReleaseFast and ReleaseSmall drop them. <code>--prefix</code> moves the install; <code>zig-out</code> and <code>.zig-cache</code> are disposable.</li>
+<li>IRON LEDGER's script is the template plus a data-file loop, build options, SQLite, packaging and a test step that also installs.</li>
+</ul></div>
+</section>

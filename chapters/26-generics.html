@@ -1,0 +1,770 @@
+<section id="ch26">
+<h2>26. Generics: types as values</h2>
+<p class="goals"><strong>In this chapter</strong> you will write generic code the Zig way: a function that takes a <code>comptime T: type</code> and returns a struct built around it, <code>@This()</code> to name that struct from inside, <code>anytype</code> parameters whose type is inferred per call, duck typing with <code>@hasDecl</code> and <code>@hasField</code>, generic functions like <code>max(comptime T, a, b)</code>, a <code>Pair(A, B)</code>, generic containers that take an allocator, and how to constrain <code>T</code> with <code>@typeInfo</code> and <code>@compileError</code>. Along the way you will see that <code>std.ArrayList</code> is nothing more than this, and what "monomorphisation" costs.</p>
+
+<h3 id="ch26-1">26.1 A function that returns a type</h3>
+<p><a href="#ch25">Chapter 25</a> established that a type is a value the compiler can hold. Zig's entire generics story follows from one more step: a function can <em>return</em> a type. There is no <code>template</code> keyword, no <code>&lt;T&gt;</code> syntax; a generic container is a function whose parameter is a type and whose result is a struct.</p>
+<p class="file">a_stack.zig</p>
+<pre><code>const std = @import("std");
+
+/// A function that takes a type and returns a new struct type built around it.
+fn Stack(comptime T: type) type {
+    return struct {
+        const Self = @This(); // "the struct being defined", whatever it ends up being called
+
+        items: std.ArrayList(T) = .empty,
+
+        pub fn push(self: *Self, gpa: std.mem.Allocator, value: T) !void {
+            try self.items.append(gpa, value);
+        }
+
+        pub fn pop(self: *Self) ?T {
+            return self.items.pop();
+        }
+
+        pub fn peek(self: Self) ?T {
+            if (self.items.items.len == 0) return null;
+            return self.items.getLast();
+        }
+
+        pub fn len(self: Self) usize {
+            return self.items.items.len;
+        }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            self.items.deinit(gpa);
+        }
+    };
+}
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var numbers: Stack(i32) = .{};
+    defer numbers.deinit(gpa);
+    try numbers.push(gpa, 10);
+    try numbers.push(gpa, 20);
+    std.debug.print("peek {?d}, pop {?d}, pop {?d}, pop {?d}\n", .{ numbers.peek(), numbers.pop(), numbers.pop(), numbers.pop() });
+
+    var names: Stack([]const u8) = .{};
+    defer names.deinit(gpa);
+    try names.push(gpa, "Kell");
+    try names.push(gpa, "Natasha");
+    std.debug.print("{d} names, top is {?s}\n", .{ names.len(), names.peek() });
+
+    std.debug.print("{s}\n{s}\n", .{ @typeName(Stack(i32)), @typeName(Stack([]const u8)) });
+}</code></pre>
+<pre class="term">peek 20, pop 20, pop 10, pop null
+2 names, top is Natasha
+a_stack.Stack(i32)
+a_stack.Stack([]const u8)</pre>
+<p>Read <code>Stack</code> top to bottom. It takes <code>comptime T: type</code>. It returns a <code>struct { ... }</code> expression: a struct type, defined inline, in which <code>T</code> is used as an ordinary type. The convention of a capitalised function name tells readers "this returns a type". Calling <code>Stack(i32)</code> produces a struct type; calling <code>Stack([]const u8)</code> produces a different one; the printed type names show the argument inside the parentheses.</p>
+<p><code>@This()</code> is the way a struct refers to itself when it has no name of its own. The anonymous struct inside <code>Stack</code> cannot say <code>Stack(T)</code> for its methods without repeating itself, so the idiom is <code>const Self = @This();</code> as the first line, and then <code>self: *Self</code> in every method. You saw this shape in <a href="#ch12">Chapter 12</a> for named structs; here it is essential.</p>
+<p>The methods are the same methods you would write for a non-generic stack. <code>push</code> takes an allocator because the list underneath can grow; <code>pop</code> returns <code>?T</code>; and every mention of the element type is just <code>T</code>. Nothing here is "generic syntax". It is ordinary code with a type-valued constant in scope.</p>
+
+<h3 id="ch26-2">26.2 Generic functions</h3>
+<p>The same trick works for a function that does not build a type but needs one to describe its arguments.</p>
+<p class="file">b_max.zig</p>
+<pre><code>const std = @import("std");
+
+fn max(comptime T: type, a: T, b: T) T {
+    return if (a &gt; b) a else b;
+}
+
+pub fn main() void {
+    std.debug.print("{d} {d} {d}\n", .{ max(i32, 3, 9), max(f64, 2.5, 1.0), max(u8, 200, 100) });
+}</code></pre>
+<pre class="term">9 2.5 200</pre>
+<p>The caller passes the type explicitly and the compiler checks that <code>a</code> and <code>b</code> both fit it. Get it wrong and the error is in terms of the real types:</p>
+<p class="file">b_max_bad.zig</p>
+<pre><code>fn max(comptime T: type, a: T, b: T) T {
+    return if (a &gt; b) a else b;
+}
+pub fn main() void {
+    _ = max(i32, 3, 2.5);
+}</code></pre>
+<pre class="term">b_max_bad.zig:5:21: error: fractional component prevents float value '2.5' from coercion to type 'i32'
+    _ = max(i32, 3, 2.5);
+                    ^~~</pre>
+<p>Passing the type by hand is verbose, but it is also the most explicit form and it is what the standard library does throughout: <code>std.mem.eql(u8, ...)</code>, <code>std.mem.sort(T, ...)</code>, <code>std.fmt.parseInt(i32, ...)</code> are all this pattern.</p>
+
+<h3 id="ch26-3">26.3 anytype: let the argument decide</h3>
+<p>When the type can be worked out from the argument itself, write <code>anytype</code> instead. The compiler substitutes the argument's actual type, and you can name it with <code>@TypeOf</code>.</p>
+<p class="file">c_anytype.zig</p>
+<pre><code>const std = @import("std");
+
+/// The type is inferred from the first argument; the second must match it.
+fn maxOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    return if (a &gt; b) a else b;
+}
+
+/// Works on arrays, slices, and pointers to arrays: anything a `for` can walk.
+fn sum(items: anytype) i64 {
+    var total: i64 = 0;
+    for (items) |x| total += x;
+    return total;
+}
+
+/// Reports what it was given, to show that anytype is resolved per call.
+fn describe(x: anytype) void {
+    std.debug.print("{s: &lt;14} = {any}\n", .{ @typeName(@TypeOf(x)), x });
+}
+
+pub fn main() void {
+    std.debug.print("{d} {d}\n", .{ maxOf(@as(u8, 3), 200), maxOf(@as(f32, 1.5), 0.5) });
+
+    const arr = [_]i32{ 1, 2, 3 };
+    const slice: []const i64 = &amp;.{ 10, 20 };
+    std.debug.print("{d} {d} {d}\n", .{ sum(arr), sum(&amp;arr), sum(slice) });
+
+    describe(42);
+    describe(@as(u8, 42));
+    describe("text");
+    describe(.{ .x = 1 });
+}</code></pre>
+<pre class="term">200 1.5
+6 6 30
+comptime_int   = 42
+u8             = 42
+*const [4:0]u8 = { 116, 101, 120, 116 }
+c_anytype.main__struct_27122 = .{ .x = 1 }</pre>
+<p><code>maxOf(a: anytype, b: @TypeOf(a))</code> infers the type from <code>a</code> and then requires <code>b</code> to have the same one, which is why <code>maxOf(@as(u8, 3), 200)</code> works: the literal <code>200</code> coerces to <code>u8</code>. Return types may refer to earlier parameters in the same way. <code>sum(items: anytype)</code> accepts anything a <code>for</code> loop can walk: an array by value, a pointer to an array, a slice. And <code>describe</code> shows the important subtlety: <code>anytype</code> takes the argument's type <em>exactly</em>, so a bare <code>42</code> arrives as <code>comptime_int</code>, a string literal as a pointer to an array, and an anonymous struct as a type the compiler named for you. If you need a specific type, cast at the call site or convert inside with <code>@as</code>.</p>
+<div class="note">Prefer a concrete type over <code>anytype</code> whenever you can name it. <code>fn area(s: Shape)</code> is clearer than <code>fn area(s: anytype)</code>, gives better errors, and shows up in documentation. Use <code>anytype</code> for genuinely polymorphic helpers (formatting, sums, "anything iterable") and for the duck typing of the next section.</div>
+
+<h3 id="ch26-4">26.4 Duck typing with @hasDecl and @hasField</h3>
+<p>Because <code>@TypeOf(x)</code> is a value, you can ask questions about it at compile time. <code>@hasDecl(T, "name")</code> asks whether the type declares a method or constant called <code>name</code>; <code>@hasField(T, "name")</code> asks about a field. Both require <code>T</code> to be a struct, enum, union or opaque, so guard with <code>@typeInfo</code> first if the argument might be a plain integer.</p>
+<p class="file">d_duck.zig</p>
+<pre><code>const std = @import("std");
+
+const Dog = struct {
+    name: []const u8,
+    pub fn speak(self: Dog) void {
+        std.debug.print("{s} says woof\n", .{self.name});
+    }
+};
+const Mech = struct {
+    name: []const u8,
+    tons: u32,
+};
+
+/// Duck typing: "if it has a speak method, call it; if it has a name, use that".
+fn introduce(x: anytype) void {
+    const T = @TypeOf(x);
+    if (@typeInfo(T) != .@"struct") {
+        std.debug.print("a {s}, which is not a struct\n", .{@typeName(T)});
+        return;
+    }
+    if (@hasDecl(T, "speak")) {
+        x.speak();
+    } else if (@hasField(T, "name")) {
+        std.debug.print("{s} is silent\n", .{x.name});
+    } else {
+        std.debug.print("something anonymous\n", .{});
+    }
+}
+
+pub fn main() void {
+    introduce(Dog{ .name = "Rex" });
+    introduce(Mech{ .name = "Atlas", .tons = 100 });
+    introduce(@as(u8, 7));
+    introduce(.{ .x = 1 });
+}</code></pre>
+<pre class="term">Rex says woof
+Atlas is silent
+a u8, which is not a struct
+something anonymous</pre>
+<p>Each <code>if</code> here is decided while compiling, so the version of <code>introduce</code> generated for <code>Dog</code> contains only the <code>speak</code> call and the version for <code>Mech</code> contains only the print. This is duck typing without the runtime cost: "if it has a <code>speak</code>, it can speak". What happens if you skip the check and just call the method?</p>
+<p class="file">d_duck_bad.zig</p>
+<pre><code>fn shout(x: anytype) void {
+    x.speak();
+}
+pub fn main() void {
+    shout(@as(u8, 7));
+}</code></pre>
+<pre class="term">d_duck_bad.zig:2:6: error: no field or member function named 'speak' in 'u8'
+    x.speak();
+    ~^~~~~~
+    main: d_duck_bad.zig:5:10</pre>
+<p>Still a compile error, still pointing at the real type. The difference from a C++ template error is that the message is one line and names your function, not forty lines of library internals. When you write reusable <code>anytype</code> code, do the <code>@hasDecl</code> check yourself and pair it with a <code>@compileError</code> that says what the function needs.</p>
+
+<h3 id="ch26-5">26.5 Pair(A, B) and type identity</h3>
+<p class="file">e_pair.zig</p>
+<pre><code>const std = @import("std");
+
+fn Pair(comptime A: type, comptime B: type) type {
+    return struct {
+        first: A,
+        second: B,
+
+        pub fn swap(self: @This()) Pair(B, A) {
+            return .{ .first = self.second, .second = self.first };
+        }
+    };
+}
+
+/// Infer both types from the arguments.
+fn pair(a: anytype, b: anytype) Pair(@TypeOf(a), @TypeOf(b)) {
+    return .{ .first = a, .second = b };
+}
+
+pub fn main() void {
+    const p = pair(@as(u32, 7), "seven");
+    const q = p.swap();
+    std.debug.print("{d} {s} / {s} {d}\n", .{ p.first, p.second, q.first, q.second });
+    std.debug.print("{s}\n{s}\n", .{ @typeName(@TypeOf(p)), @typeName(@TypeOf(q)) });
+
+    // Every call with the same arguments yields the SAME type.
+    std.debug.print("same: {}  different: {}\n", .{
+        Pair(u8, u8) == Pair(u8, u8),
+        Pair(u8, u8) == Pair(u8, u16),
+    });
+    std.debug.print("sizes: {d} {d}\n", .{ @sizeOf(Pair(u8, u8)), @sizeOf(Pair(u8, u64)) });
+}</code></pre>
+<pre class="term">7 seven / seven 7
+e_pair.Pair(u32,*const [5:0]u8)
+e_pair.Pair(*const [5:0]u8,u32)
+same: true  different: false
+sizes: 2 16</pre>
+<p>Two things to take from this one. First, <code>swap</code> returns <code>Pair(B, A)</code>: a generic type can mention other instantiations of itself, and the return type expression is evaluated at compile time like any other. The <code>pair</code> helper infers both parameters, which is how you get the convenience of type inference on top of an explicit generic type.</p>
+<p>Second, the last lines: calling a type-returning function twice with the same arguments gives the <em>same</em> type, not two look-alike types. The compiler memoises these calls. That is what lets <code>Stack(i32)</code> in one file and <code>Stack(i32)</code> in another be interchangeable, and why <code>@sizeOf(Pair(u8, u64))</code> is a stable, meaningful number.</p>
+
+<h3 id="ch26-6">26.6 Constraining T</h3>
+<p>A generic type will happily accept any <code>T</code> until some line inside it fails to compile for that <code>T</code>, at which point the error points into the middle of your struct. Better to check up front and say what you need.</p>
+<p class="file">f_constrain.zig</p>
+<pre><code>const std = @import("std");
+
+/// Only numeric types are accepted; anything else is a build error with a clear message.
+fn Accumulator(comptime T: type) type {
+    switch (@typeInfo(T)) {
+        .int, .float =&gt; {},
+        else =&gt; @compileError("Accumulator needs an integer or float type, got " ++ @typeName(T)),
+    }
+    return struct {
+        total: T = 0,
+        count: u32 = 0,
+
+        pub fn add(self: *@This(), v: T) void {
+            self.total += v;
+            self.count += 1;
+        }
+
+        pub fn mean(self: @This()) T {
+            if (self.count == 0) return 0;
+            return switch (@typeInfo(T)) {
+                .int =&gt; @divTrunc(self.total, @as(T, @intCast(self.count))),
+                .float =&gt; self.total / @as(T, @floatFromInt(self.count)),
+                else =&gt; unreachable,
+            };
+        }
+    };
+}
+
+pub fn main() void {
+    var a: Accumulator(i32) = .{};
+    a.add(10);
+    a.add(15);
+    var f: Accumulator(f64) = .{};
+    f.add(10);
+    f.add(15);
+    std.debug.print("int mean {d}, float mean {d}\n", .{ a.mean(), f.mean() });
+}</code></pre>
+<pre class="term">int mean 12, float mean 12.5</pre>
+<p>The <code>switch</code> on <code>@typeInfo(T)</code> at the top of <code>Accumulator</code> runs when the type is instantiated, before any method exists. A second <code>switch</code> inside <code>mean</code> picks integer or float division; since <code>T</code> is fixed for a given instantiation, only one arm is ever compiled, and the <code>else =&gt; unreachable</code> is there to satisfy the compiler that we thought about it. Hand it the wrong type:</p>
+<p class="file">f_constrain_bad.zig</p>
+<pre><code>fn Accumulator(comptime T: type) type {
+    switch (@typeInfo(T)) {
+        .int, .float =&gt; {},
+        else =&gt; @compileError("Accumulator needs an integer or float type, got " ++ @typeName(T)),
+    }
+    return struct { total: T = 0 };
+}
+pub fn main() void {
+    var a: Accumulator([]const u8) = .{};
+    _ = &amp;a;
+}</code></pre>
+<pre class="term">f_constrain_bad.zig:4:17: error: Accumulator needs an integer or float type, got []const u8
+        else =&gt; @compileError("Accumulator needs an integer or float type, got " ++ @typeName(T)),
+                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+f_constrain_bad.zig:9:23: note: called at comptime here
+    var a: Accumulator([]const u8) = .{};
+           ~~~~~~~~~~~^~~~~~~~~~~~</pre>
+<p>The message is yours, it names the offending type, and the "called at comptime here" note points at the instantiation. That is as good as generic error messages get in any language. Use it whenever a generic type has a real requirement: numeric, has a certain method, is an enum, is a pointer.</p>
+
+<h3 id="ch26-7">26.7 std.ArrayList is just this</h3>
+<p>Everything in <a href="#ch21">Chapter 21</a> was an instance of the pattern in this chapter. Here is a working, if minimal, <code>ArrayList</code> in thirty lines, to make that concrete.</p>
+<p class="file">g_list.zig</p>
+<pre><code>const std = @import("std");
+
+/// A tiny ArrayList. This is what std.ArrayList(T) is, minus the conveniences.
+fn List(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        items: []T = &amp;.{}, // the part in use
+        capacity: usize = 0, // the size of the buffer behind items
+
+        pub fn append(self: *Self, gpa: std.mem.Allocator, value: T) !void {
+            if (self.items.len == self.capacity) {
+                const new_cap = if (self.capacity == 0) 4 else self.capacity * 2;
+                const new_buf = try gpa.alloc(T, new_cap);
+                @memcpy(new_buf[0..self.items.len], self.items);
+                if (self.capacity &gt; 0) gpa.free(self.items.ptr[0..self.capacity]);
+                self.items = new_buf[0..self.items.len];
+                self.capacity = new_cap;
+            }
+            self.items.len += 1;
+            self.items[self.items.len - 1] = value;
+        }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            if (self.capacity &gt; 0) gpa.free(self.items.ptr[0..self.capacity]);
+            self.* = .{};
+        }
+    };
+}
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var list: List(u32) = .{};
+    defer list.deinit(gpa);
+    for (0..10) |i| {
+        try list.append(gpa, @intCast(i * i));
+        if (list.capacity == list.items.len) std.debug.print("full at {d}\n", .{list.capacity});
+    }
+    std.debug.print("{any}\n", .{list.items});
+}</code></pre>
+<pre class="term">full at 4
+full at 8
+{ 0, 1, 4, 9, 16, 25, 36, 49, 64, 81 }</pre>
+<p>Compare it with <code>std.ArrayList</code>: an <code>items</code> slice, a <code>capacity</code>, an allocator passed to the growing call, doubling when full, and a <code>deinit</code> that frees exactly what was allocated. The real one adds the many convenience methods, a smarter growth curve, and careful handling of alignment and zero-sized types, but its shape is this. When you open <code>lib/zig/std/array_list.zig</code> you will now recognise <code>pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type</code> as the function that returns the type (<code>std.ArrayList(T)</code> is an alias for <code>Aligned(T, null)</code>), and <code>const Self = @This();</code> as the first line inside its <code>return struct</code>. The pointer arithmetic in <code>deinit</code>, <code>self.items.ptr[0..self.capacity]</code>, rebuilds the full buffer slice from the in-use slice; it is the one line here that needs <a href="#ch18">Chapter 18</a>.</p>
+
+<h3 id="ch26-8">26.8 Monomorphisation and what it costs</h3>
+<p>Each distinct set of comptime arguments produces a separate copy of the function or type, compiled and optimised on its own. This is called monomorphisation, and it is why Zig generics are as fast as hand-written code: <code>Stack(i32).push</code> is a function that knows it is pushing 4-byte integers, with no boxing and no runtime type checks.</p>
+<p class="file">h_mono.zig</p>
+<pre><code>const std = @import("std");
+
+fn Box(comptime T: type) type {
+    return struct { value: T };
+}
+
+fn describe(x: anytype) void {
+    std.debug.print("{s}\n", .{@typeName(@TypeOf(x))});
+}
+
+pub fn main() void {
+    // Three distinct struct types, each compiled separately.
+    describe(Box(u8){ .value = 1 });
+    describe(Box(u64){ .value = 1 });
+    describe(Box([]const u8){ .value = "s" });
+    // The same type, reused: no new code.
+    describe(Box(u8){ .value = 2 });
+    std.debug.print("{d} {d} {d}\n", .{ @sizeOf(Box(u8)), @sizeOf(Box(u64)), @sizeOf(Box([]const u8)) });
+}</code></pre>
+<pre class="term">h_mono.Box(u8)
+h_mono.Box(u64)
+h_mono.Box([]const u8)
+h_mono.Box(u8)
+1 8 16</pre>
+<p>The cost is compile time and binary size, one copy per instantiation. Three <code>Box</code> types and four <code>describe</code> calls produced three <code>describe</code> functions, not one (the fourth call reused the first). For a small program this is nothing; in a large one, an <code>anytype</code> helper called with fifty distinct types is fifty functions. Two habits keep it under control. First, keep generic functions small and push the type-independent work into non-generic helpers that take a slice or a pointer. Second, do not make things generic that do not need to be; a function over <code>[]const u8</code> is compiled once, a function over <code>anytype</code> is compiled per caller type. The standard library's own comment on <code>printIntAny</code> says exactly this: "prefer <code>printInt</code> to avoid generic explosion".</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game uses generics sparingly and exactly where they pay: for small helpers that would otherwise be copied per type. The console parser's number reader takes the target type as a parameter so one function serves <code>i64</code> amounts and <code>u32</code> IDs (<code>game/src/sim/cli.zig</code>):
+<pre><code>pub fn num(comptime T: type, tok: ?[]const u8) ParseError!T {
+    return std.fmt.parseInt(T, tok orelse return error.BadArguments, 10) catch return error.BadNumber;
+}
+// ... .admit = @enumFromInt(try num(u32, tokens.next())) ...
+// ... .amount = try num(i64, tokens.next()) ...</code></pre>
+The save loader does the same for typed IDs, turning a database integer into whichever enum the column represents: <code>fn toId(comptime T: type, v: i64) T { return @enumFromInt(@as(u32, @intCast(v))); }</code> in <code>game/src/persist/store.zig</code>. And the SQLite binding's <code>bind(self, idx, value: anytype)</code> is 26.4 and 26.6 in one function: a <code>switch</code> on <code>@typeInfo(@TypeOf(value))</code> with an arm per kind of value and an <code>else =&gt; @compileError(...)</code>, so binding a struct by mistake fails the build instead of corrupting a save. The big containers, <code>GameState.people</code> and friends, are instantiations of the standard library's generic maps; the game never needed a generic container of its own.</div>
+
+<h3 id="ch26-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 26.1 · Pair <span class="level">warm-up</span></h4>
+  <p>Write <code>Pair(A, B)</code> with <code>swap</code> returning <code>Pair(B, A)</code> and <code>mapFirst(f)</code> that applies a function to the first element and returns a pair whose first type is <code>f</code>'s return type. Add a <code>pair(a, b)</code> helper that infers both types. Name the file: <code>exercises/26-generics/ex1_pair.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 26, exercise 1: a generic pair.
+//! Run with:  zig test ex1_pair.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+fn Pair(comptime A: type, comptime B: type) type {
+    return struct {
+        first: A,
+        second: B,
+
+        const Self = @This();
+
+        pub fn swap(self: Self) Pair(B, A) {
+            return .{ .first = self.second, .second = self.first };
+        }
+
+        /// Apply `f` to the first element, producing a pair with a new first type.
+        pub fn mapFirst(self: Self, comptime f: anytype) Pair(@TypeOf(f(self.first)), B) {
+            return .{ .first = f(self.first), .second = self.second };
+        }
+    };
+}
+
+/// Build a pair with both types inferred from the arguments.
+fn pair(a: anytype, b: anytype) Pair(@TypeOf(a), @TypeOf(b)) {
+    return .{ .first = a, .second = b };
+}
+
+fn double(x: u32) u64 {
+    return @as(u64, x) * 2;
+}
+
+test "swap" {
+    const p = pair(@as(u32, 7), @as([]const u8, "seven"));
+    const q = p.swap();
+    try std.testing.expectEqualStrings("seven", q.first);
+    try std.testing.expectEqual(@as(u32, 7), q.second);
+    try std.testing.expect(@TypeOf(q) == Pair([]const u8, u32));
+}
+
+test "mapFirst changes the type" {
+    const p = pair(@as(u32, 21), true);
+    const m = p.mapFirst(double);
+    try std.testing.expectEqual(@as(u64, 42), m.first);
+    try std.testing.expect(m.second);
+    try std.testing.expect(@TypeOf(m) == Pair(u64, bool));
+}
+
+test "same arguments, same type" {
+    try std.testing.expect(Pair(u8, u8) == Pair(u8, u8));
+    try std.testing.expect(Pair(u8, u8) != Pair(u8, u16));
+}</code></pre>
+  <p>The return type of <code>mapFirst</code> calls <code>f</code> on the field to discover its result type: <code>@TypeOf(f(self.first))</code> is evaluated at compile time and never actually runs <code>f</code>. The test that compares types with <code>==</code> works because types are values.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 26.2 · Ring buffer <span class="level">practice</span></h4>
+  <p>Write <code>Ring(T, N)</code>, a fixed-capacity FIFO queue with no allocator: <code>push</code> returns <code>error.Full</code>, <code>pop</code> returns <code>?T</code>, and indices wrap with <code>% N</code>. Name the file: <code>exercises/26-generics/ex2_ring.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 26, exercise 2: a fixed-capacity ring buffer queue.
+//! Run with:  zig test ex2_ring.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// A queue of at most N items of type T, with no allocator at all.
+fn Ring(comptime T: type, comptime N: usize) type {
+    return struct {
+        const Self = @This();
+
+        buf: [N]T = undefined,
+        head: usize = 0, // index of the oldest item
+        count: usize = 0,
+
+        pub fn push(self: *Self, v: T) error{Full}!void {
+            if (self.count == N) return error.Full;
+            self.buf[(self.head + self.count) % N] = v;
+            self.count += 1;
+        }
+
+        pub fn pop(self: *Self) ?T {
+            if (self.count == 0) return null;
+            const v = self.buf[self.head];
+            self.head = (self.head + 1) % N;
+            self.count -= 1;
+            return v;
+        }
+
+        pub fn len(self: Self) usize {
+            return self.count;
+        }
+
+        pub fn capacity(_: Self) usize {
+            return N;
+        }
+    };
+}
+
+test "fifo order" {
+    var q: Ring(u8, 3) = .{};
+    try q.push(1);
+    try q.push(2);
+    try q.push(3);
+    try std.testing.expectError(error.Full, q.push(4));
+    try std.testing.expectEqual(@as(?u8, 1), q.pop());
+    try q.push(4); // wraps around
+    try std.testing.expectEqual(@as(?u8, 2), q.pop());
+    try std.testing.expectEqual(@as(?u8, 3), q.pop());
+    try std.testing.expectEqual(@as(?u8, 4), q.pop());
+    try std.testing.expectEqual(@as(?u8, null), q.pop());
+}
+
+test "size is decided at compile time" {
+    var q: Ring([]const u8, 2) = .{};
+    try std.testing.expectEqual(@as(usize, 2), q.capacity());
+    try q.push("a");
+    try std.testing.expectEqual(@as(usize, 1), q.len());
+    try std.testing.expect(@sizeOf(Ring(u8, 4)) &lt; @sizeOf(Ring(u8, 64)));
+}</code></pre>
+  <p>Two comptime parameters, one a type and one a number. Because <code>N</code> is comptime the buffer is a plain array inside the struct and its size shows up in <code>@sizeOf</code>, as the last test checks.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 26.3 · Numeric helpers <span class="level">practice</span></h4>
+  <p>Write <code>Elem(T)</code> that extracts the element type of an array, slice or pointer-to-array with <code>@typeInfo</code>; <code>sum(items: anytype)</code> that returns that element type; <code>average(comptime T, xs)</code> that refuses non-float <code>T</code> with <code>@compileError</code>; and <code>maxOfAll(args)</code> over a tuple using <code>inline for</code>. Name the file: <code>exercises/26-generics/ex3_numeric.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 26, exercise 3: generic functions with anytype and constraints.
+//! Run with:  zig test ex3_numeric.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// The element type of an array, slice, or pointer to array.
+fn Elem(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .array =&gt; |a| a.child,
+        .pointer =&gt; |p| switch (p.size) {
+            .slice =&gt; p.child,
+            .one =&gt; Elem(p.child), // *[N]T -&gt; T
+            else =&gt; @compileError("unsupported pointer type " ++ @typeName(T)),
+        },
+        else =&gt; @compileError("sum needs an array or slice, got " ++ @typeName(T)),
+    };
+}
+
+/// Sum of any array or slice, in the element's own type.
+fn sum(items: anytype) Elem(@TypeOf(items)) {
+    var total: Elem(@TypeOf(items)) = 0;
+    for (items) |x| total += x;
+    return total;
+}
+
+/// Mean of a slice; T must be a float type, checked at compile time.
+fn average(comptime T: type, xs: []const T) T {
+    if (@typeInfo(T) != .float) @compileError("average needs a float type, got " ++ @typeName(T));
+    if (xs.len == 0) return 0;
+    return sum(xs) / @as(T, @floatFromInt(xs.len));
+}
+
+/// The largest of any number of arguments passed as a tuple.
+fn maxOfAll(args: anytype) @TypeOf(args[0]) {
+    var best = args[0];
+    inline for (args) |a| {
+        if (a &gt; best) best = a;
+    }
+    return best;
+}
+
+test "sum keeps the element type" {
+    const arr = [_]u8{ 100, 100, 50 };
+    try std.testing.expectEqual(@as(u8, 250), sum(arr));
+    try std.testing.expectEqual(@as(u8, 250), sum(&amp;arr));
+    const sl: []const i64 = &amp;.{ -5, 10 };
+    try std.testing.expectEqual(@as(i64, 5), sum(sl));
+    try std.testing.expect(@TypeOf(sum(sl)) == i64);
+}
+
+test "average" {
+    try std.testing.expectEqual(@as(f64, 2.5), average(f64, &amp;.{ 1, 2, 3, 4 }));
+    try std.testing.expectEqual(@as(f32, 0), average(f32, &amp;.{}));
+}
+
+test "maxOfAll" {
+    try std.testing.expectEqual(@as(i32, 9), maxOfAll(.{ @as(i32, 3), 9, -2, 7 }));
+    try std.testing.expectEqual(@as(f64, 2.5), maxOfAll(.{ @as(f64, 1), 2.5 }));
+}</code></pre>
+  <p><code>Elem</code> is a type-level function that takes a type and returns a type, using it in <code>sum</code>'s return type. The <code>.pointer</code> arm looks at <code>p.size</code> to tell slices from single-item pointers, and recurses for <code>*[N]T</code>. <a href="#ch27">Chapter 27</a> covers <code>@typeInfo</code> in full.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 26.4 · Matrix <span class="level">challenge</span></h4>
+  <p>Write <code>Matrix(T, rows, cols)</code> with public <code>Rows</code> and <code>Cols</code> constants, <code>identity()</code> (compile error for non-square), and <code>mul(other)</code> whose result type is <code>Matrix(T, rows, @TypeOf(other).Cols)</code> and which rejects a shape mismatch at compile time. Name the file: <code>exercises/26-generics/ex4_matrix.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 26, exercise 4: a matrix type with compile-time dimensions.
+//! Run with:  zig test ex4_matrix.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+fn Matrix(comptime T: type, comptime rows: usize, comptime cols: usize) type {
+    return struct {
+        const Self = @This();
+        pub const Rows = rows;
+        pub const Cols = cols;
+
+        data: [rows][cols]T = @splat(@splat(0)),
+
+        pub fn identity() Self {
+            if (rows != cols) @compileError("identity needs a square matrix");
+            var m: Self = .{};
+            for (0..rows) |i| m.data[i][i] = 1;
+            return m;
+        }
+
+        pub fn at(self: Self, r: usize, c: usize) T {
+            return self.data[r][c];
+        }
+
+        pub fn set(self: *Self, r: usize, c: usize, v: T) void {
+            self.data[r][c] = v;
+        }
+
+        /// Multiply by a matrix whose row count equals our column count.
+        /// The result's shape is known at compile time; a mismatch is a compile error.
+        pub fn mul(self: Self, other: anytype) Matrix(T, rows, @TypeOf(other).Cols) {
+            const O = @TypeOf(other);
+            if (O.Rows != cols) @compileError("shape mismatch: cannot multiply " ++
+                @typeName(Self) ++ " by " ++ @typeName(O));
+            var out: Matrix(T, rows, O.Cols) = .{};
+            for (0..rows) |i| {
+                for (0..O.Cols) |j| {
+                    var acc: T = 0;
+                    for (0..cols) |k| acc += self.data[i][k] * other.data[k][j];
+                    out.data[i][j] = acc;
+                }
+            }
+            return out;
+        }
+    };
+}
+
+test "identity" {
+    const I = Matrix(i32, 2, 2).identity();
+    try std.testing.expectEqual(@as(i32, 1), I.at(0, 0));
+    try std.testing.expectEqual(@as(i32, 0), I.at(0, 1));
+}
+
+test "multiply 2x3 by 3x2 gives 2x2" {
+    var a: Matrix(i32, 2, 3) = .{};
+    var b: Matrix(i32, 3, 2) = .{};
+    // a = [1 2 3; 4 5 6], b = [7 8; 9 10; 11 12]
+    var v: i32 = 1;
+    for (0..2) |r| for (0..3) |c| {
+        a.set(r, c, v);
+        v += 1;
+    };
+    for (0..3) |r| for (0..2) |c| {
+        b.set(r, c, v);
+        v += 1;
+    };
+    const p = a.mul(b);
+    try std.testing.expect(@TypeOf(p) == Matrix(i32, 2, 2));
+    try std.testing.expectEqual(@as(i32, 58), p.at(0, 0));
+    try std.testing.expectEqual(@as(i32, 64), p.at(0, 1));
+    try std.testing.expectEqual(@as(i32, 139), p.at(1, 0));
+    try std.testing.expectEqual(@as(i32, 154), p.at(1, 1));
+}
+
+test "identity leaves a matrix unchanged" {
+    var m: Matrix(f64, 2, 2) = .{};
+    m.set(0, 1, 2.5);
+    m.set(1, 0, -1);
+    const same = m.mul(Matrix(f64, 2, 2).identity());
+    try std.testing.expectEqual(@as(f64, 2.5), same.at(0, 1));
+    try std.testing.expectEqual(@as(f64, -1), same.at(1, 0));
+}</code></pre>
+  <p>Publishing <code>Rows</code> and <code>Cols</code> as declarations lets other generic code read the shape off the type with <code>@TypeOf(other).Cols</code>. A wrong shape is a compile error with a message built from <code>@typeName</code>, which is far better than a runtime bounds panic in the inner loop.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 26.5 · Container with allocator and duck typing <span class="level">challenge</span></h4>
+  <p>Extend <code>Stack(T)</code> with <code>pushAll</code>, a <code>slice()</code> accessor, and <code>map(gpa, f)</code> that returns a <code>Stack</code> of <code>f</code>'s return type. Then write <code>total(container: anytype)</code> that works on anything with a <code>slice()</code> method <em>or</em> any plain slice or array, using <code>@hasDecl</code>. Name the file: <code>exercises/26-generics/ex5_container.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 26, exercise 5: a generic container with an allocator, plus duck typing.
+//! Run with:  zig test ex5_container.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+fn Stack(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        pub const Item = T;
+
+        items: std.ArrayList(T) = .empty,
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            self.items.deinit(gpa);
+        }
+
+        pub fn push(self: *Self, gpa: std.mem.Allocator, v: T) !void {
+            try self.items.append(gpa, v);
+        }
+
+        pub fn pushAll(self: *Self, gpa: std.mem.Allocator, vs: []const T) !void {
+            try self.items.appendSlice(gpa, vs);
+        }
+
+        pub fn pop(self: *Self) ?T {
+            return self.items.pop();
+        }
+
+        /// A new stack whose items are f(item) for each item, in the same order.
+        /// The result type comes from f's return type.
+        pub fn map(self: Self, gpa: std.mem.Allocator, comptime f: anytype) !Stack(@TypeOf(f(@as(T, undefined)))) {
+            var out: Stack(@TypeOf(f(@as(T, undefined)))) = .{};
+            errdefer out.deinit(gpa);
+            try out.items.ensureTotalCapacity(gpa, self.items.items.len);
+            for (self.items.items) |v| out.items.appendAssumeCapacity(f(v));
+            return out;
+        }
+
+        pub fn slice(self: Self) []const T {
+            return self.items.items;
+        }
+    };
+}
+
+/// Works on anything that has a `slice()` method returning a slice, or is a slice itself.
+fn total(container: anytype) i64 {
+    const T = @TypeOf(container);
+    const items = if (@typeInfo(T) == .@"struct" and @hasDecl(T, "slice")) container.slice() else container;
+    var t: i64 = 0;
+    for (items) |x| t += x;
+    return t;
+}
+
+fn square(x: u32) u64 {
+    return @as(u64, x) * x;
+}
+
+test "push, pushAll, pop" {
+    const a = std.testing.allocator;
+    var s: Stack(u32) = .{};
+    defer s.deinit(a);
+    try s.push(a, 1);
+    try s.pushAll(a, &amp;.{ 2, 3 });
+    try std.testing.expectEqual(@as(?u32, 3), s.pop());
+    try std.testing.expectEqual(@as(usize, 2), s.slice().len);
+    try std.testing.expect(Stack(u32).Item == u32);
+}
+
+test "map to a different element type" {
+    const a = std.testing.allocator;
+    var s: Stack(u32) = .{};
+    defer s.deinit(a);
+    try s.pushAll(a, &amp;.{ 2, 3, 4 });
+    var sq = try s.map(a, square);
+    defer sq.deinit(a);
+    try std.testing.expect(@TypeOf(sq) == Stack(u64));
+    try std.testing.expectEqualSlices(u64, &amp;.{ 4, 9, 16 }, sq.slice());
+}
+
+test "total is duck typed" {
+    const a = std.testing.allocator;
+    var s: Stack(u32) = .{};
+    defer s.deinit(a);
+    try s.pushAll(a, &amp;.{ 10, 20 });
+    try std.testing.expectEqual(@as(i64, 30), total(s));
+    try std.testing.expectEqual(@as(i64, 6), total(@as([]const i32, &amp;.{ 1, 2, 3 })));
+    try std.testing.expectEqual(@as(i64, 3), total([_]u8{ 1, 2 }));
+}</code></pre>
+  <p><code>@TypeOf(f(@as(T, undefined)))</code> asks "what would <code>f</code> return for a <code>T</code>?" without running it. In <code>total</code>, the <code>if</code> on <code>@typeInfo</code> and <code>@hasDecl</code> is resolved at compile time, so each instantiation contains only the branch it needs; the guard on <code>.@"struct"</code> is what keeps <code>@hasDecl</code> legal when a slice is passed.</p></details>
+</div>
+
+<h3 id="ch26-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>How do you write a generic struct in Zig? <details class="answer"><summary>Answer</summary>A function with a <code>comptime T: type</code> parameter that returns a <code>struct { ... }</code> using <code>T</code>. Calling it, e.g. <code>Stack(i32)</code>, produces the type.</details></li>
+  <li>What is <code>@This()</code> for? <details class="answer"><summary>Answer</summary>It names the enclosing struct from inside it, which an anonymous struct returned from a function otherwise could not do; the idiom is <code>const Self = @This();</code>.</details></li>
+  <li>What is the difference between <code>fn f(comptime T: type, x: T)</code> and <code>fn f(x: anytype)</code>? <details class="answer"><summary>Answer</summary>The first makes the caller name the type and checks <code>x</code> against it; the second infers the type from the argument exactly (so a literal arrives as <code>comptime_int</code>). Use <code>@TypeOf(x)</code> to name the inferred type.</details></li>
+  <li>Is <code>Stack(i32)</code> in one function the same type as <code>Stack(i32)</code> in another? <details class="answer"><summary>Answer</summary>Yes. Type-returning functions are memoised on their comptime arguments, so identical arguments give the identical type.</details></li>
+  <li>How do you reject an unsuitable <code>T</code> with a readable message? <details class="answer"><summary>Answer</summary>Check <code>@typeInfo(T)</code> (or <code>@hasDecl</code>/<code>@hasField</code>) at the top of the generic function and call <code>@compileError("... " ++ @typeName(T))</code> in the failing case.</details></li>
+  <li>Why must you guard <code>@hasDecl(T, "x")</code> with a <code>@typeInfo</code> check in an <code>anytype</code> function? <details class="answer"><summary>Answer</summary><code>@hasDecl</code> only accepts struct, enum, union and opaque types; passing a <code>u8</code> or a slice is a compile error, so test the kind of type first.</details></li>
+  <li>What does monomorphisation cost, and how do you limit it? <details class="answer"><summary>Answer</summary>One compiled copy per distinct instantiation, which adds compile time and binary size. Keep generic functions small, move type-independent work into non-generic helpers, and do not use <code>anytype</code> where a concrete type will do.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A generic type is a function <code>fn Name(comptime T: type) type</code> returning a struct; <code>const Self = @This();</code> names it inside.</li>
+<li>Generic functions take <code>comptime T: type</code> explicitly, or <code>anytype</code> to infer from the argument, with <code>@TypeOf</code> to name it; return types may depend on parameters.</li>
+<li><code>@hasDecl</code> and <code>@hasField</code> give compile-time duck typing; guard them with <code>@typeInfo</code>.</li>
+<li>Instantiations with equal arguments are the same type; <code>Pair(B, A)</code> can appear inside <code>Pair(A, B)</code>.</li>
+<li>Constrain <code>T</code> up front with <code>@typeInfo</code> and <code>@compileError</code> so mistakes are reported at the instantiation.</li>
+<li><code>std.ArrayList</code> is a thirty-line idea: items, capacity, allocator on growth.</li>
+<li>Each instantiation is compiled separately (monomorphisation): fast code, more compile time; keep generic surfaces small.</li>
+</ul></div>
+</section>

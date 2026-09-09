@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zig from Zero to IRON LEDGER</title>
+<style>
+  :root {
+    --bg:#fbfaf7; --fg:#1d1f1c; --dim:#5d635c; --line:#d9d6cc; --code:#f1efe8; --navbg:#f6f4ee;
+    --accent:#8a3b12; --kw:#7a1f5c; --str:#2d5f2d; --cm:#6b6b6b; --num:#1f4e8a; --bi:#8a3b12; --ty:#1f4e8a;
+    --note:#fff7f1; --try:#f2f8f2; --trybar:#2d5f2d; --warn:#fdf1f0; --warnbar:#a83a2f;
+    --ledger:#eef3fa; --ledgerbar:#2c5a9c; --ex:#f7f5ee; --sum:#f3f1ea; --th:#efece3; --term:#1e1f1c; --termfg:#e6e3d8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#17181a; --fg:#e4e2da; --dim:#a29f95; --line:#33363a; --code:#212327; --navbg:#1c1e21;
+      --accent:#e0905f; --kw:#d98bc0; --str:#8fc98f; --cm:#8a8f8a; --num:#8fb4e8; --bi:#e0905f; --ty:#8fb4e8;
+      --note:#2a221c; --try:#1d2a1d; --trybar:#6db56d; --warn:#2d1f1d; --warnbar:#e07b6e;
+      --ledger:#1c2430; --ledgerbar:#7aa4de; --ex:#1e2023; --sum:#202225; --th:#26282c; --term:#0f1011; --termfg:#e6e3d8;
+    }
+  }
+  html { scroll-behavior:smooth; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 Georgia, "Times New Roman", serif; }
+  .wrap { display:grid; grid-template-columns:320px 1fr; min-height:100vh; }
+  nav { position:sticky; top:0; height:100vh; overflow:auto; border-right:1px solid var(--line); padding:18px 16px 40px;
+        font:13px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background:var(--navbg); }
+  nav .title { font-weight:700; font-size:14px; margin:0 0 4px; }
+  nav .sub-title { color:var(--dim); font-size:12px; margin:0 0 10px; }
+  nav h2 { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); margin:16px 0 4px; }
+  nav a { display:block; color:var(--fg); text-decoration:none; padding:2px 0; border-left:2px solid transparent; padding-left:6px; }
+  nav a:hover { color:var(--accent); }
+  nav a.ch.active { border-left-color:var(--accent); color:var(--accent); }
+  nav a.sub { padding-left:20px; color:var(--dim); font-size:12px; display:none; }
+  nav a.sub.show { display:block; }
+  nav .tools { margin:10px 0 0; display:flex; gap:8px; flex-wrap:wrap; }
+  nav button { font:12px inherit; padding:3px 8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); border-radius:4px; cursor:pointer; }
+  nav button:hover { border-color:var(--accent); }
+  main { padding:36px 60px 140px; max-width:980px; min-width:0; }
+  h1 { font-size:36px; margin:0 0 6px; line-height:1.2; }
+  h2 { font-size:28px; margin:70px 0 14px; border-bottom:2px solid var(--line); padding-bottom:6px; }
+  section:first-of-type h2 { margin-top:30px; }
+  h3 { font-size:20px; margin:38px 0 10px; }
+  h4 { font-size:16px; margin:22px 0 6px; color:var(--accent); }
+  p, li { max-width:74ch; }
+  a { color:var(--accent); }
+  pre { background:var(--code); border:1px solid var(--line); border-radius:6px; padding:12px 14px; overflow-x:auto;
+        font:13px/1.5 "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; tab-size:4; }
+  code { font:0.92em "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; background:var(--code); padding:1px 4px; border-radius:3px; }
+  pre code { background:none; padding:0; font-size:inherit; }
+  pre.term { background:var(--term); color:var(--termfg); border-color:#000; }
+  pre.term::before { content:"output"; display:block; font:10px -apple-system, Helvetica, sans-serif; letter-spacing:.1em;
+        text-transform:uppercase; color:#9a978c; margin:-4px 0 6px; }
+  .file { font:12px -apple-system, Helvetica, sans-serif; color:var(--dim); margin:14px 0 -8px; }
+  .goals { font-size:17px; color:var(--dim); border-bottom:1px dashed var(--line); padding-bottom:12px; }
+  .note   { border-left:4px solid var(--accent);    background:var(--note);   padding:10px 14px; margin:16px 0; }
+  .try    { border-left:4px solid var(--trybar);    background:var(--try);    padding:10px 14px; margin:16px 0; }
+  .try::before { content:"Try it"; display:block; font:700 11px -apple-system, Helvetica, sans-serif; letter-spacing:.1em; text-transform:uppercase; color:var(--trybar); margin-bottom:4px; }
+  .warn   { border-left:4px solid var(--warnbar);   background:var(--warn);   padding:10px 14px; margin:16px 0; }
+  .warn::before { content:"Trap"; display:block; font:700 11px -apple-system, Helvetica, sans-serif; letter-spacing:.1em; text-transform:uppercase; color:var(--warnbar); margin-bottom:4px; }
+  .ledger { border-left:4px solid var(--ledgerbar); background:var(--ledger); padding:12px 16px; margin:28px 0; }
+  .summary { background:var(--sum); border:1px solid var(--line); border-radius:6px; padding:12px 18px; margin:28px 0 10px; }
+  .summary ul { margin:6px 0 0; }
+  .exercise { background:var(--ex); border:1px solid var(--line); border-radius:6px; padding:6px 18px 12px; margin:18px 0; }
+  .exercise h4 { margin-top:10px; }
+  .level { font:11px -apple-system, Helvetica, sans-serif; letter-spacing:.06em; text-transform:uppercase; color:var(--bg);
+           background:var(--dim); border-radius:10px; padding:2px 8px; margin-left:8px; vertical-align:middle; }
+  details.answer { margin:8px 0 4px; }
+  details.answer > summary { cursor:pointer; color:var(--accent); font:14px -apple-system, Helvetica, sans-serif; user-select:none; }
+  details.answer[open] > summary { margin-bottom:6px; }
+  ol.quiz > li { margin:8px 0; }
+  ol.quiz details.answer { display:inline-block; margin:2px 0 0; }
+  table { border-collapse:collapse; margin:12px 0; font-size:14px; max-width:100%; }
+  .tablewrap { overflow-x:auto; }
+  td, th { border:1px solid var(--line); padding:5px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--th); }
+  table.compare td:first-child { color:var(--warnbar); }
+  table.compare td:nth-child(2) { color:var(--trybar); }
+  .lead { font-size:18px; color:var(--dim); }
+  hr { border:0; border-top:1px solid var(--line); margin:40px 0; }
+  .k { color:var(--kw); } .s { color:var(--str); } .c { color:var(--cm); font-style:italic; } .n { color:var(--num); }
+  .b { color:var(--bi); } .t { color:var(--ty); }
+  .toc-part { margin:26px 0; }
+  .toc-part h3 { margin:0 0 6px; }
+  .toc-part ol { margin:0; padding-left:26px; columns:2; column-gap:40px; }
+  .toc-part li { break-inside:avoid; }
+  .toc-part ol.alpha { list-style:none; padding-left:0; }
+  #progress { position:fixed; top:0; left:0; height:3px; background:var(--accent); width:0; z-index:9; }
+  @media (max-width: 900px) {
+    .wrap { grid-template-columns:1fr; }
+    nav { position:relative; height:auto; max-height:40vh; border-right:0; border-bottom:1px solid var(--line); }
+    nav a.sub { display:none !important; }
+    main { padding:24px 20px 80px; }
+    .toc-part ol { columns:1; }
+  }
+  @media print {
+    nav, #progress { display:none; }
+    .wrap { display:block; }
+    details.answer { display:block; } details.answer > summary { display:none; }
+    pre { white-space:pre-wrap; }
+  }
+</style>
+</head>
+<body>
+<div id="progress"></div>
+<div class="wrap">
+<nav>
+  <p class="title">Zig from Zero to IRON LEDGER</p>
+  <p class="sub-title">A slow, exercise-driven course in Zig 0.16</p>
+  <div class="tools">
+    <button id="btn-answers" type="button">Show all answers</button>
+    <button id="btn-subs" type="button">Show all sections</button>
+  </div>
+  <a class="ch" href="#top">Front matter</a>
+{{NAV}}
+</nav>
+<main id="top">
+
+<h1>Zig from Zero to IRON LEDGER</h1>
+<p class="lead">A patient, exercise-driven course in the Zig programming language (version 0.16), starting from the first line you type and ending inside the source of IRON LEDGER, a 31,000-line BattleTech mercenary-company simulator written in pure Zig with no libraries.</p>
+
+<p>This book grew out of a short guide, <em>Learning Zig through IRON LEDGER</em>, which taught the language in seventeen brisk sections and then toured the program's architecture. That guide assumed you already knew a systems language. This book does not. It takes the same destination and walks there slowly, the way a traditional programming book does: one idea per chapter, a complete runnable program for every idea, its real output, the trap that catches beginners, and a set of exercises with solutions you can reveal when you are ready. The original guide's architecture tour survives, expanded, as Part 5, and it is where you will find yourself reading real production code with confidence.</p>
+
+<p>Every program in this book was compiled and run with Zig 0.16 on the day it was written. Zig changes between versions, and 0.16 changed how programs talk to the outside world (the <code>std.Io</code> interface) and how the standard containers are used (lists and maps no longer remember their allocator). Tutorials found on the web will often show older forms that no longer compile. When this book and a web page disagree, trust this book and the compiler, and see Appendix A3 for the translation table.</p>
+
+<div class="note"><strong>How to read.</strong> Chapters build on each other, so read in order the first time. Every chapter ends with exercises and a short quiz. The exercise files live in the <code>exercises/</code> folder beside this page, with solutions in each chapter's <code>solutions/</code> subfolder; type the solutions in yourself rather than copying, and run them. Chapter 0 explains the mechanics. Use the sidebar to jump around later; the buttons at the top of it reveal every answer at once or every subsection heading.</div>
+
+<div id="toc">
+{{TOC}}
+</div>
+
+{{BODY}}
+
+<hr>
+<p class="lead" style="margin-top:40px">Assembled {{DATE}} from the chapter fragments in <code>chapters/</code>. Zig 0.16.0. The original guide this book expands is preserved in <code>reference/original-guide.html</code>.</p>
+
+</main>
+</div>
+<script>
+(function () {
+  // ---- Zig syntax highlighting (client-side, no dependencies) ----
+  var KW = "addrspace align allowzero and anyframe anytype asm async await break callconv catch comptime const continue defer else enum errdefer error export extern fn for if inline linksection noalias noinline nosuspend opaque or orelse packed pub resume return struct suspend switch test threadlocal try union unreachable usingnamespace var volatile while".split(" ");
+  var TY = "bool void noreturn type anyerror anyopaque comptime_int comptime_float isize usize c_char c_short c_ushort c_int c_uint c_long c_ulong c_longlong c_ulonglong c_longdouble f16 f32 f64 f80 f128 null undefined true false".split(" ");
+  var kwSet = {}, tySet = {};
+  KW.forEach(function (k) { kwSet[k] = 1; }); TY.forEach(function (k) { tySet[k] = 1; });
+  var re = /(\/\/[^\n]*)|(\\\\[^\n]*)|("(?:[^"\\\n]|\\.)*")|('(?:[^'\\\n]|\\.)*')|(@"[^"]*"|@[A-Za-z_][A-Za-z0-9_]*)|(\b0x[0-9A-Fa-f_]+\b|\b0b[01_]+\b|\b0o[0-7_]+\b|\b\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?\b)|(\b[iu]\d+\b)|(\b[A-Za-z_][A-Za-z0-9_]*\b)/g;
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function hl(src) {
+    var out = "", last = 0, m;
+    re.lastIndex = 0;
+    while ((m = re.exec(src))) {
+      out += esc(src.slice(last, m.index));
+      var t = m[0], cls = null;
+      if (m[1] || m[2]) cls = "c";
+      else if (m[3] || m[4]) cls = "s";
+      else if (m[5]) cls = "b";
+      else if (m[6]) cls = "n";
+      else if (m[7]) cls = "t";
+      else if (m[8]) { if (kwSet[t]) cls = "k"; else if (tySet[t]) cls = "t"; }
+      out += cls ? '<span class="' + cls + '">' + esc(t) + "</span>" : esc(t);
+      last = m.index + t.length;
+    }
+    return out + esc(src.slice(last));
+  }
+  document.querySelectorAll("pre:not(.term) > code").forEach(function (code) {
+    if (code.querySelector("span")) return;            // already highlighted by hand
+    var text = code.textContent;
+    if (!/\b(const|var|fn|pub|try|return|struct|enum|test|@import|defer)\b/.test(text)) return; // not zig
+    code.innerHTML = hl(text);
+  });
+  document.querySelectorAll("table").forEach(function (t) {
+    if (t.parentElement.classList.contains("tablewrap")) return;
+    var w = document.createElement("div"); w.className = "tablewrap";
+    t.parentNode.insertBefore(w, t); w.appendChild(t);
+  });
+
+  // ---- Sidebar: scroll spy, subsection reveal, buttons ----
+  var chLinks = Array.prototype.slice.call(document.querySelectorAll("nav a.ch"));
+  var subLinks = Array.prototype.slice.call(document.querySelectorAll("nav a.sub"));
+  var sections = Array.prototype.slice.call(document.querySelectorAll("main > section"));
+  var showAllSubs = false;
+  function setActive(id) {
+    chLinks.forEach(function (a) { a.classList.toggle("active", a.getAttribute("href") === "#" + id); });
+    if (showAllSubs) return;
+    var sec = document.getElementById(id);
+    var ids = {};
+    if (sec) sec.querySelectorAll("h3[id]").forEach(function (h) { ids[h.id] = 1; });
+    subLinks.forEach(function (a) { a.classList.toggle("show", !!ids[a.getAttribute("href").slice(1)]); });
+  }
+  var ticking = false;
+  function onScroll() {
+    if (ticking) return; ticking = true;
+    requestAnimationFrame(function () {
+      ticking = false;
+      var y = window.scrollY + 120, cur = null;
+      for (var i = 0; i < sections.length; i++) { if (sections[i].offsetTop <= y) cur = sections[i].id; else break; }
+      if (cur) setActive(cur);
+      var h = document.documentElement;
+      var p = (h.scrollTop) / (h.scrollHeight - h.clientHeight);
+      document.getElementById("progress").style.width = (p * 100).toFixed(2) + "%";
+    });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+  var answersOpen = false;
+  document.getElementById("btn-answers").addEventListener("click", function () {
+    answersOpen = !answersOpen;
+    document.querySelectorAll("details.answer").forEach(function (d) { d.open = answersOpen; });
+    this.textContent = answersOpen ? "Hide all answers" : "Show all answers";
+  });
+  document.getElementById("btn-subs").addEventListener("click", function () {
+    showAllSubs = !showAllSubs;
+    subLinks.forEach(function (a) { a.classList.toggle("show", showAllSubs); });
+    this.textContent = showAllSubs ? "Show current sections" : "Show all sections";
+    if (!showAllSubs) onScroll();
+  });
+  // Open the answer if the URL points inside one.
+  if (location.hash) { var el = document.querySelector(location.hash); if (el) { var d = el.closest("details"); if (d) d.open = true; } }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,338 @@
+<section id="ch41">
+<h2>41. GameState: one arena, one dice bag</h2>
+<p class="goals"><strong>In this chapter</strong> you open the struct that holds an entire campaign. You will see why every allocation a campaign makes comes from one arena and is freed by one call, why the random number generator is a bag of named streams rather than a single generator, and how a 64-bit hash of the state turns "the simulation is deterministic" from a slogan into a test.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch19">Chapter 19</a> and <a href="#ch20">Chapter 20</a> (the stack, the heap, and the <code>ArenaAllocator</code> in particular), <a href="#ch21">Chapter 21</a> and <a href="#ch22">Chapter 22</a> (unmanaged lists and hash maps: <code>.empty</code>, and an allocator passed to every growing call), <a href="#ch34">Chapter 34</a> (<code>std.Random.DefaultPrng</code> and seeding), <a href="#ch18">Chapter 18</a> (pointers into containers going stale), <a href="#ch13">Chapter 13</a> (non-exhaustive enums as typed IDs) and <a href="#ch04">Chapter 4</a> (wrapping multiplication, <code>*%</code>).</div>
+
+<h3 id="ch41-1">41.1 The struct</h3>
+<p><code>GameState</code> lives in <code>src/sim/state.zig</code>, a file of about two thousand lines of which the struct definition is the first three hundred. Here it is with the fields grouped and most of the comments removed; read the <em>types</em> more than the names:</p>
+<div class="file">src/sim/state.zig (abridged)</div>
+<pre><code>pub const Config = struct {
+    seed: u64 = 3025,
+    start_funds: types.CBills = 10_000_000,
+    start_date: clock_mod.Date = clock_mod.Date.campaign_default,
+};
+
+pub const GameState = struct {
+    arena: std.heap.ArenaAllocator,
+    rng: rng_mod.Rng,
+    clock: clock_mod.Clock,
+    funds: types.CBills,
+    reputation: i32 = 0,
+    outfit_name: []const u8 = "Provisional Mercenary Command",
+    commander: ?commander_mod.Commander = null,
+    campaign_id: i64 = 0,
+    bankrupt: bool = false,
+    auto_admit: bool = false,
+    share_profit_bp: types.Bp = @import("../domain/tuning.zig").t.person.share_profit_default_bp,
+    ledger: finance_mod.Ledger = .{},
+    event_queue: events_mod.EventQueue = .{},
+
+    people: std.AutoArrayHashMapUnmanaged(types.PersonId, person_mod.Person) = .empty,
+    units: std.AutoArrayHashMapUnmanaged(types.UnitId, unit_mod.Unit) = .empty,
+    forces: std.AutoArrayHashMapUnmanaged(types.ForceId, force_mod.Force) = .empty,
+    hqs: std.AutoArrayHashMapUnmanaged(types.HqId, hq_mod.Hq) = .empty,
+    contracts: std.AutoArrayHashMapUnmanaged(types.ContractId, contract_mod.Contract) = .empty,
+
+    contract_offers: std.ArrayListUnmanaged(contract_mod.Contract) = .empty,
+    market_listings: std.ArrayListUnmanaged(market_mod.Listing) = .empty,
+    loans: std.ArrayListUnmanaged(finance_mod.Loan) = .empty,
+    spare_parts: std.StringArrayHashMapUnmanaged(u32) = .empty,
+    part_orders: std.ArrayListUnmanaged(part_mod.AcquisitionOrder) = .empty,
+    event_log: std.ArrayListUnmanaged(LogEntry) = .empty,
+    fund_couriers: std.ArrayListUnmanaged(FundCourier) = .empty,
+    policies: std.ArrayListUnmanaged(StandingPolicy) = .empty,
+    supply_policies: std.ArrayListUnmanaged(SupplyPolicy) = .empty,
+    stock_policies: std.ArrayListUnmanaged(StockPolicy) = .empty,
+    bay_jobs: std.ArrayListUnmanaged(BayJob) = .empty,
+    candidates: std.ArrayListUnmanaged(Candidate) = .empty,
+    hq_links: std.ArrayListUnmanaged(@import("network.zig").HqLink) = .empty,
+    unit_transfers: std.ArrayListUnmanaged(UnitTransfer) = .empty,
+    faction_cooling: std.ArrayListUnmanaged(FactionCooling) = .empty,
+    faction_standing: std.StringArrayHashMapUnmanaged(i32) = .empty,
+    difficulty: difficulty_mod.Level = .regular,
+    event_memory: std.AutoArrayHashMapUnmanaged(events_mod.EventKind, EventMemory) = .empty,
+    stats: Stats = .{},
+    rating_history: std.ArrayListUnmanaged(RatingSnapshot) = .empty,
+    refit_plans: std.ArrayListUnmanaged(RefitPlan) = .empty,
+
+    next_person_id: u32 = 1,
+    next_unit_id: u32 = 1,
+    next_force_id: u32 = 1,
+    next_hq_id: u32 = 1,
+    next_contract_id: u32 = 1,
+
+    pub fn init(gpa: std.mem.Allocator, config: Config) GameState {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .rng = rng_mod.Rng.init(config.seed),
+            .clock = .{ .date = config.start_date },
+            .funds = config.start_funds,
+        };
+    }
+
+    pub fn deinit(self: *GameState) void {
+        self.arena.deinit();
+    }
+
+    pub fn allocator(self: *GameState) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+    // … about a hundred methods …
+};</code></pre>
+<p>Several things you learned in Parts 1 and 2 are on display at once.</p>
+<ul>
+<li><strong>Four fields have no default</strong> (<code>arena</code>, <code>rng</code>, <code>clock</code>, <code>funds</code>) and <code>init</code> sets exactly those four. Everything else has a default, so <code>init</code> can be a four-line struct literal, and adding a defaulted field never touches <code>init</code>. Exercise 41.2 shows what happens when you add one without a default.</li>
+<li><strong>Every container is unmanaged</strong> and starts as <code>.empty</code>. None of them stores an allocator; the one allocator they all use is the arena, fetched with <code>gs.allocator()</code> at each call site. That is the 0.16 convention from <a href="#ch21">Chapter 21</a> applied forty times.</li>
+<li><strong>The five entity maps are <code>AutoArrayHashMapUnmanaged</code></strong>, the ordered kind (<a href="#ch22">Chapter 22</a>). Iterating an ordered map visits entries in insertion order on every machine and every run. An ordinary <code>AutoHashMapUnmanaged</code> would visit them in an order that depends on hash seeds and capacity, and the hash in 41.4 would differ between two identical campaigns. The choice of map type is a determinism decision.</li>
+<li><strong>Maps are keyed by typed IDs.</strong> <code>people</code> is keyed by <code>PersonId</code>, not <code>u32</code>. The non-exhaustive enum trick from <a href="#ch13">Chapter 13</a> costs nothing at runtime and means <code>gs.people.get(unit_id)</code> is a compile error.</li>
+<li><strong>The ID counters are plain fields.</strong> <code>next_person_id</code> starts at 1 (0 is <code>PersonId.none</code>), and a fresh ID is <code>@enumFromInt(self.next_person_id)</code> followed by an increment. There is no global counter anywhere; it is part of the state and therefore saved, loaded and hashed with it.</li>
+</ul>
+<p>What is <em>not</em> in the struct matters too. There is no <code>io</code> and no allocator other than the arena. There is no cache of derived numbers (a company's total battle value, say): those are recomputed by queries when asked. A cache is a second copy of the truth that can drift, and drift is the enemy of a state that must be reproducible.</p>
+
+<h3 id="ch41-2">41.2 The arena: one owner for everything</h3>
+<p>In <a href="#ch20">Chapter 20</a> you chose allocators by lifetime. A campaign's lifetime is "from <code>init</code> to <code>deinit</code>", and every string, list, map and log line inside it lives exactly that long. That is the textbook case for an arena, and <code>GameState</code> uses one for everything:</p>
+<pre><code>pub fn deinit(self: *GameState) void {
+    self.arena.deinit();
+}</code></pre>
+<p>That one line frees every person, every hull, every ledger row, every formatted log line, and every hash map's backing store. No struct in <code>src/domain</code> needs a destructor that walks its children, and nothing in the simulation ever calls <code>free</code>. (A few domain structs, <code>Person</code> among them, do have a <code>deinit</code> method, but the game state never calls it; it exists for tests that build a <code>Person</code> with the testing allocator on its own.)</p>
+<p>The trade, stated in the original guide and worth repeating: memory grows monotonically over a campaign. When a person is fired their record stays in the map with status <code>.resigned</code>; when a log line is written it is never freed; when a list shrinks its buffer is retained. A long campaign holds every log line it ever wrote. In exchange the simulation can never have a use-after-free, never leaks in the sense the testing allocator checks for, and never has to answer "who owns this string?". For a game whose whole state is a few megabytes, that is a good trade.</p>
+<p>Look at how the arena shows up at a call site. This is the log method, which every subsystem uses to write a dated line:</p>
+<div class="file">src/sim/state.zig</div>
+<pre><code>/// Append a tagged, formatted entry (with the campaign date) to the log.
+pub fn log(self: *GameState, category: LogCategory, ctx: LogCtx, comptime fmt: []const u8, args: anytype) !void {
+    const d = self.clock.date;
+    const line = try std.fmt.allocPrint(
+        self.allocator(),
+        "{d}-{d:0&gt;2}-{d:0&gt;2} " ++ fmt,
+        .{ d.year, d.month, d.day } ++ args,
+    );
+    try self.event_log.append(self.allocator(), .{
+        .day = self.clock.day_index,
+        .category = category,
+        .company = ctx.company,
+        .hq = ctx.hq,
+        .contract = ctx.contract,
+        .text = line,
+    });
+}</code></pre>
+<p>Two compile-time tricks from <a href="#ch25">Chapter 25</a> make this pleasant. <code>"{d}-{d:0>2}-{d:0>2} " ++ fmt</code> concatenates the caller's format string onto a date prefix at compile time, and <code>.{ … } ++ args</code> concatenates the two argument tuples, so every log line begins with a date and the caller never has to pass one. The formatted string comes from <code>allocPrint</code> on the arena and is stored by reference in the entry. Nobody will ever free it, and nobody needs to.</p>
+<p>The <code>LogCtx</code> argument is a small struct of typed IDs with defaults, so a caller with nothing to tag passes <code>.{}</code> and a caller with a company passes <code>.{ .company = id }</code>. The log is queried later by those tags (<a href="#ch44">Chapter 44</a>), which is why the entry stores them as fields rather than baking "Alpha Company" into the text.</p>
+
+<div class="warn"><strong>Pointers into the maps go stale.</strong> <code>gs.people.getPtr(id)</code> returns a <code>*Person</code> that points into the map's storage. If you then insert into <code>gs.people</code> and the map grows, the storage moves and your pointer is dangling. The arena does not save you from this; it is the same rule as <a href="#ch18">Chapter 18</a>'s "a pointer into an ArrayList is invalid after append". The codebase's habit is to re-fetch after any insert: <code>gs.force(id)</code> is called again rather than a pointer kept across a <code>createForce</code>. When you write a command in <a href="#ch42">Chapter 42</a>, hire first and look up afterwards.</div>
+
+<h3 id="ch41-3">41.3 The dice bag</h3>
+<p>The second field of <code>GameState</code> is the random number generator, and it is not one generator:</p>
+<div class="file">src/sim/rng.zig (complete apart from the tests)</div>
+<pre><code>//! Deterministic RNG with named per-subsystem streams (ARCH §4).
+//! Adding a roll in one system must never perturb another, so every
+//! subsystem draws from its own stream. All combat/campaign dice are 2d6.
+
+const std = @import("std");
+
+pub const Stream = enum(u8) {
+    generation, // company/person/name generation
+    market, // contract/personnel/unit market rolls
+    maintenance,
+    acquisition,
+    battle,
+    events,
+    medical,
+    travel,
+
+    const count = @typeInfo(Stream).@"enum".fields.len;
+};
+
+pub const Rng = struct {
+    prngs: [Stream.count]std.Random.DefaultPrng,
+
+    pub fn init(seed: u64) Rng {
+        var self: Rng = undefined;
+        for (&amp;self.prngs, 0..) |*prng, i| {
+            // Distinct, stable derivation per stream.
+            prng.* = std.Random.DefaultPrng.init(seed ^ (0x9E3779B97F4A7C15 *% (i + 1)));
+        }
+        return self;
+    }
+
+    pub fn random(self: *Rng, stream: Stream) std.Random {
+        return self.prngs[@intFromEnum(stream)].random();
+    }
+
+    /// The BattleTech die roll.
+    pub fn roll2d6(self: *Rng, stream: Stream) u8 {
+        const r = self.random(stream);
+        return r.intRangeAtMost(u8, 1, 6) + r.intRangeAtMost(u8, 1, 6);
+    }
+};</code></pre>
+<p>Read <code>init</code> with <a href="#ch34">Chapter 34</a> in mind. Eight <code>DefaultPrng</code> generators sit in an array sized by the number of enum variants, a trick from <a href="#ch27">Chapter 27</a>: add a stream to the enum and the array grows. Each is seeded from the campaign seed XORed with a large odd constant times the stream index, using wrapping multiplication <code>*%</code> because the product is <em>meant</em> to overflow; plain <code>*</code> would panic in a debug build. The <code>for (&amp;self.prngs, 0..) |*prng, i|</code> form iterates the array by pointer so each element can be assigned through <code>prng.*</code>.</p>
+<p>Why eight generators instead of one? The comment at the top says it in a line, and the original guide gave the concrete case: suppose you add a weather roll to battles. With one shared generator, every market roll that happens after the first battle now gets a different number than before, and a saved game replays differently after the update. With named streams, adding a draw to <code>.battle</code> leaves <code>.market</code> exactly where it was. The test below is the rule stated as code:</p>
+<pre><code>test "streams are independent and deterministic" {
+    var a = Rng.init(42);
+    var b = Rng.init(42);
+
+    // Draw heavily from one stream in `a` only; another stream must still
+    // match the untouched twin exactly.
+    for (0..1000) |_| _ = a.roll2d6(.maintenance);
+    for (0..10) |_| {
+        try std.testing.expectEqual(b.roll2d6(.battle), a.roll2d6(.battle));
+    }
+}</code></pre>
+<p>Every call site names its stream, and the name is the subsystem: <code>gs.rng.roll2d6(.battle)</code> in the battle resolver, <code>gs.rng.roll2d6(.events)</code> when a monthly event is drawn, <code>gs.rng.roll2d6(.medical)</code> in turnover, <code>&amp;gs.rng</code> with <code>.generation</code> passed to the person generator. The house rule in <code>CLAUDE.md</code> is that no PRNG is ever created anywhere else. If you grep the core for <code>DefaultPrng.init</code> you find exactly the one in <code>rng.zig</code>.</p>
+
+<h3 id="ch41-4">41.4 The hash</h3>
+<p>The last method to read is the one that makes determinism testable:</p>
+<div class="file">src/sim/state.zig</div>
+<pre><code>/// Deterministic digest of gameplay-relevant state. Two runs with the
+/// same seed and command script must produce the same hash — the
+/// regression harness every stage builds on (ARCH §13).
+pub fn hash(self: *GameState) u64 {
+    var h = std.hash.Wyhash.init(0x42544d43); // "BTMC"
+    h.update(std.mem.asBytes(&amp;self.clock.day_index));
+    h.update(std.mem.asBytes(&amp;self.funds));
+    h.update(std.mem.asBytes(&amp;self.reputation));
+    h.update(std.mem.asBytes(&amp;self.share_profit_bp));
+    const txn_count: u64 = self.ledger.transactions.items.len;
+    h.update(std.mem.asBytes(&amp;txn_count));
+
+    var it = self.people.iterator();
+    while (it.next()) |entry| {
+        const p = entry.value_ptr;
+        h.update(std.mem.asBytes(&amp;p.id));
+        h.update(p.first_name);
+        h.update(p.last_name);
+        h.update(std.mem.asBytes(&amp;p.role));
+        h.update(std.mem.asBytes(&amp;p.status));
+        h.update(std.mem.asBytes(&amp;p.xp));
+        h.update(std.mem.asBytes(&amp;p.fatigue));
+        h.update(std.mem.asBytes(&amp;p.morale));
+        const injuries: u64 = p.injuries.items.len;
+        h.update(std.mem.asBytes(&amp;injuries));
+    }
+    var uit = self.units.iterator();
+    while (uit.next()) |entry| {
+        const u = entry.value_ptr;
+        h.update(std.mem.asBytes(&amp;u.id));
+        h.update(u.chassis_key);
+        h.update(std.mem.asBytes(&amp;u.status));
+        h.update(std.mem.asBytes(&amp;u.quality));
+        h.update(std.mem.asBytes(&amp;u.armor_pct));
+        h.update(std.mem.asBytes(&amp;u.force));
+        h.update(std.mem.asBytes(&amp;u.pilot));
+        h.update(std.mem.asBytes(&amp;u.berth_hq));
+    }
+    // … forces, contracts, offers, HQs, the commander …
+    return h.final();
+}</code></pre>
+<p><code>std.hash.Wyhash</code> is a fast non-cryptographic hash from the standard library; you feed it bytes with <code>update</code> and read a <code>u64</code> with <code>final</code>. <code>std.mem.asBytes(&amp;x)</code> views any value as a byte slice (<a href="#ch29">Chapter 29</a>), which is how integers and enums are fed in; strings are already slices. The function walks the ordered maps in insertion order, which is why the map type matters: an unordered map would feed the same entries in a different order on another run and the digest would differ.</p>
+<p>Notice what is hashed and what is not. Names, roles, statuses, fatigue, morale, hull condition: gameplay facts. Not hashed: log text, market listings, the exact RNG state. The digest is meant to say "these two campaigns are the same game", and it is deliberately coarse so that harmless changes (a reworded log line) do not break the golden-master test. The exercises ask you to check that it is nevertheless sensitive to a single C-bill.</p>
+
+<h3 id="ch41-5">41.5 Reading a GameState method</h3>
+<p>The rest of <code>state.zig</code> is about a hundred methods. They fall into a few kinds, and knowing the kinds makes the file navigable:</p>
+<ul>
+<li><strong>Lookups</strong> that wrap a map's <code>getPtr</code> and return an optional pointer: <code>person(id)</code>, <code>unit(id)</code>, <code>force(id)</code>. Callers write <code>gs.person(id) orelse return Error.UnknownPerson</code>.</li>
+<li><strong>Creation</strong> that mints an ID, builds a struct on the arena and inserts it: <code>hirePerson</code>, <code>hireFromSpec</code>, <code>addUnit</code>, <code>createForce</code>, <code>foundHq</code>, <code>createCommander</code>.</li>
+<li><strong>Money</strong>: <code>postTreasury</code>, <code>treasuryBalance</code>, <code>transferFunds</code>, <code>monthlyPayroll</code>. <a href="#ch45">Chapter 45</a> is about these.</li>
+<li><strong>Derived facts</strong> that walk the maps and compute a number without caching it: <code>companyOf</code>, <code>companiesAtHq</code>, <code>techHoursFor</code>, <code>siteFreeTons</code>.</li>
+<li><strong>Stock</strong> (physical parts at a site): <code>stockMap</code>, <code>addStock</code>, <code>takeStock</code>, <code>stockCount</code>.</li>
+</ul>
+<p>Here is one of the lookups and one of the creators, so you can see the shape:</p>
+<pre><code>pub fn person(self: *GameState, id: types.PersonId) ?*person_mod.Person {
+    return self.people.getPtr(id);
+}
+
+/// Recruit a randomly generated person (AtB-style: experience on 2d6,
+/// skills from the band, names from the tables).
+pub fn recruitGenerated(self: *GameState, role: person_mod.Role) !types.PersonId {
+    const spec = person_gen.generateWithBonus(&amp;self.rng, role, self.recruitBonus());
+    return self.hireFromSpec(spec);
+}</code></pre>
+<p>The creator passes <code>&amp;self.rng</code> to the generator in <code>src/gen</code>, which draws from the <code>.generation</code> stream. Even name generation goes through the dice bag; that is why two campaigns with the same seed hire the same people.</p>
+
+<h3 id="ch41-reading">Guided reading</h3>
+<ol>
+<li><code>src/sim/rng.zig</code>, all of it. It is sixty lines and you have now seen most of them.</li>
+<li><code>src/sim/clock.zig</code>: <code>Date</code>, <code>Clock</code> (two fields: a date and <code>day_index</code>), and the <code>DayPhase</code> enum that documents the tick order for <a href="#ch43">Chapter 43</a>.</li>
+<li><code>src/sim/state.zig</code>, lines 1 to about 300: the small helper structs (<code>Treasury</code>, <code>FundCourier</code>, <code>StandingPolicy</code>, <code>LogEntry</code>, <code>BayJob</code>, <code>Candidate</code>), then the <code>GameState</code> fields. Every one of those helper structs is something you will meet again on a screen.</li>
+<li>Still in <code>state.zig</code>: <code>init</code>, <code>deinit</code>, <code>allocator</code>, <code>postTreasury</code>, <code>treasuryBalance</code>, <code>person</code>, <code>hirePerson</code>, <code>log</code>, <code>stockMap</code>, and finally <code>hash</code>. Use search; they are not adjacent.</li>
+<li><code>src/domain/person.zig</code>: the <code>Person</code> struct fields (about sixty lines). Count how many are optionals with <code>null</code> defaults and note what each "not yet" means.</li>
+</ol>
+
+<h3 id="ch41-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 41.1 · Seeds diverge <span class="level">warm-up</span></h4>
+<p>The existing test shows that two <code>Rng</code> values with the same seed agree. Add a test to <code>src/sim/rng.zig</code> showing that two with different seeds do not: roll <code>.battle</code> fifty times on each and count how often the two rolls coincide. What threshold is safe, and why can you not demand zero coincidences?</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "different seeds give different dice" {
+    var a = Rng.init(1);
+    var b = Rng.init(2);
+    var same: u32 = 0;
+    for (0..50) |_| {
+        if (a.roll2d6(.battle) == b.roll2d6(.battle)) same += 1;
+    }
+    // Two 2d6 sequences agree by chance on roughly one roll in seven.
+    try std.testing.expect(same &lt; 25);
+}</code></pre>
+<p>Two independent 2d6 rolls are equal with probability about 0.11 (sum over the eleven outcomes of the squared probabilities), so around five or six coincidences in fifty are expected and zero would itself be suspicious. The threshold 25 is far above any plausible run of luck while still catching the bug the test is for: an <code>init</code> that ignored its seed. Because the generator is deterministic, the count for seeds 1 and 2 is in fact a fixed number and the test will never flake; the loose bound just documents the intent.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 41.2 · Let the compiler find the constructor <span class="level">warm-up</span></h4>
+<p>Add a field <code>exercise_marker: u32,</code> (no default) to <code>GameState</code>, right after <code>funds</code>. Build. Read the error, then fix it by giving the field a default rather than by editing <code>init</code>. Which choice would the codebase prefer, and why?</p>
+<details class="answer"><summary>Solution</summary>
+<pre class="term">src/sim/state.zig:290:17: error: missing struct field: exercise_marker
+        return .{
+               ~^
+src/sim/state.zig:205:23: note: struct declared here
+pub const GameState = struct {</pre>
+<p>There is exactly one place that constructs a <code>GameState</code> from nothing, and the compiler found it. The codebase prefers a default (<code>exercise_marker: u32 = 0,</code>): <code>init</code> then stays a four-line literal, <code>Store.load</code> (which also starts from <code>GameState.init(gpa, .{})</code>) keeps working, and old saves that lack the field load with the default. A field without a default is reserved for things that genuinely have no sensible default, like the arena and the seeded generator.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 41.3 · Test the log <span class="level">practice</span></h4>
+<p>Write a test in <code>src/sim/state.zig</code> that creates a fresh state, calls <code>gs.log(.decision, .{}, "hello {d}", .{7})</code>, and asserts on the single entry: its <code>text</code>, its <code>day</code> and its <code>category</code>. What date prefix do you expect on day zero of a default campaign?</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "log lines carry the campaign date and the tags" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    try gs.log(.decision, .{}, "hello {d}", .{7});
+    try std.testing.expectEqual(@as(usize, 1), gs.event_log.items.len);
+    const e = gs.event_log.items[0];
+    try std.testing.expectEqualStrings("3025-01-01 hello 7", e.text);
+    try std.testing.expectEqual(@as(u32, 0), e.day);
+    try std.testing.expectEqual(LogCategory.decision, e.category);
+}</code></pre>
+<p>The default <code>Config</code> starts on <code>Date.campaign_default</code>, 1 January 3025, and <code>day_index</code> is 0, so the prefix is <code>3025-01-01</code> with the month and day zero-padded by the <code>{d:0>2}</code> specifiers (<a href="#ch23">Chapter 23</a>). The <code>defer gs.deinit()</code> on the second line is not optional: <code>std.testing.allocator</code> reports the arena's memory as a leak without it.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 41.4 · The hash notices one C-bill <span class="level">practice</span></h4>
+<p>Write a test that takes <code>gs.hash()</code> of a fresh state, adds one to <code>gs.funds</code>, and asserts the hash changed; then subtracts one and asserts it is back to the original. Then answer: would the same test pass if you changed a log line's text instead of the funds?</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "the hash notices a single c-bill" {
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 9 });
+    defer gs.deinit();
+    const before = gs.hash();
+    gs.funds += 1;
+    try std.testing.expect(gs.hash() != before);
+    gs.funds -= 1;
+    try std.testing.expectEqual(before, gs.hash());
+}</code></pre>
+<p>It passes: <code>funds</code> is one of the first things fed to the hasher. A change to log text would <em>not</em> change the hash, because <code>hash</code> never reads <code>event_log</code>; it is a digest of gameplay-relevant state, and log wording is deliberately left out so that rewording a message does not break the golden-master test.</p></details>
+</div>
+
+<h3 id="ch41-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>Which four fields must <code>GameState.init</code> set, and why those? <details class="answer"><summary>Answer</summary><code>arena</code>, <code>rng</code>, <code>clock</code> and <code>funds</code>: they are the fields without defaults, because each depends on something only the caller knows (the parent allocator, the seed, the start date, the starting money).</details></li>
+<li>What does <code>gs.deinit()</code> do, and what does it not need to do? <details class="answer"><summary>Answer</summary>It calls <code>arena.deinit()</code>, which frees every allocation the campaign made. It does not need to walk any map or list, because nothing was allocated from anywhere else.</details></li>
+<li>Why are the entity maps <code>AutoArrayHashMapUnmanaged</code> rather than <code>AutoHashMapUnmanaged</code>? <details class="answer"><summary>Answer</summary>The array variant iterates in insertion order, which is the same on every run and every machine; the hash order of the plain variant is not, and <code>hash()</code> walks the maps.</details></li>
+<li>Why does <code>Rng.init</code> use <code>*%</code>? <details class="answer"><summary>Answer</summary>The seed derivation multiplies a large constant by the stream index and expects the product to wrap around 64 bits; plain <code>*</code> would be an overflow panic in Debug builds.</details></li>
+<li>What breaks if a new subsystem borrows the <code>.battle</code> stream instead of adding its own? <details class="answer"><summary>Answer</summary>Nothing today, but every battle roll after the new subsystem's first draw shifts, so saved campaigns replay differently after the change; a new stream leaves existing streams untouched.</details></li>
+<li>Why is a pointer from <code>gs.people.getPtr</code> unsafe to keep across a hire? <details class="answer"><summary>Answer</summary>Hiring inserts into the map; if the map grows it reallocates its storage and the pointer dangles. The arena does not prevent this; re-fetch after inserting.</details></li>
+<li>Name two things the hash includes and two it excludes. <details class="answer"><summary>Answer</summary>Includes: <code>day_index</code>, <code>funds</code>, each person's fatigue and morale, each unit's status. Excludes: log text, market listings, the internal RNG state.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>GameState</code> is one struct holding ordered maps of entities keyed by typed IDs, lists of everything else, the clock, the money and two special members: an arena and a dice bag.</li>
+<li>The arena owns every allocation of a campaign; <code>deinit</code> is one call and the domain has no destructors. Memory grows monotonically in exchange.</li>
+<li><code>Rng</code> is eight <code>DefaultPrng</code> generators, one per named stream, seeded from one campaign seed; every roll names its subsystem, so adding rolls to one subsystem never perturbs another.</li>
+<li><code>hash()</code> folds gameplay-relevant state into a <code>u64</code> by walking the ordered maps; it is the instrument the golden-master test reads.</li>
+<li>Pointers into the maps are invalidated by inserts; look up again after you create.</li>
+</ul></div>
+</section>

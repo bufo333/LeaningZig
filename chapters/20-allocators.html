@@ -1,0 +1,519 @@
+<section id="ch20">
+<h2>20. Choosing an allocator</h2>
+<p class="goals"><strong>In this chapter</strong> you will meet the allocators the standard library ships, learn what each one is for, and see the one pattern that does most of the work in real Zig programs: an arena per lifetime. You will run out of memory on purpose, watch a use-after-free crash cleanly, write an allocator of your own that counts what passes through it, and finish with a table to choose from.</p>
+
+<h3 id="ch20-1">20.1 The allocator is a decision</h3>
+<p><a href="#ch19">Chapter 19</a> showed that a <code>std.mem.Allocator</code> is a small value that any function can take. Because it is a value, the caller decides which one to pass, and different choices have very different behaviour. One allocator checks every free and reports leaks. One never frees anything individually and releases everything at once. One hands out memory from a fixed array and refuses when it is full. They all present the same interface, so the code that uses them does not change; only the line that creates the allocator does.</p>
+<p>This is the part of Zig that newcomers find strangest, and the part that experienced Zig programmers like most. Instead of one heap with one policy for the whole program, you match the allocator to the <em>lifetime</em> of the data. Memory that lives for one frame gets a frame allocator. Memory that lives for one campaign gets a campaign allocator. The program becomes easier to reason about because the question "when is this freed?" has a structural answer.</p>
+
+<h3 id="ch20-2">20.2 <code>DebugAllocator</code>: the one for development</h3>
+<p>You met it in Chapter 19. <code>std.heap.DebugAllocator(.{})</code> is a general-purpose allocator that tracks every block, detects leaks, double frees and, where the operating system allows, use-after-free. It is slower than a production allocator, which is fine, because its job is to be in your Debug builds and tests. Here is what a use-after-free looks like under it.</p>
+<p class="file">al8.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const buf = a.alloc(u8, 4) catch return;
+    a.free(buf);
+    buf[0] = 1; // use after free
+    std.debug.print(&quot;{d}\n&quot;, .{buf[0]});
+}</code></pre>
+<pre class="term">Segmentation fault at address 0x…
+ch20/al8.zig:10:8: 0x… in main (al8)
+    buf[0] = 1; // use after free
+       ^
+…</pre>
+<p>The crash is immediate and points at the offending line, because the DebugAllocator unmaps freed pages rather than reusing them. The same bug under a production allocator would silently write into memory that something else may now own. This is why you run tests in Debug.</p>
+<p><code>init.gpa</code> in <code>main</code> is a <code>DebugAllocator</code> in Debug builds. In release builds the runtime swaps it for <code>std.heap.c_allocator</code> if you linked libc and <code>std.heap.smp_allocator</code> otherwise, both fast and unchecked. Your code does not change.</p>
+
+<h3 id="ch20-3">20.3 <code>page_allocator</code>: straight from the operating system</h3>
+<p><code>std.heap.page_allocator</code> asks the operating system for memory directly, one page at a time. It needs no setup and no <code>deinit</code>, and it is thread-safe. It is also the most expensive way to get a small block, because a page is the smallest thing the OS will give you, and a system call is the slowest thing your program does.</p>
+<p class="file">al4.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() !void {
+    const a = std.heap.page_allocator;
+    const small = try a.alloc(u8, 1);
+    defer a.free(small);
+    const big = try a.alloc(u8, 10_000);
+    defer a.free(big);
+    std.debug.print(&quot;page size on this machine: {d}\n&quot;, .{std.heap.pageSize()});
+    std.debug.print(&quot;1-byte alloc at {*}\n&quot;, .{small.ptr});
+    std.debug.print(&quot;10000-byte alloc at {*}\n&quot;, .{big.ptr});
+}</code></pre>
+<pre class="term">page size on this machine: 16384
+1-byte alloc at u8@100d8c000
+10000-byte alloc at u8@100d90000</pre>
+<p>Asking for one byte cost a whole 16-kilobyte page. Use the page allocator as the <em>backing</em> for other allocators (it is what DebugAllocator and ArenaAllocator get their big chunks from) and for a few large, long-lived buffers. Do not use it for thousands of small strings.</p>
+
+<h3 id="ch20-4">20.4 <code>ArenaAllocator</code>: free everything at once</h3>
+<p>An arena takes a backing allocator, grabs chunks from it, and hands out pieces of those chunks by bumping a pointer. Allocation is nearly free. Individual <code>free</code> calls do nothing. When you are done with <em>everything</em> the arena gave out, you call <code>arena.deinit()</code> and all of it goes back at once.</p>
+<p class="file">al1.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main(init: std.process.Init) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit(); // one call frees every allocation below
+    const a = arena.allocator();
+
+    var total: usize = 0;
+    var i: u32 = 0;
+    while (i &lt; 1000) : (i += 1) {
+        const line = try std.fmt.allocPrint(a, &quot;log line {d}: contract signed&quot;, .{i});
+        total += line.len;
+        // no free. Ever. The arena remembers.
+    }
+    std.debug.print(&quot;built 1000 strings, {d} bytes, zero frees written\n&quot;, .{total});
+    std.debug.print(&quot;arena holds about {d} bytes\n&quot;, .{arena.queryCapacity()});
+}</code></pre>
+<pre class="term">built 1000 strings, 28890 bytes, zero frees written
+arena holds about 56886 bytes</pre>
+<p>A thousand strings, no frees, no leak report: the single <code>defer arena.deinit()</code> covers them all. The arena is the right tool whenever a group of allocations share one lifetime: everything built while answering one request, drawing one frame, running one test, or loading one file. The code that does the work can allocate freely and never think about cleanup, because the boundary of the lifetime is where the arena is destroyed.</p>
+<p>The cost is that memory only grows until the arena is reset. If one thing inside the group needs to be freed early, an arena will not do it. And you must not hand an arena's memory to something that outlives the arena. If a value must escape, <code>dupe</code> it into a longer-lived allocator first.</p>
+<p>Arenas can also be <em>reset</em> instead of destroyed. <code>arena.reset(.retain_capacity)</code> forgets every allocation but keeps the chunks, so the next round of allocations reuses them without touching the backing allocator. This is the frame pattern:</p>
+<p class="file">al2.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn drawFrame(a: std.mem.Allocator, frame_no: u32) !void {
+    // Every frame formats a handful of strings and forgets them.
+    var rows: std.ArrayList([]const u8) = .empty;
+    var i: u32 = 0;
+    while (i &lt; 3) : (i += 1) {
+        try rows.append(a, try std.fmt.allocPrint(a, &quot;frame {d} row {d}&quot;, .{ frame_no, i }));
+    }
+    std.debug.print(&quot;{s} ... {d} rows\n&quot;, .{ rows.items[0], rows.items.len });
+}
+
+pub fn main(init: std.process.Init) !void {
+    var frame = std.heap.ArenaAllocator.init(init.gpa);
+    defer frame.deinit();
+
+    var frame_no: u32 = 0;
+    while (frame_no &lt; 3) : (frame_no += 1) {
+        _ = frame.reset(.retain_capacity); // wipe last frame, keep the pages
+        try drawFrame(frame.allocator(), frame_no);
+        std.debug.print(&quot;  capacity after frame {d}: {d}\n&quot;, .{ frame_no, frame.queryCapacity() });
+    }
+}</code></pre>
+<pre class="term">frame 0 row 0 ... 3 rows
+  capacity after frame 0: 424
+frame 1 row 0 ... 3 rows
+  capacity after frame 1: 424
+frame 2 row 0 ... 3 rows
+  capacity after frame 2: 424</pre>
+<p>After the first frame, capacity stops changing: the arena has learned how much a frame needs and simply reuses it. Three reset modes exist: <code>.free_all</code> releases the chunks too, <code>.retain_capacity</code> keeps them all, and <code>.retain_with_limit = n</code> keeps up to <code>n</code> bytes, a good choice when one unusual frame might otherwise pin a large buffer forever. <code>reset</code> returns a <code>bool</code> saying whether it could satisfy the request, which is why the examples write <code>_ = arena.reset(…)</code>.</p>
+
+<h3 id="ch20-5">20.5 <code>FixedBufferAllocator</code>: a heap inside an array</h3>
+<p>Sometimes you want allocation without a heap at all: in a tiny embedded program, in a hot loop where a system call is unacceptable, or just because you know an upper bound and want to be told if you were wrong. <code>FixedBufferAllocator</code> hands out slices of an array you give it, and returns <code>OutOfMemory</code> when the array is full.</p>
+<p class="file">al3.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() !void {
+    var buffer: [64]u8 = undefined; // the whole heap, on the stack
+    var fba = std.heap.FixedBufferAllocator.init(&amp;buffer);
+    const a = fba.allocator();
+
+    const first = try a.alloc(u8, 40);
+    std.debug.print(&quot;got {d} bytes, used {d} of {d}\n&quot;, .{ first.len, fba.end_index, buffer.len });
+
+    const second = a.alloc(u8, 40) catch |err| {
+        std.debug.print(&quot;second alloc failed: {s}\n&quot;, .{@errorName(err)});
+        return;
+    };
+    _ = second;
+}</code></pre>
+<pre class="term">got 40 bytes, used 40 of 64
+second alloc failed: OutOfMemory</pre>
+<p>The buffer here is a local array, so the "heap" lives on the stack and vanishes with the function. There is no <code>deinit</code>. <code>free</code> only reclaims the most recent allocation (it is a bump allocator, like the arena), so treat it as an arena with a hard limit. The <code>end_index</code> field tells you how much is used, which is handy in tests.</p>
+
+<h3 id="ch20-6">20.6 <code>stackFallback</code>: small on the stack, big on the heap</h3>
+<p>A common shape is "this is usually small, but occasionally huge". <code>std.heap.stackFallback(N, fallback)</code> gives you an allocator that serves requests from an <code>N</code>-byte buffer on the stack until it runs out, then transparently switches to the fallback allocator. Small cases never touch the heap; large cases still work.</p>
+<p class="file">al6.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn join(a: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    return std.mem.join(a, &quot;, &quot;, parts);
+}
+
+pub fn main(init: std.process.Init) !void {
+    // Up to 256 bytes come from the stack; anything bigger goes to init.gpa.
+    var sfa = std.heap.stackFallback(256, init.gpa);
+    const a = sfa.get();
+
+    const short = try join(a, &amp;.{ &quot;Ada&quot;, &quot;Bo&quot; });
+    defer a.free(short);
+    std.debug.print(&quot;{s}\n&quot;, .{short});
+
+    const parts = [_][]const u8{&quot;a-fairly-long-name&quot;} ** 30;
+    const long = try join(a, &amp;parts);
+    defer a.free(long);
+    std.debug.print(&quot;{d} bytes, spilled to the fallback\n&quot;, .{long.len});
+}</code></pre>
+<pre class="term">Ada, Bo
+598 bytes, spilled to the fallback</pre>
+<p>Note the <code>sfa.get()</code> rather than <code>.allocator()</code>: the stack-fallback allocator must be a <code>var</code> and <code>get</code> takes its address, because the buffer lives inside it. Free through the same allocator as always; it knows which memory came from where.</p>
+
+<h3 id="ch20-7">20.7 <code>c_allocator</code>: libc's <code>malloc</code></h3>
+<p>If your program links the C library, <code>std.heap.c_allocator</code> wraps <code>malloc</code> and <code>free</code>. It is fast, thread-safe and the natural choice when you are also handing memory to C code that will <code>free</code> it. It needs libc, so build with <code>-lc</code> (on macOS libc is always present, so it works either way; on Linux without <code>-lc</code> the link fails).</p>
+<p class="file">al5.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() !void {
+    const a = std.heap.c_allocator; // needs: zig run -lc al5.zig
+    const s = try a.dupe(u8, &quot;malloc says hi&quot;);
+    defer a.free(s);
+    std.debug.print(&quot;{s}\n&quot;, .{s});
+}</code></pre>
+<pre class="term">malloc says hi</pre>
+<p>For pure-Zig programs that need a fast general-purpose allocator in release builds, <code>std.heap.smp_allocator</code> does the same job with no libc dependency. As noted above, <code>init.gpa</code> already makes this choice for you.</p>
+
+<h3 id="ch20-8">20.8 The pattern: one arena per lifetime</h3>
+<p>Put the pieces together and you get the structure IRON LEDGER uses, and that most substantial Zig programs converge on. There are three lifetimes, and each gets an allocator that matches it.</p>
+<table>
+<tr><th>Lifetime</th><th>Allocator</th><th>What lives there</th><th>Freed when</th></tr>
+<tr><td>The process</td><td><code>init.gpa</code> (DebugAllocator in Debug)</td><td>The app struct, the terminal, the save store, the backing for every arena</td><td><code>main</code> returns; leaks reported</td></tr>
+<tr><td>The campaign</td><td>An <code>ArenaAllocator</code> owned by <code>GameState</code></td><td>Every person, unit, log line and ledger row</td><td><code>gs.deinit()</code>: one call</td></tr>
+<tr><td>One frame, one request, one test</td><td>A per-frame arena, reset each frame; a per-test arena</td><td>Query results: rows of formatted text drawn once</td><td><code>frame.reset(.retain_capacity)</code> before the next frame</td></tr>
+</table>
+<p>The arena is why the simulation core can be relaxed about strings. A query builds hundreds of small strings with <code>allocPrint</code> and never frees one; the caller resets the arena after drawing. The game state does the same at campaign scale: there is no per-object destructor anywhere in the domain, because <code>gs.deinit()</code> is the destructor for everything. The trade is stated plainly in the source: memory grows monotonically over a campaign (a long game holds every log line it ever wrote), in exchange for never having a use-after-free and never forgetting a free.</p>
+<p>The habit to take from this: when you write a function that allocates, do not decide the lifetime inside it. Take an allocator, use it, and let the caller decide by choosing what to pass. The same <code>summary(a, &amp;gs)</code> function serves a test with a throwaway arena, a TUI with a frame arena, and a CLI with <code>init.gpa</code> and explicit frees, and it does not know which.</p>
+
+<h3 id="ch20-9">20.9 Writing an allocator: a counting wrapper</h3>
+<p>An allocator is a struct pointer plus a vtable of four functions, so writing one is not magic. The most useful custom allocator is a wrapper that forwards to another allocator and measures. Here is one that counts.</p>
+<p class="file">al7.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+/// An allocator that wraps another and counts what passes through.
+const Counting = struct {
+    child: std.mem.Allocator,
+    allocs: usize = 0,
+    frees: usize = 0,
+    bytes: usize = 0,
+
+    fn allocator(self: *Counting) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &amp;vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawAlloc(len, alignment, ret_addr);
+        if (result != null) {
+            self.allocs += 1;
+            self.bytes += len;
+        }
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    var counting = Counting{ .child = init.gpa };
+    const a = counting.allocator();
+
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(a);
+    var i: u32 = 0;
+    while (i &lt; 1000) : (i += 1) try list.append(a, i);
+
+    const s = try std.fmt.allocPrint(a, &quot;{d} items&quot;, .{list.items.len});
+    defer a.free(s);
+    std.debug.print(&quot;{s}\n&quot;, .{s});
+    std.debug.print(&quot;allocs={d} frees={d} bytes requested={d}\n&quot;, .{ counting.allocs, counting.frees, counting.bytes });
+}</code></pre>
+<pre class="term">1000 items
+allocs=9 frees=7 bytes requested=9380</pre>
+<p>The four vtable functions take the state as <code>*anyopaque</code> and cast it back with <code>@ptrCast(@alignCast(ctx))</code>, exactly as <a href="#ch18">Chapter 18</a> described. Each forwards to the child's raw method and updates a tally. The <code>alignment</code> parameter's type is <code>std.mem.Alignment</code> and the <code>ret_addr</code> is for debug traces; you pass both straight through. With the wrapper in place you can see that appending a thousand items to an <code>ArrayList</code> took nine allocations (the buffer doubles as it grows) and that the seven frees plus the two <code>defer</code>s still pending at print time will balance. Exercise 20.4 has you write this yourself and assert the balance in a test.</p>
+
+<h3 id="ch20-10">20.10 The comparison table</h3>
+<table class="compare">
+<tr><th>Allocator</th><th>Setup</th><th>Individual free</th><th>Thread-safe</th><th>Use it for</th></tr>
+<tr><td><code>DebugAllocator(.{})</code></td><td><code>.init</code>, <code>deinit()</code> returns <code>.ok</code>/<code>.leak</code></td><td>yes, checked</td><td>yes by default</td><td>Debug builds and tests; <code>init.gpa</code>, <code>std.testing.allocator</code></td></tr>
+<tr><td><code>smp_allocator</code></td><td>none</td><td>yes</td><td>yes</td><td>Release builds without libc</td></tr>
+<tr><td><code>c_allocator</code></td><td>none, needs <code>-lc</code></td><td>yes</td><td>yes</td><td>Programs that link libc or share memory with C</td></tr>
+<tr><td><code>page_allocator</code></td><td>none</td><td>yes, whole pages</td><td>yes</td><td>Backing other allocators; a few large buffers</td></tr>
+<tr><td><code>ArenaAllocator</code></td><td><code>init(backing)</code>, <code>deinit()</code>, <code>reset(mode)</code></td><td>no (no-op)</td><td>no</td><td>A group of allocations with one lifetime: a request, frame, test, campaign</td></tr>
+<tr><td><code>FixedBufferAllocator</code></td><td><code>init(&amp;buffer)</code></td><td>only the last</td><td>no</td><td>Bounded scratch space with no heap</td></tr>
+<tr><td><code>stackFallback(N, fallback)</code></td><td><code>var sfa = …; sfa.get()</code></td><td>yes</td><td>no</td><td>Usually-small, occasionally-large temporaries</td></tr>
+</table>
+<div class="note"><strong>If in doubt.</strong> Start with <code>init.gpa</code> for the program and <code>std.testing.allocator</code> for tests. The moment you find yourself writing a loop to free the parts of a result, ask whether those parts share a lifetime; if they do, that is an arena. Reach for the others when you have a specific reason.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The three lifetimes are three fields and three lines. <code>GameState</code> in <code>game/src/sim/state.zig</code> owns the campaign arena and exposes it as the only allocator the domain ever sees:
+<pre><code>arena: std.heap.ArenaAllocator,
+// …
+pub fn init(gpa: std.mem.Allocator, config: Config) GameState {
+    return .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .rng = rng_mod.Rng.init(config.seed),
+        // …
+    };
+}
+
+pub fn deinit(self: *GameState) void {
+    self.arena.deinit();
+}
+
+/// All campaign-lifetime allocations come from here.
+pub fn allocator(self: *GameState) std.mem.Allocator {
+    return self.arena.allocator();
+}</code></pre>
+The terminal client in <code>game/src/tui/app.zig</code> keeps two more arenas, <code>frame</code> and <code>lobby</code>, both created with <code>std.heap.ArenaAllocator.init(gpa)</code>, and the first line of <code>draw</code> is <code>_ = self.frame.reset(.retain_capacity);</code>. Every row of text the screen shows is allocated from <code>self.frame.allocator()</code> and forgotten. And every test that calls a query begins with the three lines from the original guide: <code>var arena = std.heap.ArenaAllocator.init(std.testing.allocator); defer arena.deinit(); const a = arena.allocator();</code>, which means the testing allocator still sees the arena's chunks and still reports a leak if the arena itself is forgotten.</div>
+
+<h3 id="ch20-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 20.1 · An arena for a pile of short-lived strings <span class="level">warm-up</span></h4>
+  <p>Write <code>report(a, n)</code>, which builds <code>n</code> formatted lines into an owned slice. The first test runs it through an arena and frees with one <code>deinit</code>; the second runs it through the testing allocator and frees piece by piece. Same function, both must pass. File: <code>exercises/20-allocators/ex1_arena.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 20, exercise 1: an arena for a pile of short-lived strings.
+//! Run with:  zig test ex1_arena.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// Build a report of `n` lines using `a` and return the lines. The
+/// caller decides how to free (with an arena: one deinit).
+fn report(a: std.mem.Allocator, n: u32) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: u32 = 0;
+    while (i &lt; n) : (i += 1) {
+        try out.append(a, try std.fmt.allocPrint(a, &quot;day {d}: nothing to report&quot;, .{i + 1}));
+    }
+    return out.toOwnedSlice(a);
+}
+
+test &quot;arena frees everything at once&quot; {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit(); // this is the ONLY free in the test
+    const a = arena.allocator();
+
+    const lines = try report(a, 50);
+    try std.testing.expectEqual(@as(usize, 50), lines.len);
+    try std.testing.expectEqualStrings(&quot;day 50: nothing to report&quot;, lines[49]);
+}
+
+test &quot;the same function works with a plain allocator, if you free&quot; {
+    const a = std.testing.allocator;
+    const lines = try report(a, 3);
+    defer {
+        for (lines) |l| a.free(l);
+        a.free(lines);
+    }
+    try std.testing.expectEqualStrings(&quot;day 2: nothing to report&quot;, lines[1]);
+}</code></pre>
+  <p>The function does not know or care which allocator it was given. That is the whole point of taking it as a parameter: the caller chooses the lifetime.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 20.2 · A fixed buffer runs out <span class="level">practice</span></h4>
+  <p>Implement <code>countUntilFull</code>, which allocates labels from a <code>FixedBufferAllocator</code> over a <code>size</code>-byte array until it fails, and returns how many fit. File: <code>exercises/20-allocators/ex2_fba.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 20, exercise 2: a fixed buffer runs out.
+//! Run with:  zig test ex2_fba.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// Format `n` into memory taken from `a`. Caller frees.
+fn label(a: std.mem.Allocator, n: u32) ![]u8 {
+    return std.fmt.allocPrint(a, &quot;unit-{d}&quot;, .{n});
+}
+
+/// How many labels fit in a buffer of `size` bytes before OutOfMemory?
+fn countUntilFull(comptime size: usize) usize {
+    var buffer: [size]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&amp;buffer);
+    const a = fba.allocator();
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        _ = label(a, 100) catch break;
+    }
+    return n;
+}
+
+test &quot;labels come out of the buffer&quot; {
+    var buffer: [32]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&amp;buffer);
+    const a = fba.allocator();
+    const l = try label(a, 7);
+    try std.testing.expectEqualStrings(&quot;unit-7&quot;, l);
+    try std.testing.expect(fba.end_index &gt;= 6);
+}
+
+test &quot;a full buffer fails cleanly with OutOfMemory&quot; {
+    var buffer: [16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&amp;buffer);
+    const a = fba.allocator();
+    _ = try label(a, 1);
+    _ = try label(a, 2);
+    try std.testing.expectError(error.OutOfMemory, label(a, 3));
+}
+
+test &quot;bigger buffer, more labels&quot; {
+    try std.testing.expect(countUntilFull(64) &lt; countUntilFull(256));
+    try std.testing.expectEqual(@as(usize, 0), countUntilFull(4));
+}</code></pre>
+  <p><code>size</code> is <code>comptime</code> because it is the length of an array type. The loop stops on the first <code>OutOfMemory</code>, which the <code>catch break</code> turns into ordinary control flow. There is no cleanup: the buffer is a local.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 20.3 · One arena per frame <span class="level">practice</span></h4>
+  <p>Implement <code>runFrames</code>, which draws <code>frames</code> frames through one arena, resetting with <code>.retain_capacity</code> between them, and returns the final capacity. The test asserts that 200 frames use no more capacity than one. File: <code>exercises/20-allocators/ex3_frame.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 20, exercise 3: one arena per frame, reset between frames.
+//! Run with:  zig test ex3_frame.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// One frame&#x27;s worth of work: a few formatted rows, never freed one by one.
+fn drawFrame(a: std.mem.Allocator, frame_no: u32) !usize {
+    var bytes: usize = 0;
+    var i: u32 = 0;
+    while (i &lt; 20) : (i += 1) {
+        const row = try std.fmt.allocPrint(a, &quot;frame {d} row {d}&quot;, .{ frame_no, i });
+        bytes += row.len;
+    }
+    return bytes;
+}
+
+/// Run `frames` frames through one arena, resetting it between frames
+/// so that its capacity stops growing after the first frame.
+/// Returns the arena&#x27;s capacity after the last frame.
+fn runFrames(gpa: std.mem.Allocator, frames: u32) !usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var f: u32 = 0;
+    while (f &lt; frames) : (f += 1) {
+        _ = arena.reset(.retain_capacity);
+        _ = try drawFrame(arena.allocator(), f);
+    }
+    return arena.queryCapacity();
+}
+
+test &quot;capacity does not grow with the number of frames&quot; {
+    const one = try runFrames(std.testing.allocator, 1);
+    const many = try runFrames(std.testing.allocator, 200);
+    try std.testing.expect(one &gt; 0);
+    try std.testing.expectEqual(one, many);
+}</code></pre>
+  <p>Change the reset mode to <code>.free_all</code> and the test still passes (capacity after the last frame is the same), but the arena now goes back to the backing allocator every frame. Remove the reset entirely and the assertion fails, because the arena keeps growing.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 20.4 · An allocator that counts <span class="level">challenge</span></h4>
+  <p>Fill in the four vtable functions of <code>Counting</code> so that it forwards to its child and tallies allocations, frees and bytes requested. The second test checks that an <code>ArrayList</code> frees exactly as many times as it allocates. File: <code>exercises/20-allocators/ex4_counting.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 20, exercise 4: an allocator that counts.
+//! Run with:  zig test ex4_counting.zig
+//! Goal: make every test pass without changing the tests. Implement the
+//! four vtable functions by forwarding to `child` and keeping the tallies.
+const std = @import(&quot;std&quot;);
+
+const Counting = struct {
+    child: std.mem.Allocator,
+    allocs: usize = 0,
+    frees: usize = 0,
+    bytes_requested: usize = 0,
+
+    fn allocator(self: *Counting) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &amp;vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr);
+        if (p != null) {
+            self.allocs += 1;
+            self.bytes_requested += len;
+        }
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Counting = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test &quot;counts allocs, frees and bytes&quot; {
+    var c = Counting{ .child = std.testing.allocator };
+    const a = c.allocator();
+
+    const x = try a.alloc(u8, 10);
+    const y = try a.alloc(u32, 4);
+    try std.testing.expectEqual(@as(usize, 2), c.allocs);
+    try std.testing.expectEqual(@as(usize, 26), c.bytes_requested);
+    a.free(x);
+    a.free(y);
+    try std.testing.expectEqual(@as(usize, 2), c.frees);
+}
+
+test &quot;a list balances its allocations&quot; {
+    var c = Counting{ .child = std.testing.allocator };
+    const a = c.allocator();
+    {
+        var list: std.ArrayList(u64) = .empty;
+        defer list.deinit(a);
+        var i: u64 = 0;
+        while (i &lt; 500) : (i += 1) try list.append(a, i);
+    }
+    try std.testing.expect(c.allocs &gt; 0);
+    try std.testing.expectEqual(c.allocs, c.frees);
+}</code></pre>
+  <p>Only successful allocations are counted, which is why <code>alloc</code> checks the result before incrementing. The child's <code>rawAlloc</code>, <code>rawResize</code>, <code>rawRemap</code> and <code>rawFree</code> are the vtable calls without the type-safe wrapping, which is what a forwarding allocator wants.</p></details>
+</div>
+
+<h3 id="ch20-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What happens when you call <code>free</code> on memory from an <code>ArenaAllocator</code>? <details class="answer"><summary>Answer</summary>Nothing. Arena memory is released all at once by <code>deinit()</code> or <code>reset()</code>.</details></li>
+  <li>When is an arena the wrong choice? <details class="answer"><summary>Answer</summary>When parts of the data need to be freed at different times, when memory must not grow unboundedly, or when a value must outlive the arena (then <code>dupe</code> it elsewhere).</details></li>
+  <li>What does <code>reset(.retain_capacity)</code> do differently from <code>deinit()</code>? <details class="answer"><summary>Answer</summary>Both forget every allocation; <code>reset</code> keeps the chunks so the next round reuses them without going back to the backing allocator, and the arena stays usable.</details></li>
+  <li>Why is <code>page_allocator</code> a poor choice for many small strings? <details class="answer"><summary>Answer</summary>Every allocation is at least one page (16 KiB here) and costs a system call.</details></li>
+  <li>What does <code>FixedBufferAllocator</code> do when its buffer is full? <details class="answer"><summary>Answer</summary>Returns <code>error.OutOfMemory</code>, an ordinary error you handle with <code>try</code> or <code>catch</code>.</details></li>
+  <li>What is <code>init.gpa</code> in a Debug build, and in a release build? <details class="answer"><summary>Answer</summary>A <code>DebugAllocator</code> with leak checking in Debug; <code>c_allocator</code> if libc is linked or <code>smp_allocator</code> otherwise in release.</details></li>
+  <li>What are the four functions in an allocator's vtable? <details class="answer"><summary>Answer</summary><code>alloc</code>, <code>resize</code>, <code>remap</code> and <code>free</code>, each receiving the allocator's state as <code>*anyopaque</code>.</details></li>
+  <li>A function takes an allocator and builds a result out of many pieces. Who decides how long the pieces live? <details class="answer"><summary>Answer</summary>The caller, by choosing which allocator to pass: an arena for "all together", a general-purpose allocator for piece-by-piece freeing.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>The allocator is chosen by the caller and should match the lifetime of the data.</li>
+<li><code>DebugAllocator</code> for development: leaks, double frees and use-after-free are reported with traces. <code>init.gpa</code> is one in Debug.</li>
+<li><code>page_allocator</code> is the raw OS source, good as a backing allocator; <code>c_allocator</code> and <code>smp_allocator</code> are the fast general-purpose choices for release.</li>
+<li><code>ArenaAllocator</code> frees everything at once; <code>reset(.retain_capacity)</code> makes it a reusable per-frame or per-request allocator.</li>
+<li><code>FixedBufferAllocator</code> allocates from an array and fails cleanly when full; <code>stackFallback</code> uses the stack first and a fallback after.</li>
+<li>One arena per lifetime, process / campaign / frame, is how IRON LEDGER never writes a per-object free.</li>
+<li>An allocator is a pointer plus four vtable functions; a counting wrapper is thirty lines.</li>
+</ul></div>
+</section>

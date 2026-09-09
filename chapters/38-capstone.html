@@ -1,0 +1,2176 @@
+<section id="ch38">
+<h2>38. Capstone: a mercenary ledger from scratch</h2>
+<p class="goals"><strong>In this chapter</strong> you will build a complete program, "Small Ledger", a command-line simulator of a mercenary company's payroll, in six stages. Each stage is a single file that compiles and passes its tests on its own, and each adds one layer: types, a company with commands, a ledger, a calendar tick, seeded random events, and finally an interactive loop with save and load. By the end you will have written, in about five hundred lines, a miniature of IRON LEDGER's architecture, and the next Part of this book, which reads the real game, will feel like visiting a bigger version of your own house.</p>
+
+<h3 id="ch38-1">38.1 What we are building, and the shape of it</h3>
+<p>Small Ledger is a program you talk to. You hire people by name and role, advance the calendar, and watch money leave on payday. Random events nudge morale, morale nudges pay, and everything can be saved to a file and loaded back. Here is a session with the finished program:</p>
+<pre class="term">$ printf 'hire Grayson mekwarrior\nhire Clay tech\nadvance 31\nledger\nsave ledger.sav\nquit\n' | zig run ex6_repl.zig
+&gt; hired Grayson as mekwarrior (id 1)
+&gt; hired Clay as tech (id 2)
+&gt; advanced 31 days to 3025-02-01, funds 47746
+&gt; day 31  -2254  payroll  monthly payroll
+balance 47746
+&gt; saved ledger.sav
+&gt; bye</pre>
+<p>(Two people whose base pay adds up to 2300 were paid 2254 because on day 15 the dice rolled a 2 and morale dropped a point. The seed is fixed, so you will get exactly these numbers.)</p>
+<p>The architecture has one rule, borrowed directly from the game: <strong>a pure core, and I/O at the edges</strong>. The core is a <code>Company</code> struct and an <code>execute(company, command)</code> function. It never reads a file, never reads the clock, never touches stdin. It takes values and returns values or errors. Around it sits a thin edge: a parser that turns text into commands, a printer that turns results into text, and save/load functions that hold the <code>io</code>. The core is where all the rules live, and because it is pure, all of it is testable with <code>zig test</code> and no fixtures.</p>
+<p>Each stage is <code>exercises/38-capstone/exN_name.zig</code>. The starters give you the tests and the skeleton; you fill in the bodies. The solutions are complete files, and each stage's solution contains the previous stage's code, so if you get stuck you can start the next stage from the solution of the one before. The table below is the map, with the IRON LEDGER file each stage corresponds to:</p>
+<table>
+<tr><th>Stage</th><th>You build</th><th>In IRON LEDGER</th></tr>
+<tr><td>1 · types</td><td><code>CBills</code>, <code>applyBp</code>, <code>PersonId</code>, <code>Role</code>, <code>Person</code></td><td><code>src/domain/types.zig</code>, <code>src/domain/person.zig</code></td></tr>
+<tr><td>2 · company</td><td><code>Company</code> with an arena, <code>Command</code>, <code>execute</code>, <code>Error</code></td><td><code>src/sim/state.zig</code>, <code>src/sim/commands.zig</code></td></tr>
+<tr><td>3 · ledger</td><td><code>Transaction</code>, <code>Ledger</code>, <code>postTransaction</code>, payroll</td><td><code>src/econ/finance.zig</code>, <code>GameState.postTreasury</code></td></tr>
+<tr><td>4 · tick</td><td><code>Date</code>, <code>Clock</code>, <code>advanceDay</code>, payday on the 1st</td><td><code>src/sim/clock.zig</code>, <code>src/sim/tick.zig</code></td></tr>
+<tr><td>5 · events</td><td><code>Rng</code> with streams, a 2d6 morale event, <code>hash</code>, the golden master</td><td><code>src/sim/rng.zig</code>, <code>src/sim/events.zig</code>, <code>GameState.hash</code></td></tr>
+<tr><td>6 · repl</td><td>a stdin loop, a text parser, save and load with <code>std.Io</code></td><td><code>src/sim/cli.zig</code>, <code>src/main.zig</code>, <code>src/persist/store.zig</code></td></tr>
+</table>
+
+<h3 id="ch38-2">38.2 Stage 1: the vocabulary</h3>
+<p>Every program has a handful of types that everything else is written in terms of. Get them right first, alone, with tests, before there is any behaviour to distract you.</p>
+<p>Money is an integer. Not a float: floats cannot represent 0.1 exactly, and a ledger that drifts by a C-bill over a thousand transactions is a ledger nobody trusts (<a href="#ch05">Chapter 5</a>). So <code>CBills = i64</code>, and percentages are <em>basis points</em>, hundredths of a percent, so that "plus 10 percent" is <code>applyBp(x, 11_000)</code> and stays in integer arithmetic. Identifiers are non-exhaustive enums over <code>u32</code>: a <code>PersonId</code> is a number, but the compiler will not let you pass it where a <code>u32</code> or another ID type is expected (<a href="#ch13">Chapter 13</a>). Roles are an ordinary enum with a method. A person is a struct with a default for the field that starts at zero.</p>
+<p>Write these, then make the tests pass. Notice the test for morale: a person at morale +5 earns 2 percent per point more, and the arithmetic must be exact.</p>
+<details class="answer"><summary>Stage 1 solution: exercises/38-capstone/solutions/ex1_types.zig</summary>
+<pre><code>//! Chapter 38, stage 1: the vocabulary of Small Ledger.
+//! Run with:  zig test ex1_types.zig
+//! Goal: define CBills, applyBp, PersonId, Role with baseSalary, and
+//! Person with monthlySalary, so the tests pass.
+
+const std = @import("std");
+
+/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points: 10_000 bp is x1.0. All multipliers go through this so
+/// the arithmetic is integer and reproducible.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+/// A typed ID: impossible to mix up with a plain integer or another ID.
+pub const PersonId = enum(u32) { none = 0, _ };
+
+pub const Role = enum {
+    mekwarrior,
+    tech,
+    medic,
+    admin,
+
+    /// Monthly base pay.
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+};
+
+pub const Person = struct {
+    id: PersonId,
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+    /// -10 (mutinous) to +10 (devoted). Each point is 2 percent of pay.
+    morale: i8 = 0,
+
+    /// Base pay adjusted by morale: +2 percent per point.
+    pub fn monthlySalary(self: Person) CBills {
+        const bp: Bp = 10_000 + @as(Bp, self.morale) * 200;
+        return applyBp(self.role.baseSalary(), bp);
+    }
+};
+
+test "basis points stay in integers" {
+    try std.testing.expectEqual(@as(CBills, 1_500), applyBp(1_500, 10_000));
+    try std.testing.expectEqual(@as(CBills, 1_650), applyBp(1_500, 11_000));
+    try std.testing.expectEqual(@as(CBills, 900), applyBp(1_500, 6_000));
+}
+
+test "typed ids are distinct values" {
+    const a: PersonId = @enumFromInt(1);
+    const b: PersonId = @enumFromInt(2);
+    try std.testing.expect(a != b);
+    try std.testing.expect(a != .none);
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(b));
+}
+
+test "salary follows role and morale" {
+    var p: Person = .{ .id = @enumFromInt(1), .name = "Grayson", .role = .mekwarrior, .hired_day = 0 };
+    try std.testing.expectEqual(@as(CBills, 1_500), p.monthlySalary());
+    p.morale = 5;
+    try std.testing.expectEqual(@as(CBills, 1_650), p.monthlySalary());
+    p.morale = -10;
+    try std.testing.expectEqual(@as(CBills, 1_200), p.monthlySalary());
+}</code></pre>
+</details>
+<pre class="term">$ zig test ex1_types.zig
+All 3 tests passed.</pre>
+<p>Two details deserve a look. <code>monthlySalary</code> builds the multiplier as <code>10_000 + morale * 200</code>, so morale -10 is 8000 bp (80 percent) and +10 is 12000. And the cast <code>@as(Bp, self.morale)</code> widens the <code>i8</code> before multiplying, because <code>i8 * 200</code> would overflow. This is the game's <code>Person.monthlySalary</code> in miniature; the real one multiplies three factors, role, experience and rank, all in basis points.</p>
+
+<h3 id="ch38-3">38.3 Stage 2: a Company and its commands</h3>
+<p>Now the state. A <code>Company</code> owns a list of people, a running ID counter and a treasury. The question every stateful program must answer is <em>who frees the memory</em>, and the answer here is the same as the game's: an <strong>arena</strong>. The company creates one arena in <code>init</code>, every name and every list grows out of it, and <code>deinit</code> frees the lot in one call (<a href="#ch20">Chapter 20</a>). No per-person destructor, no double free, no forgotten free.</p>
+<pre><code>pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
+
+pub const Company = struct {
+    arena: std.heap.ArenaAllocator,
+    people: std.ArrayList(Person) = .empty,
+    next_id: u32 = 1,
+    day: u32 = 0,
+    funds: CBills,
+
+    pub const Options = struct {
+        funds: CBills = 50_000,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) Company {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .funds = opts.funds,
+        };
+    }
+
+    pub fn deinit(self: *Company) void {
+        self.arena.deinit();
+    }
+
+    /// Every allocation the company makes comes from here and dies in deinit.
+    pub fn allocator(self: *Company) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn find(self: *Company, id: PersonId) ?*Person {
+        for (self.people.items) |*p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn today(self: *Company) u32 {
+        return self.day;
+    }
+
+    pub fn hire(self: *Company, name: []const u8, role: Role) Error!PersonId {
+        if (name.len == 0) return error.EmptyName;
+        const id: PersonId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        const owned = try self.allocator().dupe(u8, name);
+        try self.people.append(self.allocator(), .{
+            .id = id,
+            .name = owned,
+            .role = role,
+            .hired_day = self.today(),
+        });
+        return id;
+    }
+
+    pub fn fire(self: *Company, id: PersonId) Error!void {
+        for (self.people.items, 0..) |p, i| {
+            if (p.id == id) {
+                _ = self.people.orderedRemove(i);
+                return;
+            }
+        }
+        return error.UnknownPerson;
+    }
+};</code></pre>
+<p><code>hire</code> copies the name into the arena with <code>dupe</code>. This matters: the caller's string might be a buffer that gets reused (the REPL's line buffer will be exactly that), so the company must own its copy. The test checks this by mutating the caller's buffer after hiring. <code>fire</code> uses <code>orderedRemove</code> rather than <code>swapRemove</code>, because the order of the roster is part of the state we will hash later, and it must not depend on deletion history.</p>
+<p>The second half of the stage is the command layer. A command is a tagged union, one variant per thing a user can ask for; <code>execute</code> is one <code>switch</code> that dispatches to the company's methods and returns a <code>Result</code> or an error from a named set (<a href="#ch14">Chapter 14</a>, <a href="#ch16">Chapter 16</a>).</p>
+<pre><code>pub const Command = union(enum) {
+    hire: struct { name: []const u8, role: Role },
+    fire: PersonId,
+};
+
+pub const Result = union(enum) {
+    hired: PersonId,
+    fired,
+};
+
+pub fn execute(co: *Company, cmd: Command) Error!Result {
+    switch (cmd) {
+        .hire =&gt; |h| return .{ .hired = try co.hire(h.name, h.role) },
+        .fire =&gt; |id| {
+            try co.fire(id);
+            return .fired;
+        },
+    }
+}</code></pre>
+<p>Why the extra layer, when the REPL could call <code>co.hire</code> directly? Because a union of commands is <em>data</em>. It can be stored in an array (a script), compared, logged, replayed, sent over a wire. Stage 5's golden-master test is an array of commands run twice. The game's <code>Command</code> union has about forty variants and its <code>execute</code> is the single entry point for the TUI, the CLI and every test.</p>
+<details class="answer"><summary>Stage 2 solution: exercises/38-capstone/solutions/ex2_company.zig</summary>
+<pre><code>//! Chapter 38, stage 2: a Company and its commands.
+//! Run with:  zig test ex2_company.zig
+//! Goal: add a Company that owns its people through an arena, and a
+//! tagged-union Command with an `execute` function that returns errors.
+
+const std = @import("std");
+
+/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points: 10_000 bp is x1.0.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+pub const PersonId = enum(u32) { none = 0, _ };
+
+pub const Role = enum {
+    mekwarrior,
+    tech,
+    medic,
+    admin,
+
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+};
+
+pub const Person = struct {
+    id: PersonId,
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+    morale: i8 = 0,
+
+    pub fn monthlySalary(self: Person) CBills {
+        const bp: Bp = 10_000 + @as(Bp, self.morale) * 200;
+        return applyBp(self.role.baseSalary(), bp);
+    }
+};
+
+pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
+
+pub const Company = struct {
+    arena: std.heap.ArenaAllocator,
+    people: std.ArrayList(Person) = .empty,
+    next_id: u32 = 1,
+    day: u32 = 0,
+    funds: CBills,
+
+    pub const Options = struct {
+        funds: CBills = 50_000,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) Company {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .funds = opts.funds,
+        };
+    }
+
+    pub fn deinit(self: *Company) void {
+        self.arena.deinit();
+    }
+
+    /// Every allocation the company makes comes from here and dies in deinit.
+    pub fn allocator(self: *Company) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn find(self: *Company, id: PersonId) ?*Person {
+        for (self.people.items) |*p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn today(self: *Company) u32 {
+        return self.day;
+    }
+
+    pub fn hire(self: *Company, name: []const u8, role: Role) Error!PersonId {
+        if (name.len == 0) return error.EmptyName;
+        const id: PersonId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        const owned = try self.allocator().dupe(u8, name);
+        try self.people.append(self.allocator(), .{
+            .id = id,
+            .name = owned,
+            .role = role,
+            .hired_day = self.today(),
+        });
+        return id;
+    }
+
+    pub fn fire(self: *Company, id: PersonId) Error!void {
+        for (self.people.items, 0..) |p, i| {
+            if (p.id == id) {
+                _ = self.people.orderedRemove(i);
+                return;
+            }
+        }
+        return error.UnknownPerson;
+    }
+};
+
+pub const Command = union(enum) {
+    hire: struct { name: []const u8, role: Role },
+    fire: PersonId,
+};
+
+pub const Result = union(enum) {
+    hired: PersonId,
+    fired,
+};
+
+pub fn execute(co: *Company, cmd: Command) Error!Result {
+    switch (cmd) {
+        .hire =&gt; |h| return .{ .hired = try co.hire(h.name, h.role) },
+        .fire =&gt; |id| {
+            try co.fire(id);
+            return .fired;
+        },
+    }
+}
+
+test "hire gives increasing ids and copies the name" {
+    var co = Company.init(std.testing.allocator, .{});
+    defer co.deinit();
+    var name_buf = [_]u8{ 'C', 'l', 'a', 'y' };
+    const a = try execute(&amp;co, .{ .hire = .{ .name = &amp;name_buf, .role = .tech } });
+    name_buf[0] = 'X'; // the company must not be looking at our buffer
+    const b = try execute(&amp;co, .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } });
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(a.hired));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(b.hired));
+    try std.testing.expectEqualStrings("Clay", co.find(a.hired).?.name);
+}
+
+test "fire removes and refuses unknown ids" {
+    var co = Company.init(std.testing.allocator, .{});
+    defer co.deinit();
+    const r = try execute(&amp;co, .{ .hire = .{ .name = "Lori", .role = .mekwarrior } });
+    try std.testing.expectEqual(@as(usize, 1), co.people.items.len);
+    _ = try execute(&amp;co, .{ .fire = r.hired });
+    try std.testing.expectEqual(@as(usize, 0), co.people.items.len);
+    try std.testing.expectError(error.UnknownPerson, execute(&amp;co, .{ .fire = r.hired }));
+    try std.testing.expectError(error.EmptyName, execute(&amp;co, .{ .hire = .{ .name = "", .role = .medic } }));
+}</code></pre>
+</details>
+<pre class="term">$ zig test ex2_company.zig
+All 2 tests passed.</pre>
+
+<h3 id="ch38-4">38.4 Stage 3: the ledger</h3>
+<p>Money must move in exactly one way. If <code>funds</code> can be changed by any line of code that feels like it, then the ledger and the balance will disagree eventually and you will not know which is right. So: a <code>Transaction</code> record, a <code>Ledger</code> that is a list of them, and one method on <code>Company</code> that appends a record <em>and</em> adjusts the balance in the same breath.</p>
+<pre><code>pub const Category = enum { payroll, severance, contract, event };
+
+pub const Transaction = struct {
+    day: u32,
+    amount: CBills, // income +, expense -
+    category: Category,
+    note: []const u8 = "",
+};
+
+pub const Ledger = struct {
+    transactions: std.ArrayList(Transaction) = .empty,
+
+    pub fn post(self: *Ledger, alloc: std.mem.Allocator, txn: Transaction) !void {
+        try self.transactions.append(alloc, txn);
+    }
+
+    /// Sum of every transaction: what the ledger says we have gained or lost.
+    pub fn balance(self: Ledger) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| total += t.amount;
+        return total;
+    }
+
+    pub fn sumCategory(self: Ledger, cat: Category) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| if (t.category == cat) {
+            total += t.amount;
+        };
+        return total;
+    }
+};</code></pre>
+<pre><code>/// The only way money moves: a ledger entry and the balance, in lockstep.
+pub fn postTransaction(self: *Company, txn: Transaction) Error!void {
+    try self.ledger.post(self.allocator(), txn);
+    self.funds += txn.amount;
+}
+
+pub fn monthlyPayroll(self: *Company) CBills {
+    var total: CBills = 0;
+    for (self.people.items) |p| total += p.monthlySalary();
+    return total;
+}
+
+pub fn runPayroll(self: *Company) Error!void {
+    const payroll = self.monthlyPayroll();
+    if (payroll == 0) return;
+    try self.postTransaction(.{
+        .day = self.today(),
+        .amount = -payroll,
+        .category = .payroll,
+        .note = "monthly payroll",
+    });
+}</code></pre>
+<p>The invariant this buys is stated as a test: <code>funds == starting_funds + ledger.balance()</code>, always. Firing now posts a severance transaction (one month's pay) before removing the person:</p>
+<pre><code>pub fn fire(self: *Company, id: PersonId) Error!void {
+    for (self.people.items, 0..) |p, i| {
+        if (p.id == id) {
+            try self.postTransaction(.{
+                .day = self.today(),
+                .amount = -p.monthlySalary(),
+                .category = .severance,
+                .note = p.name,
+            });
+            _ = self.people.orderedRemove(i);
+            return;
+        }
+    }
+    return error.UnknownPerson;
+}</code></pre>
+<p>The <code>note</code> field holds the person's name, which lives in the arena, so the string stays valid after the person is removed from the list. That is another quiet benefit of the arena: nothing you have ever allocated goes away until the company does, so references between records are always safe.</p>
+<details class="answer"><summary>Stage 3 solution: exercises/38-capstone/solutions/ex3_ledger.zig</summary>
+<pre><code>//! Chapter 38, stage 3: a ledger of transactions and payroll.
+//! Run with:  zig test ex3_ledger.zig
+//! Goal: add Transaction, Ledger, Company.postTransaction (the only way
+//! money moves), monthlyPayroll and runPayroll; firing now posts severance.
+
+const std = @import("std");
+
+/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points: 10_000 bp is x1.0.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+pub const PersonId = enum(u32) { none = 0, _ };
+
+pub const Role = enum {
+    mekwarrior,
+    tech,
+    medic,
+    admin,
+
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+};
+
+pub const Person = struct {
+    id: PersonId,
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+    morale: i8 = 0,
+
+    pub fn monthlySalary(self: Person) CBills {
+        const bp: Bp = 10_000 + @as(Bp, self.morale) * 200;
+        return applyBp(self.role.baseSalary(), bp);
+    }
+};
+
+pub const Category = enum { payroll, severance, contract, event };
+
+pub const Transaction = struct {
+    day: u32,
+    amount: CBills, // income +, expense -
+    category: Category,
+    note: []const u8 = "",
+};
+
+pub const Ledger = struct {
+    transactions: std.ArrayList(Transaction) = .empty,
+
+    pub fn post(self: *Ledger, alloc: std.mem.Allocator, txn: Transaction) !void {
+        try self.transactions.append(alloc, txn);
+    }
+
+    /// Sum of every transaction: what the ledger says we have gained or lost.
+    pub fn balance(self: Ledger) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| total += t.amount;
+        return total;
+    }
+
+    pub fn sumCategory(self: Ledger, cat: Category) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| if (t.category == cat) {
+            total += t.amount;
+        };
+        return total;
+    }
+};
+
+pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
+
+pub const Company = struct {
+    arena: std.heap.ArenaAllocator,
+    people: std.ArrayList(Person) = .empty,
+    next_id: u32 = 1,
+    day: u32 = 0,
+    funds: CBills,
+    starting_funds: CBills,
+    ledger: Ledger = .{},
+
+    pub const Options = struct {
+        funds: CBills = 50_000,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) Company {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .funds = opts.funds,
+            .starting_funds = opts.funds,
+        };
+    }
+
+    pub fn deinit(self: *Company) void {
+        self.arena.deinit();
+    }
+
+    /// Every allocation the company makes comes from here and dies in deinit.
+    pub fn allocator(self: *Company) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn find(self: *Company, id: PersonId) ?*Person {
+        for (self.people.items) |*p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn today(self: *Company) u32 {
+        return self.day;
+    }
+
+    pub fn hire(self: *Company, name: []const u8, role: Role) Error!PersonId {
+        if (name.len == 0) return error.EmptyName;
+        const id: PersonId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        const owned = try self.allocator().dupe(u8, name);
+        try self.people.append(self.allocator(), .{
+            .id = id,
+            .name = owned,
+            .role = role,
+            .hired_day = self.today(),
+        });
+        return id;
+    }
+
+    pub fn fire(self: *Company, id: PersonId) Error!void {
+        for (self.people.items, 0..) |p, i| {
+            if (p.id == id) {
+                try self.postTransaction(.{
+                    .day = self.today(),
+                    .amount = -p.monthlySalary(),
+                    .category = .severance,
+                    .note = p.name,
+                });
+                _ = self.people.orderedRemove(i);
+                return;
+            }
+        }
+        return error.UnknownPerson;
+    }
+
+    /// The only way money moves: a ledger entry and the balance, in lockstep.
+    pub fn postTransaction(self: *Company, txn: Transaction) Error!void {
+        try self.ledger.post(self.allocator(), txn);
+        self.funds += txn.amount;
+    }
+
+    pub fn monthlyPayroll(self: *Company) CBills {
+        var total: CBills = 0;
+        for (self.people.items) |p| total += p.monthlySalary();
+        return total;
+    }
+
+    pub fn runPayroll(self: *Company) Error!void {
+        const payroll = self.monthlyPayroll();
+        if (payroll == 0) return;
+        try self.postTransaction(.{
+            .day = self.today(),
+            .amount = -payroll,
+            .category = .payroll,
+            .note = "monthly payroll",
+        });
+    }
+};
+
+pub const Command = union(enum) {
+    hire: struct { name: []const u8, role: Role },
+    fire: PersonId,
+};
+
+pub const Result = union(enum) {
+    hired: PersonId,
+    fired,
+};
+
+pub fn execute(co: *Company, cmd: Command) Error!Result {
+    switch (cmd) {
+        .hire =&gt; |h| return .{ .hired = try co.hire(h.name, h.role) },
+        .fire =&gt; |id| {
+            try co.fire(id);
+            return .fired;
+        },
+    }
+}
+
+test "payroll is the sum of salaries and posts one transaction" {
+    var co = Company.init(std.testing.allocator, .{ .funds = 10_000 });
+    defer co.deinit();
+    _ = try execute(&amp;co, .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } });
+    _ = try execute(&amp;co, .{ .hire = .{ .name = "Clay", .role = .tech } });
+    try std.testing.expectEqual(@as(CBills, 2_300), co.monthlyPayroll());
+    try co.runPayroll();
+    try std.testing.expectEqual(@as(CBills, 7_700), co.funds);
+    try std.testing.expectEqual(@as(usize, 1), co.ledger.transactions.items.len);
+    try std.testing.expectEqual(@as(CBills, -2_300), co.ledger.sumCategory(.payroll));
+}
+
+test "firing posts severance" {
+    var co = Company.init(std.testing.allocator, .{ .funds = 10_000 });
+    defer co.deinit();
+    const r = try execute(&amp;co, .{ .hire = .{ .name = "Lori", .role = .mekwarrior } });
+    _ = try execute(&amp;co, .{ .fire = r.hired });
+    try std.testing.expectEqual(@as(CBills, 8_500), co.funds);
+    try std.testing.expectEqual(@as(CBills, -1_500), co.ledger.sumCategory(.severance));
+}
+
+test "the ledger and the balance never disagree" {
+    var co = Company.init(std.testing.allocator, .{ .funds = 10_000 });
+    defer co.deinit();
+    _ = try execute(&amp;co, .{ .hire = .{ .name = "A", .role = .admin } });
+    try co.runPayroll();
+    try co.postTransaction(.{ .day = 0, .amount = 4_000, .category = .contract, .note = "advance" });
+    try co.runPayroll();
+    try std.testing.expectEqual(co.funds, co.starting_funds + co.ledger.balance());
+}</code></pre>
+</details>
+<pre class="term">$ zig test ex3_ledger.zig
+All 3 tests passed.</pre>
+<p>In the game this is <code>GameState.postTreasury</code> in <code>src/sim/state.zig</code> and the <code>Ledger</code> in <code>src/econ/finance.zig</code>. The real <code>Transaction</code> also carries which company, HQ and contract it belongs to, so that every report in the game (per-company profit, contract pay received, the campaign summary) is a filter over the same list.</p>
+
+<h3 id="ch38-5">38.5 Stage 4: the daily tick</h3>
+<p>Time moves in one place. Add the <code>Date</code> struct from <a href="#ch34">Chapter 34</a> and a <code>Clock</code> that carries both the civil date and the integer <code>day_index</code>. Replace the company's bare <code>day</code> field with the clock, add an <code>advance_days</code> command, and write <code>advanceDay</code>, the function that does everything one day involves. For now that is: advance the clock, and if it is the first of the month, run payroll.</p>
+<pre><code>/// One campaign day, in a fixed order of phases.
+pub fn advanceDay(co: *Company) Error!void {
+    co.clock.advance();
+    if (co.clock.date.isPayday()) try co.runPayroll();
+}</code></pre>
+<p>Small as it is, this function is the most important shape in the whole program. Every future rule (supply consumption, maintenance, contract events, battles) is one more line in <code>advanceDay</code>, in a fixed order, and the order is part of the specification. The game's <code>advanceDay</code> in <code>src/sim/tick.zig</code> has about fifteen phases, each a function taking <code>*GameState</code>, and its <code>DayPhase</code> enum documents the order.</p>
+<p>The tests count paydays: 31 days from January 1st is exactly one; 365 days is exactly twelve; and the company's start date is a payday that does <em>not</em> pay, because payroll runs after the clock advances. That last point is the kind of off-by-one a test settles once and for all.</p>
+<details class="answer"><summary>Stage 4 solution: exercises/38-capstone/solutions/ex4_tick.zig</summary>
+<pre><code>//! Chapter 38, stage 4: the daily tick and payday.
+//! Run with:  zig test ex4_tick.zig
+//! Goal: add Date and Clock, an `advance_days` command, and `advanceDay`,
+//! which runs payroll on the first of every month.
+
+const std = @import("std");
+
+/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points: 10_000 bp is x1.0.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+pub const PersonId = enum(u32) { none = 0, _ };
+
+pub const Role = enum {
+    mekwarrior,
+    tech,
+    medic,
+    admin,
+
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+};
+
+pub const Person = struct {
+    id: PersonId,
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+    morale: i8 = 0,
+
+    pub fn monthlySalary(self: Person) CBills {
+        const bp: Bp = 10_000 + @as(Bp, self.morale) * 200;
+        return applyBp(self.role.baseSalary(), bp);
+    }
+};
+
+pub const Category = enum { payroll, severance, contract, event };
+
+pub const Transaction = struct {
+    day: u32,
+    amount: CBills, // income +, expense -
+    category: Category,
+    note: []const u8 = "",
+};
+
+pub const Ledger = struct {
+    transactions: std.ArrayList(Transaction) = .empty,
+
+    pub fn post(self: *Ledger, alloc: std.mem.Allocator, txn: Transaction) !void {
+        try self.transactions.append(alloc, txn);
+    }
+
+    /// Sum of every transaction: what the ledger says we have gained or lost.
+    pub fn balance(self: Ledger) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| total += t.amount;
+        return total;
+    }
+
+    pub fn sumCategory(self: Ledger, cat: Category) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| if (t.category == cat) {
+            total += t.amount;
+        };
+        return total;
+    }
+};
+
+/// Proleptic Gregorian date, as the game uses in 3025.
+pub const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+
+    pub const campaign_start: Date = .{ .year = 3025, .month = 1, .day = 1 };
+
+    pub fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    pub fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+            4, 6, 9, 11 =&gt; 30,
+            2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+            else =&gt; unreachable,
+        };
+    }
+
+    pub fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+
+    pub fn isPayday(self: Date) bool {
+        return self.day == 1;
+    }
+};
+
+pub const Clock = struct {
+    date: Date = Date.campaign_start,
+    day_index: u32 = 0,
+
+    pub fn advance(self: *Clock) void {
+        self.date = self.date.next();
+        self.day_index += 1;
+    }
+};
+
+pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
+
+pub const Company = struct {
+    arena: std.heap.ArenaAllocator,
+    people: std.ArrayList(Person) = .empty,
+    next_id: u32 = 1,
+    funds: CBills,
+    starting_funds: CBills,
+    ledger: Ledger = .{},
+    clock: Clock = .{},
+
+    pub const Options = struct {
+        funds: CBills = 50_000,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) Company {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .funds = opts.funds,
+            .starting_funds = opts.funds,
+        };
+    }
+
+    pub fn deinit(self: *Company) void {
+        self.arena.deinit();
+    }
+
+    /// Every allocation the company makes comes from here and dies in deinit.
+    pub fn allocator(self: *Company) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn find(self: *Company, id: PersonId) ?*Person {
+        for (self.people.items) |*p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn today(self: *Company) u32 {
+        return self.clock.day_index;
+    }
+
+    pub fn hire(self: *Company, name: []const u8, role: Role) Error!PersonId {
+        if (name.len == 0) return error.EmptyName;
+        const id: PersonId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        const owned = try self.allocator().dupe(u8, name);
+        try self.people.append(self.allocator(), .{
+            .id = id,
+            .name = owned,
+            .role = role,
+            .hired_day = self.today(),
+        });
+        return id;
+    }
+
+    pub fn fire(self: *Company, id: PersonId) Error!void {
+        for (self.people.items, 0..) |p, i| {
+            if (p.id == id) {
+                try self.postTransaction(.{
+                    .day = self.today(),
+                    .amount = -p.monthlySalary(),
+                    .category = .severance,
+                    .note = p.name,
+                });
+                _ = self.people.orderedRemove(i);
+                return;
+            }
+        }
+        return error.UnknownPerson;
+    }
+
+    /// The only way money moves: a ledger entry and the balance, in lockstep.
+    pub fn postTransaction(self: *Company, txn: Transaction) Error!void {
+        try self.ledger.post(self.allocator(), txn);
+        self.funds += txn.amount;
+    }
+
+    pub fn monthlyPayroll(self: *Company) CBills {
+        var total: CBills = 0;
+        for (self.people.items) |p| total += p.monthlySalary();
+        return total;
+    }
+
+    pub fn runPayroll(self: *Company) Error!void {
+        const payroll = self.monthlyPayroll();
+        if (payroll == 0) return;
+        try self.postTransaction(.{
+            .day = self.today(),
+            .amount = -payroll,
+            .category = .payroll,
+            .note = "monthly payroll",
+        });
+    }
+};
+
+pub const Command = union(enum) {
+    hire: struct { name: []const u8, role: Role },
+    fire: PersonId,
+    advance_days: u32,
+};
+
+pub const Result = union(enum) {
+    hired: PersonId,
+    fired,
+    advanced: u32,
+};
+
+pub fn execute(co: *Company, cmd: Command) Error!Result {
+    switch (cmd) {
+        .hire =&gt; |h| return .{ .hired = try co.hire(h.name, h.role) },
+        .fire =&gt; |id| {
+            try co.fire(id);
+            return .fired;
+        },
+        .advance_days =&gt; |n| {
+            for (0..n) |_| try advanceDay(co);
+            return .{ .advanced = n };
+        },
+    }
+}
+
+/// One campaign day, in a fixed order of phases.
+pub fn advanceDay(co: *Company) Error!void {
+    co.clock.advance();
+    if (co.clock.date.isPayday()) try co.runPayroll();
+}
+
+test "31 days from January 1st crosses exactly one payday" {
+    var co = Company.init(std.testing.allocator, .{ .funds = 10_000 });
+    defer co.deinit();
+    _ = try execute(&amp;co, .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } });
+    const r = try execute(&amp;co, .{ .advance_days = 31 });
+    try std.testing.expectEqual(@as(u32, 31), r.advanced);
+    try std.testing.expectEqual(Date{ .year = 3025, .month = 2, .day = 1 }, co.clock.date);
+    try std.testing.expectEqual(@as(CBills, 8_500), co.funds);
+    try std.testing.expectEqual(@as(u32, 31), co.ledger.transactions.items[0].day);
+}
+
+test "a year has twelve paydays" {
+    var co = Company.init(std.testing.allocator, .{ .funds = 100_000 });
+    defer co.deinit();
+    _ = try execute(&amp;co, .{ .hire = .{ .name = "Clay", .role = .tech } });
+    _ = try execute(&amp;co, .{ .advance_days = 365 });
+    try std.testing.expectEqual(Date{ .year = 3026, .month = 1, .day = 1 }, co.clock.date);
+    try std.testing.expectEqual(@as(usize, 12), co.ledger.transactions.items.len);
+    try std.testing.expectEqual(@as(CBills, 100_000 - 12 * 800), co.funds);
+}
+
+test "hired_day records the clock" {
+    var co = Company.init(std.testing.allocator, .{});
+    defer co.deinit();
+    _ = try execute(&amp;co, .{ .advance_days = 10 });
+    const r = try execute(&amp;co, .{ .hire = .{ .name = "Lori", .role = .mekwarrior } });
+    try std.testing.expectEqual(@as(u32, 10), co.find(r.hired).?.hired_day);
+}</code></pre>
+</details>
+<pre class="term">$ zig test ex4_tick.zig
+All 3 tests passed.</pre>
+
+<h3 id="ch38-6">38.6 Stage 5: dice, and the golden master</h3>
+<p>Now the simulation gets a random element, and with it the discipline that keeps randomness from ruining testability. The company gets a seed in its <code>Options</code>, an <code>Rng</code> with named streams (the miniature you built in Exercise 34.5), and a log. <code>advanceDay</code> gains an events phase before finances:</p>
+<pre><code>/// One campaign day, in a fixed order of phases: events, then finances.
+pub fn advanceDay(co: *Company) Error!void {
+    co.clock.advance();
+    try runEvents(co);
+    if (co.clock.date.isPayday()) try co.runPayroll();
+}
+
+/// The morale event: 2d6 on the events stream every day. Snake eyes and
+/// boxcars are the only rolls that do anything, so most days are quiet.
+fn runEvents(co: *Company) Error!void {
+    const roll = co.rng.roll2d6(.events);
+    switch (roll) {
+        2 =&gt; {
+            for (co.people.items) |*p| p.morale = @max(p.morale - 1, -10);
+            try co.logf("day {d}: grumbling in the barracks (rolled 2), morale -1", .{co.clock.day_index});
+        },
+        12 =&gt; {
+            for (co.people.items) |*p| p.morale = @min(p.morale + 1, 10);
+            try co.logf("day {d}: a good day (rolled 12), morale +1", .{co.clock.day_index});
+        },
+        else =&gt; {},
+    }
+}</code></pre>
+<p>Every day rolls 2d6 on the <code>.events</code> stream. A 2 lowers everyone's morale by a point, a 12 raises it, anything else is a quiet day, so roughly one day in eighteen something happens. Morale is clamped with <code>@max</code> and <code>@min</code>. The log is a list of strings in the arena, built with <code>allocPrint</code>.</p>
+<p>Then the test that makes the whole design pay off. A <code>hash</code> method folds the state that matters (the day, the funds, every person's ID, name, morale and hire date, and the number of transactions) into one 64-bit number with <code>std.hash.Wyhash</code>:</p>
+<pre><code>/// A 64-bit fingerprint of everything that matters. Two companies with
+/// the same seed and the same commands must produce the same hash.
+pub fn hash(self: *Company) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.asBytes(&amp;self.clock.day_index));
+    h.update(std.mem.asBytes(&amp;self.funds));
+    for (self.people.items) |p| {
+        h.update(std.mem.asBytes(&amp;p.id));
+        h.update(p.name);
+        h.update(std.mem.asBytes(&amp;p.morale));
+        h.update(std.mem.asBytes(&amp;p.hired_day));
+    }
+    const n: u64 = self.ledger.transactions.items.len;
+    h.update(std.mem.asBytes(&amp;n));
+    return h.final();
+}</code></pre>
+<p>And the golden master runs the same six commands on two fresh companies with the same seed and demands the same hash. It is a near-verbatim copy of the game's test in <code>src/sim/commands.zig</code>.</p>
+<pre><code>test "golden master: same seed + same script = same hash" {
+    const script = [_]Command{
+        .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } },
+        .{ .hire = .{ .name = "Lori", .role = .mekwarrior } },
+        .{ .hire = .{ .name = "Clay", .role = .tech } },
+        .{ .advance_days = 45 },
+        .{ .fire = @enumFromInt(2) },
+        .{ .advance_days = 45 },
+    };
+    var hashes: [2]u64 = undefined;
+    for (&amp;hashes) |*out| {
+        var co = Company.init(std.testing.allocator, .{ .seed = 42 });
+        defer co.deinit();
+        for (script) |cmd| _ = try execute(&amp;co, cmd);
+        out.* = co.hash();
+    }
+    try std.testing.expectEqual(hashes[0], hashes[1]);
+}</code></pre>
+<p>What this test catches: any read of the real clock, any use of an OS-seeded generator, any iteration over an unordered hash map, any thread, any uninitialised memory that leaks into the state. What it costs: a few microseconds per build. Two companion tests check that a different seed gives a different history (so the hash is not trivially constant) and that morale stays in range over two thousand days.</p>
+<details class="answer"><summary>Stage 5 solution: exercises/38-capstone/solutions/ex5_events.zig</summary>
+<pre><code>//! Chapter 38, stage 5: a seeded RNG and a 2d6 morale event.
+//! Run with:  zig test ex5_events.zig
+//! Goal: add a named-stream Rng seeded from Options, an events phase in
+//! advanceDay that rolls 2d6 for morale, a log, and a `hash` for the
+//! golden-master test.
+
+const std = @import("std");
+
+/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points: 10_000 bp is x1.0.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+pub const PersonId = enum(u32) { none = 0, _ };
+
+pub const Role = enum {
+    mekwarrior,
+    tech,
+    medic,
+    admin,
+
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+};
+
+pub const Person = struct {
+    id: PersonId,
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+    morale: i8 = 0,
+
+    pub fn monthlySalary(self: Person) CBills {
+        const bp: Bp = 10_000 + @as(Bp, self.morale) * 200;
+        return applyBp(self.role.baseSalary(), bp);
+    }
+};
+
+pub const Category = enum { payroll, severance, contract, event };
+
+pub const Transaction = struct {
+    day: u32,
+    amount: CBills, // income +, expense -
+    category: Category,
+    note: []const u8 = "",
+};
+
+pub const Ledger = struct {
+    transactions: std.ArrayList(Transaction) = .empty,
+
+    pub fn post(self: *Ledger, alloc: std.mem.Allocator, txn: Transaction) !void {
+        try self.transactions.append(alloc, txn);
+    }
+
+    /// Sum of every transaction: what the ledger says we have gained or lost.
+    pub fn balance(self: Ledger) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| total += t.amount;
+        return total;
+    }
+
+    pub fn sumCategory(self: Ledger, cat: Category) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| if (t.category == cat) {
+            total += t.amount;
+        };
+        return total;
+    }
+};
+
+/// Proleptic Gregorian date, as the game uses in 3025.
+pub const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+
+    pub const campaign_start: Date = .{ .year = 3025, .month = 1, .day = 1 };
+
+    pub fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    pub fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+            4, 6, 9, 11 =&gt; 30,
+            2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+            else =&gt; unreachable,
+        };
+    }
+
+    pub fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+
+    pub fn isPayday(self: Date) bool {
+        return self.day == 1;
+    }
+};
+
+pub const Clock = struct {
+    date: Date = Date.campaign_start,
+    day_index: u32 = 0,
+
+    pub fn advance(self: *Clock) void {
+        self.date = self.date.next();
+        self.day_index += 1;
+    }
+};
+
+pub const Stream = enum(u8) {
+    events,
+    market,
+
+    const count = @typeInfo(Stream).@"enum".fields.len;
+};
+
+/// One generator per subsystem, all derived from a single seed.
+pub const Rng = struct {
+    prngs: [Stream.count]std.Random.DefaultPrng,
+
+    pub fn init(seed: u64) Rng {
+        var self: Rng = undefined;
+        for (&amp;self.prngs, 0..) |*prng, i| {
+            prng.* = std.Random.DefaultPrng.init(seed ^ (0x9E3779B97F4A7C15 *% (i + 1)));
+        }
+        return self;
+    }
+
+    pub fn roll2d6(self: *Rng, stream: Stream) u8 {
+        const r = self.prngs[@intFromEnum(stream)].random();
+        return r.intRangeAtMost(u8, 1, 6) + r.intRangeAtMost(u8, 1, 6);
+    }
+};
+
+pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
+
+pub const Company = struct {
+    arena: std.heap.ArenaAllocator,
+    people: std.ArrayList(Person) = .empty,
+    next_id: u32 = 1,
+    funds: CBills,
+    starting_funds: CBills,
+    ledger: Ledger = .{},
+    clock: Clock = .{},
+    seed: u64,
+    rng: Rng,
+    log: std.ArrayList([]const u8) = .empty,
+
+    pub const Options = struct {
+        funds: CBills = 50_000,
+        seed: u64 = 3025,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) Company {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .funds = opts.funds,
+            .starting_funds = opts.funds,
+            .seed = opts.seed,
+            .rng = Rng.init(opts.seed),
+        };
+    }
+
+    pub fn deinit(self: *Company) void {
+        self.arena.deinit();
+    }
+
+    /// Every allocation the company makes comes from here and dies in deinit.
+    pub fn allocator(self: *Company) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn find(self: *Company, id: PersonId) ?*Person {
+        for (self.people.items) |*p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn today(self: *Company) u32 {
+        return self.clock.day_index;
+    }
+
+    pub fn hire(self: *Company, name: []const u8, role: Role) Error!PersonId {
+        if (name.len == 0) return error.EmptyName;
+        const id: PersonId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        const owned = try self.allocator().dupe(u8, name);
+        try self.people.append(self.allocator(), .{
+            .id = id,
+            .name = owned,
+            .role = role,
+            .hired_day = self.today(),
+        });
+        return id;
+    }
+
+    pub fn fire(self: *Company, id: PersonId) Error!void {
+        for (self.people.items, 0..) |p, i| {
+            if (p.id == id) {
+                try self.postTransaction(.{
+                    .day = self.today(),
+                    .amount = -p.monthlySalary(),
+                    .category = .severance,
+                    .note = p.name,
+                });
+                _ = self.people.orderedRemove(i);
+                return;
+            }
+        }
+        return error.UnknownPerson;
+    }
+
+    /// The only way money moves: a ledger entry and the balance, in lockstep.
+    pub fn postTransaction(self: *Company, txn: Transaction) Error!void {
+        try self.ledger.post(self.allocator(), txn);
+        self.funds += txn.amount;
+    }
+
+    pub fn monthlyPayroll(self: *Company) CBills {
+        var total: CBills = 0;
+        for (self.people.items) |p| total += p.monthlySalary();
+        return total;
+    }
+
+    pub fn runPayroll(self: *Company) Error!void {
+        const payroll = self.monthlyPayroll();
+        if (payroll == 0) return;
+        try self.postTransaction(.{
+            .day = self.today(),
+            .amount = -payroll,
+            .category = .payroll,
+            .note = "monthly payroll",
+        });
+    }
+
+    pub fn logf(self: *Company, comptime fmt: []const u8, args: anytype) Error!void {
+        const line = try std.fmt.allocPrint(self.allocator(), fmt, args);
+        try self.log.append(self.allocator(), line);
+    }
+
+    /// A 64-bit fingerprint of everything that matters. Two companies with
+    /// the same seed and the same commands must produce the same hash.
+    pub fn hash(self: *Company) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&amp;self.clock.day_index));
+        h.update(std.mem.asBytes(&amp;self.funds));
+        for (self.people.items) |p| {
+            h.update(std.mem.asBytes(&amp;p.id));
+            h.update(p.name);
+            h.update(std.mem.asBytes(&amp;p.morale));
+            h.update(std.mem.asBytes(&amp;p.hired_day));
+        }
+        const n: u64 = self.ledger.transactions.items.len;
+        h.update(std.mem.asBytes(&amp;n));
+        return h.final();
+    }
+};
+
+pub const Command = union(enum) {
+    hire: struct { name: []const u8, role: Role },
+    fire: PersonId,
+    advance_days: u32,
+};
+
+pub const Result = union(enum) {
+    hired: PersonId,
+    fired,
+    advanced: u32,
+};
+
+pub fn execute(co: *Company, cmd: Command) Error!Result {
+    switch (cmd) {
+        .hire =&gt; |h| return .{ .hired = try co.hire(h.name, h.role) },
+        .fire =&gt; |id| {
+            try co.fire(id);
+            return .fired;
+        },
+        .advance_days =&gt; |n| {
+            for (0..n) |_| try advanceDay(co);
+            return .{ .advanced = n };
+        },
+    }
+}
+
+/// One campaign day, in a fixed order of phases: events, then finances.
+pub fn advanceDay(co: *Company) Error!void {
+    co.clock.advance();
+    try runEvents(co);
+    if (co.clock.date.isPayday()) try co.runPayroll();
+}
+
+/// The morale event: 2d6 on the events stream every day. Snake eyes and
+/// boxcars are the only rolls that do anything, so most days are quiet.
+fn runEvents(co: *Company) Error!void {
+    const roll = co.rng.roll2d6(.events);
+    switch (roll) {
+        2 =&gt; {
+            for (co.people.items) |*p| p.morale = @max(p.morale - 1, -10);
+            try co.logf("day {d}: grumbling in the barracks (rolled 2), morale -1", .{co.clock.day_index});
+        },
+        12 =&gt; {
+            for (co.people.items) |*p| p.morale = @min(p.morale + 1, 10);
+            try co.logf("day {d}: a good day (rolled 12), morale +1", .{co.clock.day_index});
+        },
+        else =&gt; {},
+    }
+}
+
+test "golden master: same seed + same script = same hash" {
+    const script = [_]Command{
+        .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } },
+        .{ .hire = .{ .name = "Lori", .role = .mekwarrior } },
+        .{ .hire = .{ .name = "Clay", .role = .tech } },
+        .{ .advance_days = 45 },
+        .{ .fire = @enumFromInt(2) },
+        .{ .advance_days = 45 },
+    };
+    var hashes: [2]u64 = undefined;
+    for (&amp;hashes) |*out| {
+        var co = Company.init(std.testing.allocator, .{ .seed = 42 });
+        defer co.deinit();
+        for (script) |cmd| _ = try execute(&amp;co, cmd);
+        out.* = co.hash();
+    }
+    try std.testing.expectEqual(hashes[0], hashes[1]);
+}
+
+test "a different seed gives a different history" {
+    var a = Company.init(std.testing.allocator, .{ .seed = 1 });
+    defer a.deinit();
+    var b = Company.init(std.testing.allocator, .{ .seed = 2 });
+    defer b.deinit();
+    for ([_]*Company{ &amp;a, &amp;b }) |co| {
+        _ = try execute(co, .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } });
+        _ = try execute(co, .{ .advance_days = 400 });
+    }
+    try std.testing.expect(a.hash() != b.hash());
+    try std.testing.expect(a.log.items.len &gt; 0);
+}
+
+test "morale stays within -10..10 and moves pay" {
+    var co = Company.init(std.testing.allocator, .{ .seed = 7, .funds = 1_000_000 });
+    defer co.deinit();
+    const r = try execute(&amp;co, .{ .hire = .{ .name = "Clay", .role = .tech } });
+    _ = try execute(&amp;co, .{ .advance_days = 2000 });
+    const p = co.find(r.hired).?;
+    try std.testing.expect(p.morale &gt;= -10 and p.morale &lt;= 10);
+    const expected = applyBp(800, 10_000 + @as(Bp, p.morale) * 200);
+    try std.testing.expectEqual(expected, p.monthlySalary());
+}</code></pre>
+</details>
+<pre class="term">$ zig test ex5_events.zig
+All 3 tests passed.</pre>
+
+<h3 id="ch38-7">38.7 Stage 6: the edge</h3>
+<p>Everything so far is pure. The last stage adds the parts that touch the world, and keeps them below a line in the file that says so:</p>
+<pre><code>// ---------------------------------------------------------------------
+// Everything above this line is the pure core: no io, no stdin, no files.
+// Everything below is the edge: parsing text, printing, saving, loading.
+// ---------------------------------------------------------------------
+
+const ParseError = error{ UnknownVerb, MissingArgument, BadNumber, BadRole };
+
+const ReplCommand = union(enum) {
+    sim: Command,
+    people,
+    ledger,
+    log,
+    save: []const u8,
+    load: []const u8,
+    quit,
+};</code></pre>
+<p>There are two kinds of command now. <code>Command</code> from the core (<code>hire</code>, <code>fire</code>, <code>advance_days</code>) changes the simulation. <code>ReplCommand</code> wraps it and adds the verbs that belong only to the interactive session: printing the roster, the ledger or the log, saving, loading, quitting. Keeping them separate means the core never learns what "save" is, which is exactly right: saving is a property of this front end, not of the company.</p>
+<p><strong>Parsing.</strong> <code>parseLine</code> tokenises on spaces, matches the verb, and converts arguments with <code>std.meta.stringToEnum</code> (for roles) and <code>std.fmt.parseInt</code> (for numbers). Each failure is a named error, and the REPL prints the error's name. Note that the <code>hire</code> variant holds a slice into the line buffer; that is fine, because <code>execute</code> copies the name into the arena immediately, and the buffer is only reused on the next iteration.</p>
+<pre><code>fn parseLine(line: []const u8) ParseError!ReplCommand {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const verb = it.next() orelse return error.UnknownVerb;
+    if (std.mem.eql(u8, verb, "hire")) {
+        const name = it.next() orelse return error.MissingArgument;
+        const role_text = it.next() orelse return error.MissingArgument;
+        const role = std.meta.stringToEnum(Role, role_text) orelse return error.BadRole;
+        return .{ .sim = .{ .hire = .{ .name = name, .role = role } } };
+    } else if (std.mem.eql(u8, verb, "fire")) {
+        const id_text = it.next() orelse return error.MissingArgument;
+        const id = std.fmt.parseInt(u32, id_text, 10) catch return error.BadNumber;
+        return .{ .sim = .{ .fire = @enumFromInt(id) } };
+    } else if (std.mem.eql(u8, verb, "advance")) {
+        const n_text = it.next() orelse return error.MissingArgument;
+        const n = std.fmt.parseInt(u32, n_text, 10) catch return error.BadNumber;
+        return .{ .sim = .{ .advance_days = n } };
+    } else if (std.mem.eql(u8, verb, "people")) {
+        return .people;
+    } else if (std.mem.eql(u8, verb, "ledger")) {
+        return .ledger;
+    } else if (std.mem.eql(u8, verb, "log")) {
+        return .log;
+    } else if (std.mem.eql(u8, verb, "save")) {
+        return .{ .save = it.next() orelse return error.MissingArgument };
+    } else if (std.mem.eql(u8, verb, "load")) {
+        return .{ .load = it.next() orelse return error.MissingArgument };
+    } else if (std.mem.eql(u8, verb, "quit")) {
+        return .quit;
+    }
+    return error.UnknownVerb;
+}</code></pre>
+<p><strong>The loop.</strong> <code>main</code> owns the <code>io</code>, the allocator, a buffered stdout writer and a buffered stdin reader (<a href="#ch32">Chapter 32</a>). It reads a line with <code>takeDelimiter('\n')</code>, which returns <code>null</code> at end of input so a piped script ends cleanly, trims it, parses, executes, prints. Every branch that can fail prints and <code>continue</code>s; nothing a user types can crash the program.</p>
+<pre><code>pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &amp;out_buf);
+    const out = &amp;stdout.interface;
+    var in_buf: [1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(io, &amp;in_buf);
+
+    var co = Company.init(gpa, .{});
+    defer co.deinit();
+
+    while (true) {
+        try out.flush();
+        const raw = try stdin.interface.takeDelimiter('\n') orelse break;
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const cmd = parseLine(line) catch |e| {
+            try out.print("&gt; error: {s}\n", .{@errorName(e)});
+            continue;
+        };
+        switch (cmd) {
+            .sim =&gt; |c| {
+                const result = execute(&amp;co, c) catch |e| {
+                    try out.print("&gt; error: {s}\n", .{@errorName(e)});
+                    continue;
+                };</code></pre>
+<p><strong>Saving and loading.</strong> The save format is deliberately boring: one record per line, fields separated by spaces, the free-text note last so it may contain spaces. It saves the seed, the clock, the funds, the ID counter, the four words of state inside each random stream, every person, every transaction and every log line. <code>save</code> takes an <code>io</code> and a <code>*Company</code> and writes with a buffered file writer (<a href="#ch33">Chapter 33</a>). <code>load</code> reads the whole file with <code>readFileAlloc</code>, splits it into lines, and rebuilds a company record by record, with <code>errdefer co.deinit()</code> so a malformed file does not leak the half-built arena.</p>
+<pre><code>fn save(io: std.Io, co: *Company, path: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &amp;buf);
+    const w = &amp;fw.interface;
+    try w.print("smallledger 1\n", .{});
+    try w.print("seed {d}\n", .{co.seed});
+    try w.print("clock {d} {d} {d} {d}\n", .{ co.clock.day_index, co.clock.date.year, co.clock.date.month, co.clock.date.day });
+    try w.print("funds {d} {d} {d}\n", .{ co.funds, co.starting_funds, co.next_id });
+    for (co.rng.prngs, 0..) |prng, i| {
+        try w.print("rng {d} {d} {d} {d} {d}\n", .{ i, prng.s[0], prng.s[1], prng.s[2], prng.s[3] });
+    }
+    for (co.people.items) |p| {
+        try w.print("person {d} {s} {s} {d} {d}\n", .{ @intFromEnum(p.id), p.name, @tagName(p.role), p.hired_day, p.morale });
+    }
+    for (co.ledger.transactions.items) |t| {
+        try w.print("txn {d} {d} {s} {s}\n", .{ t.day, t.amount, @tagName(t.category), t.note });
+    }
+    for (co.log.items) |line| try w.print("log {s}\n", .{line});
+    try w.flush();
+}
+
+const LoadError = error{ BadFormat, OutOfMemory };</code></pre>
+<p>Saving the random streams' internal state (<code>prng.s</code>, four <code>u64</code>s each) is what makes a loaded game continue <em>identically</em> to the unsaved one, and the file's test proves it: save, load, advance both companies a hundred days, compare hashes. In the REPL, <code>load</code> replaces the running company, so its <code>deinit</code> is called first:</p>
+<pre><code>            .load =&gt; |path| {
+                const loaded = load(io, gpa, path) catch |e| {
+                    try out.print("&gt; load failed: {s}\n", .{@errorName(e)});
+                    continue;
+                };
+                co.deinit();
+                co = loaded;
+                try out.print("&gt; loaded {s}: day {d}, {d} people, funds {d}\n", .{ path, co.clock.day_index, co.people.items.len, co.funds });
+            },
+            .quit =&gt; break,
+        }
+    }
+    try out.print("&gt; bye\n", .{});
+    try out.flush();
+}</code></pre>
+<details class="answer"><summary>Stage 6 solution: exercises/38-capstone/solutions/ex6_repl.zig</summary>
+<pre><code>//! Chapter 38, stage 6: the REPL, with save and load.
+//! Run with:  printf 'hire Grayson mekwarrior\nhire Clay tech\nadvance 31\nledger\nsave ledger.sav\nquit\n' | zig run ex6_repl.zig
+//! Goal: read commands from stdin, run them through the pure core, print
+//! results, and persist the whole company to a text file with std.Io.
+//! Verbs: hire NAME ROLE, fire ID, advance N, people, ledger, log,
+//! save FILE, load FILE, quit. Expected output for the command above:
+//!   &gt; hired Grayson as mekwarrior (id 1)
+//!   &gt; hired Clay as tech (id 2)
+//!   &gt; advanced 31 days to 3025-02-01, funds 47746
+//!   &gt; day 31  -2254  payroll  monthly payroll
+//!   balance 47746
+//!   &gt; saved ledger.sav
+//!   &gt; bye
+
+const std = @import("std");
+
+/// All money is integer C-bills. No floats in the ledger, ever.
+pub const CBills = i64;
+
+/// Basis points: 10_000 bp is x1.0.
+pub const Bp = i64;
+
+pub fn applyBp(amount: CBills, bp: Bp) CBills {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+pub const PersonId = enum(u32) { none = 0, _ };
+
+pub const Role = enum {
+    mekwarrior,
+    tech,
+    medic,
+    admin,
+
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+};
+
+pub const Person = struct {
+    id: PersonId,
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+    morale: i8 = 0,
+
+    pub fn monthlySalary(self: Person) CBills {
+        const bp: Bp = 10_000 + @as(Bp, self.morale) * 200;
+        return applyBp(self.role.baseSalary(), bp);
+    }
+};
+
+pub const Category = enum { payroll, severance, contract, event };
+
+pub const Transaction = struct {
+    day: u32,
+    amount: CBills, // income +, expense -
+    category: Category,
+    note: []const u8 = "",
+};
+
+pub const Ledger = struct {
+    transactions: std.ArrayList(Transaction) = .empty,
+
+    pub fn post(self: *Ledger, alloc: std.mem.Allocator, txn: Transaction) !void {
+        try self.transactions.append(alloc, txn);
+    }
+
+    /// Sum of every transaction: what the ledger says we have gained or lost.
+    pub fn balance(self: Ledger) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| total += t.amount;
+        return total;
+    }
+
+    pub fn sumCategory(self: Ledger, cat: Category) CBills {
+        var total: CBills = 0;
+        for (self.transactions.items) |t| if (t.category == cat) {
+            total += t.amount;
+        };
+        return total;
+    }
+};
+
+/// Proleptic Gregorian date, as the game uses in 3025.
+pub const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+
+    pub const campaign_start: Date = .{ .year = 3025, .month = 1, .day = 1 };
+
+    pub fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    pub fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+            4, 6, 9, 11 =&gt; 30,
+            2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+            else =&gt; unreachable,
+        };
+    }
+
+    pub fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+
+    pub fn isPayday(self: Date) bool {
+        return self.day == 1;
+    }
+};
+
+pub const Clock = struct {
+    date: Date = Date.campaign_start,
+    day_index: u32 = 0,
+
+    pub fn advance(self: *Clock) void {
+        self.date = self.date.next();
+        self.day_index += 1;
+    }
+};
+
+pub const Stream = enum(u8) {
+    events,
+    market,
+
+    const count = @typeInfo(Stream).@"enum".fields.len;
+};
+
+/// One generator per subsystem, all derived from a single seed.
+pub const Rng = struct {
+    prngs: [Stream.count]std.Random.DefaultPrng,
+
+    pub fn init(seed: u64) Rng {
+        var self: Rng = undefined;
+        for (&amp;self.prngs, 0..) |*prng, i| {
+            prng.* = std.Random.DefaultPrng.init(seed ^ (0x9E3779B97F4A7C15 *% (i + 1)));
+        }
+        return self;
+    }
+
+    pub fn roll2d6(self: *Rng, stream: Stream) u8 {
+        const r = self.prngs[@intFromEnum(stream)].random();
+        return r.intRangeAtMost(u8, 1, 6) + r.intRangeAtMost(u8, 1, 6);
+    }
+};
+
+pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
+
+pub const Company = struct {
+    arena: std.heap.ArenaAllocator,
+    people: std.ArrayList(Person) = .empty,
+    next_id: u32 = 1,
+    funds: CBills,
+    starting_funds: CBills,
+    ledger: Ledger = .{},
+    clock: Clock = .{},
+    seed: u64,
+    rng: Rng,
+    log: std.ArrayList([]const u8) = .empty,
+
+    pub const Options = struct {
+        funds: CBills = 50_000,
+        seed: u64 = 3025,
+    };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) Company {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .funds = opts.funds,
+            .starting_funds = opts.funds,
+            .seed = opts.seed,
+            .rng = Rng.init(opts.seed),
+        };
+    }
+
+    pub fn deinit(self: *Company) void {
+        self.arena.deinit();
+    }
+
+    /// Every allocation the company makes comes from here and dies in deinit.
+    pub fn allocator(self: *Company) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn find(self: *Company, id: PersonId) ?*Person {
+        for (self.people.items) |*p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn today(self: *Company) u32 {
+        return self.clock.day_index;
+    }
+
+    pub fn hire(self: *Company, name: []const u8, role: Role) Error!PersonId {
+        if (name.len == 0) return error.EmptyName;
+        const id: PersonId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        const owned = try self.allocator().dupe(u8, name);
+        try self.people.append(self.allocator(), .{
+            .id = id,
+            .name = owned,
+            .role = role,
+            .hired_day = self.today(),
+        });
+        return id;
+    }
+
+    pub fn fire(self: *Company, id: PersonId) Error!void {
+        for (self.people.items, 0..) |p, i| {
+            if (p.id == id) {
+                try self.postTransaction(.{
+                    .day = self.today(),
+                    .amount = -p.monthlySalary(),
+                    .category = .severance,
+                    .note = p.name,
+                });
+                _ = self.people.orderedRemove(i);
+                return;
+            }
+        }
+        return error.UnknownPerson;
+    }
+
+    /// The only way money moves: a ledger entry and the balance, in lockstep.
+    pub fn postTransaction(self: *Company, txn: Transaction) Error!void {
+        try self.ledger.post(self.allocator(), txn);
+        self.funds += txn.amount;
+    }
+
+    pub fn monthlyPayroll(self: *Company) CBills {
+        var total: CBills = 0;
+        for (self.people.items) |p| total += p.monthlySalary();
+        return total;
+    }
+
+    pub fn runPayroll(self: *Company) Error!void {
+        const payroll = self.monthlyPayroll();
+        if (payroll == 0) return;
+        try self.postTransaction(.{
+            .day = self.today(),
+            .amount = -payroll,
+            .category = .payroll,
+            .note = "monthly payroll",
+        });
+    }
+
+    pub fn logf(self: *Company, comptime fmt: []const u8, args: anytype) Error!void {
+        const line = try std.fmt.allocPrint(self.allocator(), fmt, args);
+        try self.log.append(self.allocator(), line);
+    }
+
+    /// A 64-bit fingerprint of everything that matters. Two companies with
+    /// the same seed and the same commands must produce the same hash.
+    pub fn hash(self: *Company) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&amp;self.clock.day_index));
+        h.update(std.mem.asBytes(&amp;self.funds));
+        for (self.people.items) |p| {
+            h.update(std.mem.asBytes(&amp;p.id));
+            h.update(p.name);
+            h.update(std.mem.asBytes(&amp;p.morale));
+            h.update(std.mem.asBytes(&amp;p.hired_day));
+        }
+        const n: u64 = self.ledger.transactions.items.len;
+        h.update(std.mem.asBytes(&amp;n));
+        return h.final();
+    }
+};
+
+pub const Command = union(enum) {
+    hire: struct { name: []const u8, role: Role },
+    fire: PersonId,
+    advance_days: u32,
+};
+
+pub const Result = union(enum) {
+    hired: PersonId,
+    fired,
+    advanced: u32,
+};
+
+pub fn execute(co: *Company, cmd: Command) Error!Result {
+    switch (cmd) {
+        .hire =&gt; |h| return .{ .hired = try co.hire(h.name, h.role) },
+        .fire =&gt; |id| {
+            try co.fire(id);
+            return .fired;
+        },
+        .advance_days =&gt; |n| {
+            for (0..n) |_| try advanceDay(co);
+            return .{ .advanced = n };
+        },
+    }
+}
+
+/// One campaign day, in a fixed order of phases: events, then finances.
+pub fn advanceDay(co: *Company) Error!void {
+    co.clock.advance();
+    try runEvents(co);
+    if (co.clock.date.isPayday()) try co.runPayroll();
+}
+
+/// The morale event: 2d6 on the events stream every day. Snake eyes and
+/// boxcars are the only rolls that do anything, so most days are quiet.
+fn runEvents(co: *Company) Error!void {
+    const roll = co.rng.roll2d6(.events);
+    switch (roll) {
+        2 =&gt; {
+            for (co.people.items) |*p| p.morale = @max(p.morale - 1, -10);
+            try co.logf("day {d}: grumbling in the barracks (rolled 2), morale -1", .{co.clock.day_index});
+        },
+        12 =&gt; {
+            for (co.people.items) |*p| p.morale = @min(p.morale + 1, 10);
+            try co.logf("day {d}: a good day (rolled 12), morale +1", .{co.clock.day_index});
+        },
+        else =&gt; {},
+    }
+}
+
+// ---------------------------------------------------------------------
+// Everything above this line is the pure core: no io, no stdin, no files.
+// Everything below is the edge: parsing text, printing, saving, loading.
+// ---------------------------------------------------------------------
+
+const ParseError = error{ UnknownVerb, MissingArgument, BadNumber, BadRole };
+
+const ReplCommand = union(enum) {
+    sim: Command,
+    people,
+    ledger,
+    log,
+    save: []const u8,
+    load: []const u8,
+    quit,
+};
+
+fn parseLine(line: []const u8) ParseError!ReplCommand {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const verb = it.next() orelse return error.UnknownVerb;
+    if (std.mem.eql(u8, verb, "hire")) {
+        const name = it.next() orelse return error.MissingArgument;
+        const role_text = it.next() orelse return error.MissingArgument;
+        const role = std.meta.stringToEnum(Role, role_text) orelse return error.BadRole;
+        return .{ .sim = .{ .hire = .{ .name = name, .role = role } } };
+    } else if (std.mem.eql(u8, verb, "fire")) {
+        const id_text = it.next() orelse return error.MissingArgument;
+        const id = std.fmt.parseInt(u32, id_text, 10) catch return error.BadNumber;
+        return .{ .sim = .{ .fire = @enumFromInt(id) } };
+    } else if (std.mem.eql(u8, verb, "advance")) {
+        const n_text = it.next() orelse return error.MissingArgument;
+        const n = std.fmt.parseInt(u32, n_text, 10) catch return error.BadNumber;
+        return .{ .sim = .{ .advance_days = n } };
+    } else if (std.mem.eql(u8, verb, "people")) {
+        return .people;
+    } else if (std.mem.eql(u8, verb, "ledger")) {
+        return .ledger;
+    } else if (std.mem.eql(u8, verb, "log")) {
+        return .log;
+    } else if (std.mem.eql(u8, verb, "save")) {
+        return .{ .save = it.next() orelse return error.MissingArgument };
+    } else if (std.mem.eql(u8, verb, "load")) {
+        return .{ .load = it.next() orelse return error.MissingArgument };
+    } else if (std.mem.eql(u8, verb, "quit")) {
+        return .quit;
+    }
+    return error.UnknownVerb;
+}
+
+/// Save format: one record per line, whitespace separated, notes last.
+fn save(io: std.Io, co: *Company, path: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &amp;buf);
+    const w = &amp;fw.interface;
+    try w.print("smallledger 1\n", .{});
+    try w.print("seed {d}\n", .{co.seed});
+    try w.print("clock {d} {d} {d} {d}\n", .{ co.clock.day_index, co.clock.date.year, co.clock.date.month, co.clock.date.day });
+    try w.print("funds {d} {d} {d}\n", .{ co.funds, co.starting_funds, co.next_id });
+    for (co.rng.prngs, 0..) |prng, i| {
+        try w.print("rng {d} {d} {d} {d} {d}\n", .{ i, prng.s[0], prng.s[1], prng.s[2], prng.s[3] });
+    }
+    for (co.people.items) |p| {
+        try w.print("person {d} {s} {s} {d} {d}\n", .{ @intFromEnum(p.id), p.name, @tagName(p.role), p.hired_day, p.morale });
+    }
+    for (co.ledger.transactions.items) |t| {
+        try w.print("txn {d} {d} {s} {s}\n", .{ t.day, t.amount, @tagName(t.category), t.note });
+    }
+    for (co.log.items) |line| try w.print("log {s}\n", .{line});
+    try w.flush();
+}
+
+const LoadError = error{ BadFormat, OutOfMemory };
+
+fn load(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Company {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 &lt;&lt; 24));
+    defer gpa.free(text);
+
+    var co = Company.init(gpa, .{});
+    errdefer co.deinit();
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const header = lines.next() orelse return error.BadFormat;
+    if (!std.mem.eql(u8, header, "smallledger 1")) return error.BadFormat;
+
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        const kind = it.next() orelse continue;
+        if (std.mem.eql(u8, kind, "seed")) {
+            co.seed = try num(u64, &amp;it);
+            co.rng = Rng.init(co.seed);
+        } else if (std.mem.eql(u8, kind, "clock")) {
+            co.clock.day_index = try num(u32, &amp;it);
+            co.clock.date = .{ .year = try num(u16, &amp;it), .month = try num(u8, &amp;it), .day = try num(u8, &amp;it) };
+        } else if (std.mem.eql(u8, kind, "funds")) {
+            co.funds = try num(CBills, &amp;it);
+            co.starting_funds = try num(CBills, &amp;it);
+            co.next_id = try num(u32, &amp;it);
+        } else if (std.mem.eql(u8, kind, "rng")) {
+            const i = try num(usize, &amp;it);
+            if (i &gt;= Stream.count) return error.BadFormat;
+            for (&amp;co.rng.prngs[i].s) |*s| s.* = try num(u64, &amp;it);
+        } else if (std.mem.eql(u8, kind, "person")) {
+            const id = try num(u32, &amp;it);
+            const name = it.next() orelse return error.BadFormat;
+            const role = std.meta.stringToEnum(Role, it.next() orelse return error.BadFormat) orelse return error.BadFormat;
+            const hired_day = try num(u32, &amp;it);
+            const morale = try num(i8, &amp;it);
+            try co.people.append(co.allocator(), .{
+                .id = @enumFromInt(id),
+                .name = try co.allocator().dupe(u8, name),
+                .role = role,
+                .hired_day = hired_day,
+                .morale = morale,
+            });
+        } else if (std.mem.eql(u8, kind, "txn")) {
+            const day = try num(u32, &amp;it);
+            const amount = try num(CBills, &amp;it);
+            const cat = std.meta.stringToEnum(Category, it.next() orelse return error.BadFormat) orelse return error.BadFormat;
+            const note = try co.allocator().dupe(u8, it.rest());
+            try co.ledger.post(co.allocator(), .{ .day = day, .amount = amount, .category = cat, .note = note });
+        } else if (std.mem.eql(u8, kind, "log")) {
+            try co.log.append(co.allocator(), try co.allocator().dupe(u8, it.rest()));
+        } else {
+            return error.BadFormat;
+        }
+    }
+    return co;
+}
+
+fn num(comptime T: type, it: *std.mem.TokenIterator(u8, .scalar)) LoadError!T {
+    const tok = it.next() orelse return error.BadFormat;
+    return std.fmt.parseInt(T, tok, 10) catch error.BadFormat;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &amp;out_buf);
+    const out = &amp;stdout.interface;
+    var in_buf: [1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(io, &amp;in_buf);
+
+    var co = Company.init(gpa, .{});
+    defer co.deinit();
+
+    while (true) {
+        try out.flush();
+        const raw = try stdin.interface.takeDelimiter('\n') orelse break;
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const cmd = parseLine(line) catch |e| {
+            try out.print("&gt; error: {s}\n", .{@errorName(e)});
+            continue;
+        };
+        switch (cmd) {
+            .sim =&gt; |c| {
+                const result = execute(&amp;co, c) catch |e| {
+                    try out.print("&gt; error: {s}\n", .{@errorName(e)});
+                    continue;
+                };
+                switch (result) {
+                    .hired =&gt; |id| try out.print("&gt; hired {s} as {s} (id {d})\n", .{ c.hire.name, @tagName(c.hire.role), @intFromEnum(id) }),
+                    .fired =&gt; try out.print("&gt; fired {d}\n", .{@intFromEnum(c.fire)}),
+                    .advanced =&gt; |n| try out.print("&gt; advanced {d} days to {d}-{d:0&gt;2}-{d:0&gt;2}, funds {d}\n", .{
+                        n, co.clock.date.year, co.clock.date.month, co.clock.date.day, co.funds,
+                    }),
+                }
+            },
+            .people =&gt; {
+                for (co.people.items) |p| {
+                    try out.print("&gt; {d:&gt;3}  {s:&lt;10} {s:&lt;10} morale {d:&gt;3}  pay {d}\n", .{
+                        @intFromEnum(p.id), p.name, @tagName(p.role), p.morale, p.monthlySalary(),
+                    });
+                }
+                if (co.people.items.len == 0) try out.print("&gt; nobody on the roster\n", .{});
+            },
+            .ledger =&gt; {
+                for (co.ledger.transactions.items) |t| {
+                    try out.print("&gt; day {d}  {d}  {s}  {s}\n", .{ t.day, t.amount, @tagName(t.category), t.note });
+                }
+                try out.print("balance {d}\n", .{co.funds});
+            },
+            .log =&gt; {
+                for (co.log.items) |l| try out.print("&gt; {s}\n", .{l});
+                if (co.log.items.len == 0) try out.print("&gt; quiet so far\n", .{});
+            },
+            .save =&gt; |path| {
+                save(io, &amp;co, path) catch |e| {
+                    try out.print("&gt; save failed: {s}\n", .{@errorName(e)});
+                    continue;
+                };
+                try out.print("&gt; saved {s}\n", .{path});
+            },
+            .load =&gt; |path| {
+                const loaded = load(io, gpa, path) catch |e| {
+                    try out.print("&gt; load failed: {s}\n", .{@errorName(e)});
+                    continue;
+                };
+                co.deinit();
+                co = loaded;
+                try out.print("&gt; loaded {s}: day {d}, {d} people, funds {d}\n", .{ path, co.clock.day_index, co.people.items.len, co.funds });
+            },
+            .quit =&gt; break,
+        }
+    }
+    try out.print("&gt; bye\n", .{});
+    try out.flush();
+}
+
+test "save then load reproduces the hash" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var co = Company.init(gpa, .{ .seed = 9 });
+    defer co.deinit();
+    _ = try execute(&amp;co, .{ .hire = .{ .name = "Grayson", .role = .mekwarrior } });
+    _ = try execute(&amp;co, .{ .advance_days = 60 });
+    try save(io, &amp;co, "test_roundtrip.sav");
+    defer std.Io.Dir.cwd().deleteFile(io, "test_roundtrip.sav") catch {};
+    var back = try load(io, gpa, "test_roundtrip.sav");
+    defer back.deinit();
+    try std.testing.expectEqual(co.hash(), back.hash());
+    // and the two continue identically, because the RNG state was saved
+    _ = try execute(&amp;co, .{ .advance_days = 100 });
+    _ = try execute(&amp;back, .{ .advance_days = 100 });
+    try std.testing.expectEqual(co.hash(), back.hash());
+}
+
+test "parseLine" {
+    const c = try parseLine("hire Grayson mekwarrior");
+    try std.testing.expectEqualStrings("Grayson", c.sim.hire.name);
+    try std.testing.expectError(error.BadRole, parseLine("hire X pirate"));
+    try std.testing.expectError(error.UnknownVerb, parseLine("dance"));
+    try std.testing.expectError(error.BadNumber, parseLine("advance ten"));
+}</code></pre>
+</details>
+<pre class="term">$ zig test ex6_repl.zig
+All 2 tests passed.
+$ printf 'load ledger.sav\npeople\nadvance 300\nlog\nfire 2\npeople\nbogus\n' | zig run ex6_repl.zig
+&gt; loaded ledger.sav: day 31, 2 people, funds 47746
+&gt;   1  Grayson    mekwarrior morale  -1  pay 1470
+&gt;   2  Clay       tech       morale  -1  pay 784
+&gt; advanced 300 days to 3025-11-28, funds 26080
+&gt; day 15: grumbling in the barracks (rolled 2), morale -1
+&gt; day 32: a good day (rolled 12), morale +1
+&gt; day 68: a good day (rolled 12), morale +1
+&gt; day 87: grumbling in the barracks (rolled 2), morale -1
+&gt; day 99: a good day (rolled 12), morale +1
+&gt; day 104: a good day (rolled 12), morale +1
+&gt; day 125: grumbling in the barracks (rolled 2), morale -1
+&gt; day 137: a good day (rolled 12), morale +1
+&gt; day 142: a good day (rolled 12), morale +1
+&gt; day 163: a good day (rolled 12), morale +1
+&gt; day 206: grumbling in the barracks (rolled 2), morale -1
+&gt; day 295: a good day (rolled 12), morale +1
+&gt; day 299: grumbling in the barracks (rolled 2), morale -1
+&gt; day 322: grumbling in the barracks (rolled 2), morale -1
+&gt; fired 2
+&gt;   1  Grayson    mekwarrior morale  +2  pay 1560
+&gt; error: UnknownVerb
+&gt; bye</pre>
+<p>Notice what the second session shows: the file saved by the first session loads, the log line from day 15 is still there, the events continue from the saved random state, and an unknown verb is an error message rather than a crash. When you get this output from your own file, you have built the thing.</p>
+
+<h3 id="ch38-8">38.8 What you built, and what the game adds</h3>
+<p>Line up the two programs and the correspondence is one to one. Your <code>Company</code> is the game's <code>GameState</code>: one arena, one dice bag, ordered collections, a clock, a ledger. Your <code>execute</code> is theirs. Your <code>advanceDay</code> with two phases is theirs with fifteen. Your text save file is their SQLite database (forty tables instead of six record kinds, and migrations, but the same delete-and-reinsert-then-hash-must-match idea). Your <code>parseLine</code> is <code>src/sim/cli.zig</code>; your <code>main</code> loop is the non-TUI branch of <code>src/main.zig</code>. Your golden master is theirs.</p>
+<p>What the game adds is width, not new shapes: more types (units, forces, contracts, HQs, each with a typed ID), ZON data files for the rule tables (<a href="#ch28">Chapter 28</a>), a query layer that computes screens from state without mutating it, a battle resolver, and a terminal client. Each of those is a chapter in Part 5. You already know how to read them.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The file to open next to your stage 6 is <code>src/sim/commands.zig</code>. Its <code>Command</code> union starts with the same three variants you wrote (<code>advance_day</code>, <code>advance_days: u32</code>, <code>hire: struct { first, last, role }</code>, <code>fire: types.PersonId</code>), its <code>Error</code> set begins with <code>UnknownPerson</code>, and its <code>execute</code> is a <code>switch (cmd)</code> whose <code>.hire</code> arm is <code>const id = try gs.hirePerson(h.first, h.last, h.role); return .{ .hired = id };</code>. The test at the bottom is your golden master with the game's script: three hires, 45 days, a firing, 45 more days, two hashes, <code>expectEqual</code>. The pure-core rule is enforced by a parameter that is not there: <code>execute</code> takes <code>*GameState</code> and a <code>Command</code>, and nothing in <code>src/sim/</code> ever receives an <code>io</code>.</div>
+
+<h3 id="ch38-ex">Exercises</h3>
+<p>The six stages are the exercises of this chapter. Each starter in <code>exercises/38-capstone/</code> contains the tests and the type skeletons with <code>// TODO</code> bodies; the solutions are the complete files shown above. Work them in order.</p>
+<div class="exercise"><h4>Exercise 38.1 · Stage 1, types <span class="level">warm-up</span></h4>
+  <p>Define <code>CBills</code>, <code>Bp</code>, <code>applyBp</code>, <code>PersonId</code>, <code>Role.baseSalary</code> and <code>Person.monthlySalary</code>. Name the file: <code>exercises/38-capstone/ex1_types.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary><p>See 38.2 above; the complete file is <code>exercises/38-capstone/solutions/ex1_types.zig</code>. The one trap is widening <code>morale</code> to <code>Bp</code> before multiplying by 200.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 38.2 · Stage 2, company and commands <span class="level">practice</span></h4>
+  <p>Add <code>Company</code> (arena, people list, ID counter, funds), <code>hire</code>, <code>fire</code>, <code>find</code>, and the <code>Command</code>/<code>Result</code>/<code>Error</code>/<code>execute</code> layer. Name the file: <code>exercises/38-capstone/ex2_company.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary><p>See 38.3; complete file <code>solutions/ex2_company.zig</code>. Remember to <code>dupe</code> the name and to use <code>orderedRemove</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 38.3 · Stage 3, the ledger <span class="level">practice</span></h4>
+  <p>Add <code>Category</code>, <code>Transaction</code>, <code>Ledger</code> with <code>post</code>, <code>balance</code> and <code>sumCategory</code>, and <code>Company.postTransaction</code>, <code>monthlyPayroll</code>, <code>runPayroll</code>. Make <code>fire</code> post severance. Name the file: <code>exercises/38-capstone/ex3_ledger.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary><p>See 38.4; complete file <code>solutions/ex3_ledger.zig</code>. The invariant test is the one to keep green while you refactor.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 38.4 · Stage 4, the tick <span class="level">practice</span></h4>
+  <p>Add <code>Date</code>, <code>Clock</code>, the <code>advance_days</code> command and <code>advanceDay</code> with payday on the 1st. Name the file: <code>exercises/38-capstone/ex4_tick.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary><p>See 38.5; complete file <code>solutions/ex4_tick.zig</code>. Advance the clock first, then check payday.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 38.5 · Stage 5, events and the golden master <span class="level">challenge</span></h4>
+  <p>Add <code>Stream</code>, <code>Rng</code>, a <code>seed</code> option, <code>runEvents</code> with the 2d6 morale rule, <code>logf</code> and <code>hash</code>. Make the golden-master test pass. Name the file: <code>exercises/38-capstone/ex5_events.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary><p>See 38.6; complete file <code>solutions/ex5_events.zig</code>. If the two hashes differ, something in your state depends on something other than the seed and the commands.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 38.6 · Stage 6, the REPL with save and load <span class="level">challenge</span></h4>
+  <p>Add <code>ReplCommand</code>, <code>parseLine</code>, <code>save</code>, <code>load</code> and <code>main</code>. The header comment shows how to pipe a script into it. Then extend it: add a <code>raise ID BP</code> command that adjusts one person's pay through basis points, carrying it through the union, <code>execute</code>, the parser and the save format. Name the file: <code>exercises/38-capstone/ex6_repl.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary><p>See 38.7; complete file <code>solutions/ex6_repl.zig</code> (without the <code>raise</code> extension, which is yours). Adding a command touches four places, and the compiler will point at three of them; the save format is the fourth, and the round-trip test is what catches it.</p></details>
+</div>
+
+<h3 id="ch38-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Why is money an <code>i64</code> and a percentage an integer number of basis points? <details class="answer"><summary>Answer</summary>Floats cannot represent most decimal fractions exactly, so sums drift. Integer C-bills and integer basis points make every computation exact and identical on every machine, which the golden master depends on.</details></li>
+  <li>What does the arena buy the <code>Company</code>, and what does it cost? <details class="answer"><summary>Answer</summary>One <code>deinit</code> frees everything, there are no per-object destructors, and references between records (a transaction's note pointing at a name) are always valid. The cost is that memory only grows until the company is destroyed.</details></li>
+  <li>Why is <code>Command</code> a tagged union rather than a set of methods the REPL calls directly? <details class="answer"><summary>Answer</summary>A union value is data: it can be put in an array (a script), replayed, logged, compared, and run by any front end through one <code>execute</code>. The golden-master test is a script of commands.</details></li>
+  <li>State the invariant that <code>postTransaction</code> protects. <details class="answer"><summary>Answer</summary><code>funds == starting_funds + ledger.balance()</code> at all times, because the balance and the ledger change only together, in that one function.</details></li>
+  <li>Why does the company that starts on January 1st not pay on day 0? <details class="answer"><summary>Answer</summary>Payroll runs inside <code>advanceDay</code> after the clock moves, so the first check happens on day 1 (January 2nd). The test "31 days crosses exactly one payday" pins this down.</details></li>
+  <li>What kinds of bug does the golden-master test catch, and what does it not catch? <details class="answer"><summary>Answer</summary>It catches any source of non-determinism: real-clock reads, OS-seeded randomness, unordered iteration, races, uninitialised memory. It does not catch wrong rules that are wrong deterministically; those need the ordinary unit tests.</details></li>
+  <li>Why is the random stream state saved to the file? <details class="answer"><summary>Answer</summary>So that a loaded company continues exactly as the unsaved one would have. Re-seeding from the seed alone would restart the sequence from day 0's position.</details></li>
+  <li>Which parts of stage 6 receive an <code>io</code>, and which must never? <details class="answer"><summary>Answer</summary><code>main</code>, <code>save</code> and <code>load</code> take <code>io</code>. Nothing above the "pure core" line does: <code>Company</code>, <code>execute</code>, <code>advanceDay</code> and <code>runEvents</code> cannot touch the outside world because the parameter is not there.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Start a program with its vocabulary types, tested alone: integer money, basis points, typed IDs, enums with methods.</li>
+<li>A state struct owns its memory through one arena; <code>init</code>/<code>deinit</code>/<code>allocator()</code>; copy every string you keep.</li>
+<li>Commands are a tagged union and <code>execute</code> is the single entry point returning a <code>Result</code> or a named error.</li>
+<li>Money moves through one function that writes the ledger and the balance together; the invariant is a test.</li>
+<li>Time moves in <code>advanceDay</code>, a fixed sequence of phases; the calendar is a struct beside an integer day counter.</li>
+<li>Randomness comes from a seeded, named-stream generator owned by the state; a <code>hash</code> and a golden-master test guard determinism.</li>
+<li>Parsing, printing, saving and loading live at the edge, hold the <code>io</code>, and turn every failure into a message. Save the RNG state and prove round-trips with a hash.</li>
+<li>This is IRON LEDGER's architecture at one-sixtieth scale; Part 5 reads the full-size version.</li>
+</ul></div>
+</section>

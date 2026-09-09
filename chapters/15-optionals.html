@@ -1,0 +1,553 @@
+<section id="ch15">
+<h2>15. Optionals</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn how Zig represents "a value that might not be there". You will write the optional type <code>?T</code>, unwrap it with <code>orelse</code>, <code>if</code>, <code>while</code> and <code>.?</code>, and see why an optional pointer costs nothing. By the end you will read a chain like <code>if (gs.person(id)) |p| if (p.born_day) |born|</code> without slowing down.</p>
+
+<h3 id="ch15-1">15.1 The problem with "nothing"</h3>
+<p>Every program has values that are sometimes missing. A pilot may have no birthday on record. A lookup by name may find nobody. A parser may reach the end of the input. Most languages you have used answer this with a special value: <code>None</code> in Python, <code>null</code> or <code>undefined</code> in JavaScript, <code>NULL</code> in C. The trouble is that in those languages any variable can hold the special value, so any line of code might be the one that trips over it. "Cannot read property of undefined" is the most common runtime error in JavaScript for exactly this reason.</p>
+<p>Zig takes a different position. A plain <code>u32</code> is always a number. A plain <code>*Pilot</code> always points at a pilot. If a value may be absent, its <em>type</em> says so, and the compiler refuses to let you use it as if it were present until you have checked. The type is written with a question mark in front: <code>?u32</code> is "maybe a <code>u32</code>", <code>?*Pilot</code> is "maybe a pointer to a Pilot", <code>?[]const u8</code> is "maybe a string".</p>
+<p>The absent value is spelled <code>null</code>. It is only ever a valid value for an optional type. You cannot put <code>null</code> into a <code>u32</code>, and the compiler will tell you so.</p>
+
+<h3 id="ch15-2">15.2 Declaring and printing an optional</h3>
+<p>Here is the smallest program that uses one.</p>
+<p class="file">opt1.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var maybe_age: ?u32 = null;
+    std.debug.print(&quot;start: {?}\n&quot;, .{maybe_age});
+
+    maybe_age = 27;
+    std.debug.print(&quot;later: {?}\n&quot;, .{maybe_age});
+
+    const shown: u32 = maybe_age orelse 0;
+    std.debug.print(&quot;shown: {d}\n&quot;, .{shown});
+
+    const nothing: ?u32 = null;
+    std.debug.print(&quot;fallback: {d}\n&quot;, .{nothing orelse 0});
+}</code></pre>
+<pre class="term">start: null
+later: 27
+shown: 27
+fallback: 0</pre>
+<p>Four things to notice. First, the variable is declared as <code>?u32</code> and starts out as <code>null</code>. Second, assigning a plain <code>27</code> to it works without ceremony: a <code>u32</code> coerces into a <code>?u32</code> automatically, because "definitely 27" is a fine answer to "maybe a number". The coercion never goes the other way. Third, the format specifier <code>{?}</code> prints an optional, showing either the value or the word <code>null</code>. Fourth, <code>orelse</code> turns the optional back into a plain value by supplying what to use when it is <code>null</code>.</p>
+<p>What happens if you try to use a <code>?u32</code> where a <code>u32</code> is required, without unwrapping it?</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    const age: ?u32 = 27;
+    const n: u32 = age; // error: cannot assign ?u32 to u32
+    std.debug.print(&quot;{d}\n&quot;, .{n});
+}</code></pre>
+<pre class="term">opt2.zig:5:20: error: expected type &#x27;u32&#x27;, found &#x27;?u32&#x27;
+    const n: u32 = age; // error: cannot assign ?u32 to u32
+                   ^~~
+opt2.zig:5:20: note: cannot convert optional to payload type
+opt2.zig:5:20: note: consider using &#x27;.?&#x27;, &#x27;orelse&#x27;, or &#x27;if&#x27;
+…</pre>
+<p>Read that error message slowly, because you will see it often in your first weeks: "cannot convert optional to payload type", followed by a helpful list of the three ways to fix it. The <em>payload</em> is the value inside the optional. The rest of this chapter is those three ways.</p>
+
+<h3 id="ch15-3">15.3 Functions that return optionals</h3>
+<p>The most common place an optional appears is as the return type of a search. Here is a roster and a function that finds a name's position in it.</p>
+<p class="file">opt3.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const pilots = [_][]const u8{ &quot;Kerensky&quot;, &quot;Steiner&quot;, &quot;Liao&quot; };
+
+/// Position of a pilot in the roster, or null if not there.
+fn indexOfPilot(name: []const u8) ?usize {
+    for (pilots, 0..) |p, i| {
+        if (std.mem.eql(u8, p, name)) return i;
+    }
+    return null;
+}
+
+pub fn main() void {
+    std.debug.print(&quot;Steiner -&gt; {?}\n&quot;, .{indexOfPilot(&quot;Steiner&quot;)});
+    std.debug.print(&quot;Davion  -&gt; {?}\n&quot;, .{indexOfPilot(&quot;Davion&quot;)});
+}</code></pre>
+<pre class="term">Steiner -&gt; 1
+Davion  -&gt; null</pre>
+<p>The function's return type is <code>?usize</code>. Inside it, <code>return i</code> returns a plain <code>usize</code>, which coerces to the optional. <code>return null</code> is the "not found" answer. In Python you might return <code>-1</code> or raise an exception; in C you would return <code>-1</code> or <code>SIZE_MAX</code> and hope every caller remembers to check. Here, every caller <em>must</em> deal with the possibility of <code>null</code>, because a <code>?usize</code> cannot be used as an index until it is unwrapped.</p>
+
+<h3 id="ch15-4">15.4 <code>orelse</code>: a fallback, or an early exit</h3>
+<p>You have already seen <code>x orelse 0</code>: if <code>x</code> is present, use its value; otherwise use 0. The right-hand side of <code>orelse</code> can be any expression of the payload type. But it can also be something that does not produce a value at all: a <code>return</code>, a <code>break</code>, a <code>continue</code>, or <code>unreachable</code>. This is the form you will see the most in real code.</p>
+<p class="file">opt4.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const pilots = [_][]const u8{ &quot;Kerensky&quot;, &quot;Steiner&quot;, &quot;Liao&quot; };
+
+fn indexOfPilot(name: []const u8) ?usize {
+    for (pilots, 0..) |p, i| {
+        if (std.mem.eql(u8, p, name)) return i;
+    }
+    return null;
+}
+
+/// The pilot after `name` in the roster, or null if `name` is unknown
+/// or is the last one. `orelse return null` ends the function early.
+fn nextPilot(name: []const u8) ?[]const u8 {
+    const i = indexOfPilot(name) orelse return null;
+    if (i + 1 &gt;= pilots.len) return null;
+    return pilots[i + 1];
+}
+
+pub fn main() void {
+    std.debug.print(&quot;after Kerensky: {?s}\n&quot;, .{nextPilot(&quot;Kerensky&quot;)});
+    std.debug.print(&quot;after Liao:     {?s}\n&quot;, .{nextPilot(&quot;Liao&quot;)});
+    std.debug.print(&quot;after Davion:   {?s}\n&quot;, .{nextPilot(&quot;Davion&quot;)});
+
+    // We *know* Steiner is in the roster, so null is impossible here.
+    const i = indexOfPilot(&quot;Steiner&quot;) orelse unreachable;
+    std.debug.print(&quot;Steiner sits at {d}\n&quot;, .{i});
+}</code></pre>
+<pre class="term">after Kerensky: Steiner
+after Liao:     null
+after Davion:   null
+Steiner sits at 1</pre>
+<p>Look at the first line of <code>nextPilot</code>: <code>const i = indexOfPilot(name) orelse return null;</code>. If the lookup finds nothing, the function returns right there and the rest of the body never runs. If it finds something, <code>i</code> is a plain <code>usize</code>, not an optional, and the code after it is free to use it as an index. This one line replaces a whole <code>if (x == null) return null;</code> block, and it is why Zig functions that do several lookups in a row stay flat instead of nesting.</p>
+<p>The last form, <code>orelse unreachable</code>, says "I know this is never null". In a Debug build, if you are wrong, the program panics with a clear message. In a release build with safety off, it is undefined behaviour. Use it only when the surrounding code has already guaranteed the value is there, as in the example: we looked up a name that is literally in the array.</p>
+<p>The format specifier <code>{?s}</code> is worth remembering: it prints an optional string, showing <code>null</code> when absent. In general, <code>?</code> followed by the specifier you would use for the payload works for any optional.</p>
+
+<h3 id="ch15-5">15.5 <code>if (x) |v|</code>: run code only when present</h3>
+<p>When you want to do something with the value if it is there and something else if it is not, use <code>if</code> with a <em>capture</em>. The bars around <code>v</code> introduce a new constant holding the unwrapped payload, visible only inside the following block.</p>
+<p class="file">opt5.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn describe(slot: ?u8) void {
+    if (slot) |n| {
+        std.debug.print(&quot;slot holds {d}\n&quot;, .{n});
+    } else {
+        std.debug.print(&quot;slot is empty\n&quot;, .{});
+    }
+}
+
+pub fn main() void {
+    describe(4);
+    describe(null);
+
+    // if/else as an expression, choosing a value
+    const a: ?u8 = 4;
+    const b: ?u8 = null;
+    const tonnage_a: u8 = if (a) |v| v * 10 else 50;
+    const tonnage_b: u8 = if (b) |v| v * 10 else 50;
+    std.debug.print(&quot;{d} {d}\n&quot;, .{ tonnage_a, tonnage_b });
+
+    // comparing with null directly, no unwrap needed
+    std.debug.print(&quot;a == null? {}\n&quot;, .{a == null});
+    std.debug.print(&quot;b == null? {}\n&quot;, .{b == null});
+    std.debug.print(&quot;a == 4?    {}\n&quot;, .{a == 4});
+}</code></pre>
+<pre class="term">slot holds 4
+slot is empty
+40 50
+a == null? false
+b == null? true
+a == 4?    true</pre>
+<p>Three forms in one file. The statement form, <code>if (slot) |n| { … } else { … }</code>, is what you reach for most of the time. The expression form, <code>if (a) |v| v * 10 else 50</code>, produces a value and is handy for computing a field from an optional lookup. IRON LEDGER uses exactly this shape to get a unit's tonnage from a catalogue entry that might be missing: <code>const tonnage: u8 = if (chassis_mod.find(u.chassis_key)) |d| d.tonnage else 50;</code>.</p>
+<p>The third form is comparison. You may compare an optional to <code>null</code> directly with <code>==</code> and <code>!=</code>, and you may even compare it to a plain value: <code>a == 4</code> is <code>true</code> when <code>a</code> holds 4 and <code>false</code> when it is <code>null</code> or holds something else. This is a common way to write a guard clause: <code>if (p.leave_until_day != null) …</code>.</p>
+<div class="note"><strong>Reading the bars.</strong> Once you have seen <code>|v|</code> after an <code>if</code>, a <code>while</code>, a <code>for</code> or a <code>catch</code>, you have seen the whole idea: the thing between the bars is the unwrapped value for the block that follows. It is always a fresh constant. If you need to modify the payload in place, capture a pointer to it with <code>|*v|</code>, which works when the optional itself is a variable you can address, as in <code>if (self.gs) |*g| g.deinit();</code> from the game's terminal client.</div>
+
+<h3 id="ch15-6">15.6 <code>.?</code>: assert it is present</h3>
+<p>The third unwrapping form is the shortest. Putting <code>.?</code> after an optional gives you the payload, and if the optional is <code>null</code> the program panics.</p>
+<p class="file">opt6.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    const present: ?u32 = 42;
+    const absent: ?u32 = null;
+
+    std.debug.print(&quot;present.? = {d}\n&quot;, .{present.?});
+    std.debug.print(&quot;about to unwrap absent...\n&quot;, .{});
+    std.debug.print(&quot;absent.? = {d}\n&quot;, .{absent.?});
+}</code></pre>
+<pre class="term">present.? = 42
+about to unwrap absent...
+thread 12345 panic: attempt to use null value
+ch15/opt6.zig:9:49: 0x… in main (opt6)
+    std.debug.print(&quot;absent.? = {d}\n&quot;, .{absent.?});
+                                                ^
+&lt;zig&gt;/lib/std/start.zig:698:59: 0x… in callMain (opt6)
+    if (fn_info.params.len == 0) return wrapMain(root.main());
+…</pre>
+<p>That is a real panic with a real stack trace pointing at the exact expression that failed. <code>.?</code> is the same as <code>orelse unreachable</code>, spelled more briefly. Use it when nullness would be a bug in your program, not a normal outcome. A lookup by a key you just inserted, a value you checked two lines earlier, an ID handed to you by code that only produces valid IDs: those are <code>.?</code> situations. User input is never a <code>.?</code> situation.</p>
+<div class="warn"><strong>Trap.</strong> Beginners sprinkle <code>.?</code> everywhere to make the compiler stop complaining. That converts a compile-time check into a run-time crash, which is exactly what optionals exist to prevent. If you find yourself typing <code>.?</code>, ask "what should happen if this is null?" If the honest answer is "that would be a bug", keep it. If the answer is "then skip it" or "then use a default", you want <code>if</code> or <code>orelse</code> instead.</div>
+
+<h3 id="ch15-7">15.7 <code>while (it.next()) |v|</code>: iterators</h3>
+<p>Combine an optional-returning function with a <code>while</code> capture and you have Zig's iterator protocol. There is no interface to implement and no special syntax to learn: any function that returns <code>?T</code> can drive a loop, and the loop stops the first time it returns <code>null</code>.</p>
+<p class="file">opt7.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+/// Counts down from `n` to 1, then is exhausted.
+const Countdown = struct {
+    n: u32,
+
+    fn next(self: *Countdown) ?u32 {
+        if (self.n == 0) return null;
+        const v = self.n;
+        self.n -= 1;
+        return v;
+    }
+};
+
+pub fn main() void {
+    var cd = Countdown{ .n = 3 };
+    while (cd.next()) |v| {
+        std.debug.print(&quot;t-minus {d}\n&quot;, .{v});
+    }
+
+    var words = std.mem.tokenizeScalar(u8, &quot;hire  pilot  Steiner&quot;, &#x27; &#x27;);
+    while (words.next()) |w| {
+        std.debug.print(&quot;word: {s}\n&quot;, .{w});
+    }
+}</code></pre>
+<pre class="term">t-minus 3
+t-minus 2
+t-minus 1
+word: hire
+word: pilot
+word: Steiner</pre>
+<p>The standard library's tokenizers, splitters, directory walkers and hash-map iterators all work this way. You saw <code>std.mem.tokenizeScalar</code> in <a href="#ch11">Chapter 11</a>; the <code>while (words.next()) |w|</code> line here is why its <code>next</code> returns <code>?[]const u8</code>. Writing your own iterator, as <code>Countdown</code> does, is a matter of keeping some state in a struct and writing one <code>next</code> method that returns <code>null</code> when done.</p>
+
+<h3 id="ch15-8">15.8 What an optional costs</h3>
+<p>An optional needs somewhere to record "present or not". For most types that means an extra byte, padded up to the type's alignment. For pointers it costs nothing at all, because a pointer is never allowed to be zero in Zig, so the value zero is free to mean <code>null</code>. This is called the null pointer optimisation, and it means <code>?*T</code> is exactly as cheap as the raw nullable pointer a C programmer would use, with the compiler doing the checking the C programmer had to do by hand.</p>
+<p class="file">opt8.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    std.debug.print(&quot;u32:    {d} bytes\n&quot;, .{@sizeOf(u32)});
+    std.debug.print(&quot;?u32:   {d} bytes\n&quot;, .{@sizeOf(?u32)});
+    std.debug.print(&quot;*u32:   {d} bytes\n&quot;, .{@sizeOf(*u32)});
+    std.debug.print(&quot;?*u32:  {d} bytes\n&quot;, .{@sizeOf(?*u32)});
+    std.debug.print(&quot;[]u8:   {d} bytes\n&quot;, .{@sizeOf([]u8)});
+    std.debug.print(&quot;?[]u8:  {d} bytes\n&quot;, .{@sizeOf(?[]u8)});
+}</code></pre>
+<pre class="term">u32:    4 bytes
+?u32:   8 bytes
+*u32:   8 bytes
+?*u32:  8 bytes
+[]u8:   16 bytes
+?[]u8:  16 bytes</pre>
+<p><code>?u32</code> doubles in size because of alignment. <code>?*u32</code> and <code>?[]u8</code> do not grow at all: a slice is a pointer plus a length, and the pointer part carries the null. So when you design a function that "finds a thing or not", returning an optional pointer, <code>?*const Chassis</code>, is not a compromise. It is the natural shape.</p>
+
+<h3 id="ch15-9">15.9 Optional fields and chains</h3>
+<p>Optionals are how a struct expresses "not yet" or "not applicable". A person hired by a test might have no birthday. A pilot on leave has a day the leave ends; a pilot not on leave has none. Rather than a magic number like <code>0</code> or <code>-1</code>, the field is an optional with a default of <code>null</code>.</p>
+<p class="file">opt9.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Person = struct {
+    name: []const u8,
+    born_day: ?i32 = null,
+    leave_until_day: ?u32 = null,
+
+    fn isAvailable(self: Person, day: u32) bool {
+        if (self.leave_until_day) |until| return day &gt; until;
+        return true;
+    }
+};
+
+const Unit = struct {
+    name: []const u8,
+    pilot: ?*const Person = null,
+};
+
+pub fn main() void {
+    const ada = Person{ .name = &quot;Ada&quot;, .born_day = 5 };
+    const bo = Person{ .name = &quot;Bo&quot;, .leave_until_day = 30 };
+    const day: u32 = 20;
+
+    const units = [_]Unit{
+        .{ .name = &quot;Locust&quot;, .pilot = &amp;ada },
+        .{ .name = &quot;Marauder&quot;, .pilot = &amp;bo },
+        .{ .name = &quot;Atlas&quot; },
+    };
+
+    for (units) |u| {
+        if (u.pilot) |p| {
+            if (p.born_day) |born| {
+                const age_days = @as(i64, day) - @as(i64, born);
+                std.debug.print(&quot;{s}: pilot {s}, age {d} days\n&quot;, .{ u.name, p.name, age_days });
+            } else {
+                std.debug.print(&quot;{s}: pilot {s}, birthday unknown\n&quot;, .{ u.name, p.name });
+            }
+            if (!p.isAvailable(day)) std.debug.print(&quot;  ({s} is on leave)\n&quot;, .{p.name});
+        } else {
+            std.debug.print(&quot;{s}: no pilot assigned\n&quot;, .{u.name});
+        }
+    }
+
+    // A chain: only runs when every link is present.
+    for (units) |u| if (u.pilot) |p| if (p.isAvailable(day)) {
+        std.debug.print(&quot;ready: {s} in the {s}\n&quot;, .{ p.name, u.name });
+    };
+}</code></pre>
+<pre class="term">Locust: pilot Ada, age 15 days
+Marauder: pilot Bo, birthday unknown
+  (Bo is on leave)
+Atlas: no pilot assigned
+ready: Ada in the Locust</pre>
+<p>Two optionals are nested here: a unit may have no pilot, and a pilot may have no birthday. Each <code>if … |x|</code> peels one layer. The last loop shows the compact chain form, <code>if (u.pilot) |p| if (p.isAvailable(day)) { … }</code>: an <code>if</code> whose body is another <code>if</code>, with no braces between them. It reads as "if there is a pilot, and the pilot is available". You will see this idiom throughout IRON LEDGER, and once you have written it a few times it stops looking odd. Note the semicolon after the closing brace: because the whole thing is the body of a brace-less <code>for</code>, it is a single statement and needs one.</p>
+<p>Inside <code>isAvailable</code>, the pattern <code>if (self.leave_until_day) |until| return day &gt; until;</code> followed by <code>return true;</code> is the optional version of a guard clause. It is often clearer than one long boolean expression.</p>
+
+<h3 id="ch15-10">15.10 An optional of an optional</h3>
+<p>Because <code>?T</code> is a type like any other, <code>??T</code> is legal, and it is not the same as <code>?T</code>. "Present, but holding null" and "absent" are different values. You will rarely want this, but it comes up when a generic container stores optionals, and it explains why <code>orelse</code> only removes one layer at a time.</p>
+<p class="file">opt10.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    const inner: ?u8 = null;
+    const outer: ??u8 = inner;
+    std.debug.print(&quot;outer == null? {}\n&quot;, .{outer == null});
+    if (outer) |i| {
+        std.debug.print(&quot;outer present, inner == null? {}\n&quot;, .{i == null});
+    }
+}</code></pre>
+<pre class="term">outer == null? false
+outer present, inner == null? true</pre>
+
+<h3 id="ch15-11">15.11 Why no null by default</h3>
+<p>Step back and look at what the type system has bought you. Every place a value might be missing is marked in the type. Every place that marking is removed is visible in the code: an <code>orelse</code>, an <code>if</code> capture, a <code>.?</code>. The compiler will not let you forget a check, and when you deliberately assert with <code>.?</code>, a Debug build tells you the exact line if you were wrong. Compare this to hunting for the origin of a <code>null</code> that surfaced three modules away from where it was created.</p>
+<p>The price is a little typing. In practice, most Zig programs have far fewer optionals than JavaScript programs have <code>undefined</code> checks, because most values simply are never absent, and their types say so.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The simulation looks things up by typed ID constantly, and every lookup returns an optional pointer. <code>GameState.person</code> in <code>game/src/sim/state.zig</code> is one line, <code>return self.people.getPtr(id);</code>, with return type <code>?*person_mod.Person</code>. Callers pick the unwrapping form that fits: a command handler writes <code>const p = gs.person(id) orelse return Error.UnknownPerson;</code> because an unknown ID is a user mistake to report; a query writes <code>if (gs.person(u.pilot)) |pilot| if (pilot.isAvailable(day)) …</code> because a unit with no pilot is simply skipped; and code that has just created a unit writes <code>gs.unit(seat).?</code> because failure there would be a bug. Optional fields carry "not yet" state on the domain structs: <code>leave_until_day: ?u32 = null</code>, <code>wound_heal_day: ?u32 = null</code>, <code>born_day: ?i32 = null</code>. And the catalogue lookup in <code>game/src/domain/chassis.zig</code> is the shape from section 15.8:
+<pre><code>pub fn find(key: []const u8) ?*const Chassis {
+    for (catalog) |*c| {
+        if (std.mem.eql(u8, c.key, key)) return c;
+    }
+    return null;
+}</code></pre></div>
+
+<h3 id="ch15-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 15.1 · A lookup that may find nothing <span class="level">warm-up</span></h4>
+  <p>Implement <code>find</code>, which returns the index of a name in a fixed roster or <code>null</code>, and <code>after</code>, which returns the following name using <code>orelse return null</code>. File: <code>exercises/15-optionals/ex1_lookup.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 15, exercise 1: a lookup that may find nothing.
+//! Run with:  zig test ex1_lookup.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const roster = [_][]const u8{ &quot;Kerensky&quot;, &quot;Steiner&quot;, &quot;Liao&quot;, &quot;Davion&quot; };
+
+/// Return the index of `name` in the roster, or null when it is not there.
+fn find(name: []const u8) ?usize {
+    for (roster, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry, name)) return i;
+    }
+    return null;
+}
+
+/// Return the name that follows `name`, or null when `name` is unknown
+/// or already the last one. Use `orelse return null`.
+fn after(name: []const u8) ?[]const u8 {
+    const i = find(name) orelse return null;
+    if (i + 1 &gt;= roster.len) return null;
+    return roster[i + 1];
+}
+
+test &quot;find present and absent&quot; {
+    try std.testing.expectEqual(@as(?usize, 1), find(&quot;Steiner&quot;));
+    try std.testing.expectEqual(@as(?usize, 3), find(&quot;Davion&quot;));
+    try std.testing.expectEqual(@as(?usize, null), find(&quot;Marik&quot;));
+}
+
+test &quot;after&quot; {
+    try std.testing.expectEqualStrings(&quot;Liao&quot;, after(&quot;Steiner&quot;).?);
+    try std.testing.expect(after(&quot;Davion&quot;) == null);
+    try std.testing.expect(after(&quot;Marik&quot;) == null);
+}</code></pre>
+  <p><code>find</code> returns a plain <code>usize</code> from inside the loop and <code>null</code> after it; both coerce to <code>?usize</code>. In <code>after</code>, the <code>orelse return null</code> makes <code>i</code> a plain index for the rest of the function.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 15.2 · Defaults and first-present <span class="level">practice</span></h4>
+  <p>Write four small functions: a default with <code>orelse</code>, a chain of <code>orelse</code> that picks the first present of three, a sum over a slice of <code>?u32</code> using <code>if</code> captures, and a count of the <code>null</code> entries using <code>== null</code>. File: <code>exercises/15-optionals/ex2_orelse.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 15, exercise 2: defaults and first-present.
+//! Run with:  zig test ex2_orelse.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// The tonnage of a unit, or 50 when the catalogue had no entry.
+fn tonnageOr50(found: ?u8) u8 {
+    return found orelse 50;
+}
+
+/// The first of three optionals that is present, or null if none is.
+fn firstPresent(a: ?u32, b: ?u32, c: ?u32) ?u32 {
+    return a orelse b orelse c;
+}
+
+/// Sum of the present values only. Use `if (x) |v|`.
+fn sumPresent(values: []const ?u32) u32 {
+    var total: u32 = 0;
+    for (values) |maybe| {
+        if (maybe) |v| total += v;
+    }
+    return total;
+}
+
+/// How many are null? Use `== null`.
+fn countMissing(values: []const ?u32) usize {
+    var n: usize = 0;
+    for (values) |maybe| {
+        if (maybe == null) n += 1;
+    }
+    return n;
+}
+
+test &quot;tonnageOr50&quot; {
+    try std.testing.expectEqual(@as(u8, 75), tonnageOr50(75));
+    try std.testing.expectEqual(@as(u8, 50), tonnageOr50(null));
+}
+
+test &quot;firstPresent&quot; {
+    try std.testing.expectEqual(@as(?u32, 2), firstPresent(null, 2, 3));
+    try std.testing.expectEqual(@as(?u32, 3), firstPresent(null, null, 3));
+    try std.testing.expectEqual(@as(?u32, null), firstPresent(null, null, null));
+}
+
+test &quot;sumPresent and countMissing&quot; {
+    const vals = [_]?u32{ 1, null, 4, null, 10 };
+    try std.testing.expectEqual(@as(u32, 15), sumPresent(&amp;vals));
+    try std.testing.expectEqual(@as(usize, 2), countMissing(&amp;vals));
+}</code></pre>
+  <p><code>a orelse b orelse c</code> works because <code>orelse</code> is right-associative: <code>a orelse (b orelse c)</code>. Its right-hand side is a <code>?u32</code>, so the whole expression is still an optional, which is what the test expects.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 15.3 · Write your own iterator <span class="level">practice</span></h4>
+  <p>Give <code>Range</code> a <code>next</code> method that returns <code>?u32</code>, then write <code>sum</code> as a <code>while (it.next()) |v|</code> loop. File: <code>exercises/15-optionals/ex3_iterator.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 15, exercise 3: write your own iterator.
+//! Run with:  zig test ex3_iterator.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// Yields `start`, `start + step`, ... while the value is below `end`.
+const Range = struct {
+    next_value: u32,
+    end: u32,
+    step: u32,
+
+    fn init(start: u32, end: u32, step: u32) Range {
+        return .{ .next_value = start, .end = end, .step = step };
+    }
+
+    /// Return the next value, or null once the range is exhausted.
+    fn next(self: *Range) ?u32 {
+        if (self.next_value &gt;= self.end) return null;
+        const v = self.next_value;
+        self.next_value += self.step;
+        return v;
+    }
+};
+
+/// Drain an iterator with `while (it.next()) |v|` and add up the values.
+fn sum(it: *Range) u32 {
+    var total: u32 = 0;
+    while (it.next()) |v| total += v;
+    return total;
+}
+
+test &quot;range yields then stops&quot; {
+    var r = Range.init(0, 10, 3);
+    try std.testing.expectEqual(@as(?u32, 0), r.next());
+    try std.testing.expectEqual(@as(?u32, 3), r.next());
+    try std.testing.expectEqual(@as(?u32, 6), r.next());
+    try std.testing.expectEqual(@as(?u32, 9), r.next());
+    try std.testing.expectEqual(@as(?u32, null), r.next());
+    try std.testing.expectEqual(@as(?u32, null), r.next());
+}
+
+test &quot;sum drains it&quot; {
+    var r = Range.init(1, 5, 1);
+    try std.testing.expectEqual(@as(u32, 10), sum(&amp;r));
+    var empty = Range.init(5, 5, 1);
+    try std.testing.expectEqual(@as(u32, 0), sum(&amp;empty));
+}</code></pre>
+  <p><code>next</code> takes <code>*Range</code> because it must change the stored counter. Once exhausted it keeps returning <code>null</code>, which is the polite behaviour for an iterator and is what the last two assertions check.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 15.4 · Optional fields and optional pointers <span class="level">challenge</span></h4>
+  <p>Complete <code>isAvailable</code> (a guard on an optional field), <code>oldest</code> (returns <code>?*const Person</code>, skipping people with no birthday) and <code>firstAvailable</code>. File: <code>exercises/15-optionals/ex4_fields.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 15, exercise 4: optional fields and optional pointers.
+//! Run with:  zig test ex4_fields.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const Person = struct {
+    name: []const u8,
+    born_day: ?i32 = null,
+    leave_until_day: ?u32 = null,
+
+    /// Available unless on leave that has not yet ended.
+    fn isAvailable(self: Person, day: u32) bool {
+        if (self.leave_until_day) |until| return day &gt; until;
+        return true;
+    }
+};
+
+/// Pointer to the person with the smallest known birthday, or null if
+/// nobody has a birthday on record.
+fn oldest(people: []const Person) ?*const Person {
+    var best: ?*const Person = null;
+    for (people) |*p| {
+        const born = p.born_day orelse continue;
+        if (best) |b| {
+            if (born &lt; b.born_day.?) best = p;
+        } else {
+            best = p;
+        }
+    }
+    return best;
+}
+
+/// Pointer to the first available person, or null.
+fn firstAvailable(people: []const Person, day: u32) ?*const Person {
+    for (people) |*p| if (p.isAvailable(day)) return p;
+    return null;
+}
+
+const crew = [_]Person{
+    .{ .name = &quot;Ada&quot;, .born_day = 200, .leave_until_day = 40 },
+    .{ .name = &quot;Bo&quot; },
+    .{ .name = &quot;Cy&quot;, .born_day = 120 },
+};
+
+test &quot;isAvailable&quot; {
+    try std.testing.expect(!crew[0].isAvailable(30));
+    try std.testing.expect(crew[0].isAvailable(41));
+    try std.testing.expect(crew[1].isAvailable(0));
+}
+
+test &quot;oldest skips unknown birthdays&quot; {
+    const o = oldest(&amp;crew) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(&quot;Cy&quot;, o.name);
+    const nobody = [_]Person{ .{ .name = &quot;X&quot; }, .{ .name = &quot;Y&quot; } };
+    try std.testing.expect(oldest(&amp;nobody) == null);
+}
+
+test &quot;firstAvailable&quot; {
+    try std.testing.expectEqualStrings(&quot;Bo&quot;, firstAvailable(&amp;crew, 10).?.name);
+    try std.testing.expectEqualStrings(&quot;Ada&quot;, firstAvailable(&amp;crew, 50).?.name);
+    const all_away = [_]Person{.{ .name = &quot;Z&quot;, .leave_until_day = 99 }};
+    try std.testing.expect(firstAvailable(&amp;all_away, 10) == null);
+}</code></pre>
+  <p>In <code>oldest</code>, <code>orelse continue</code> skips a person with no birthday in one line. The running best is itself an optional pointer, so the body uses an <code>if … |b| … else</code> to distinguish "no candidate yet" from "compare with the candidate". The <code>b.born_day.?</code> is safe because we only ever store people whose birthday is present.</p></details>
+</div>
+
+<h3 id="ch15-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does the compiler say if you assign a <code>?u32</code> to a <code>u32</code>? <details class="answer"><summary>Answer</summary>"expected type 'u32', found '?u32'", with a note that you cannot convert an optional to its payload type, and a hint to use <code>.?</code>, <code>orelse</code> or <code>if</code>.</details></li>
+  <li>What is the difference between <code>x orelse 0</code> and <code>x orelse return</code>? <details class="answer"><summary>Answer</summary>The first substitutes 0 when <code>x</code> is null and continues. The second leaves the function when <code>x</code> is null; the variable being assigned only exists on the present path.</details></li>
+  <li>When is <code>.?</code> appropriate? <details class="answer"><summary>Answer</summary>When null would be a bug, not a normal outcome: the value was produced or checked by code you control. It panics in Debug if it is wrong. Never use it on user input.</details></li>
+  <li>How many bytes does <code>?*u32</code> take on a 64-bit machine, and why? <details class="answer"><summary>Answer</summary>8, the same as <code>*u32</code>. Pointers cannot be zero, so the zero bit pattern represents null with no extra storage.</details></li>
+  <li>How does a <code>while</code> loop know when an iterator is finished? <details class="answer"><summary>Answer</summary><code>while (it.next()) |v|</code> stops the first time <code>next</code> returns null. Any function returning <code>?T</code> can be an iterator.</details></li>
+  <li>Is <code>if (a) |v| if (v.b) |w| …</code> legal, and what does it mean? <details class="answer"><summary>Answer</summary>Yes. The body of the outer <code>if</code> is another <code>if</code>. It runs the innermost block only when both <code>a</code> and <code>a.b</code> are present.</details></li>
+  <li>Can an optional be compared with <code>==</code>? <details class="answer"><summary>Answer</summary>Yes, both to <code>null</code> and to a plain value of the payload type. <code>a == 4</code> is false when <code>a</code> is null.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>?T</code> is a type that holds either a <code>T</code> or <code>null</code>; a <code>T</code> coerces into it, never the other way.</li>
+<li>Unwrap with <code>orelse</code> (a fallback value, or <code>return</code>/<code>break</code>/<code>continue</code>/<code>unreachable</code>), with <code>if (x) |v| … else …</code>, or with <code>.?</code>, which panics on null.</li>
+<li><code>while (it.next()) |v|</code> is the iterator protocol; any <code>?T</code>-returning function drives it.</li>
+<li><code>?*T</code> and <code>?[]T</code> cost nothing extra; <code>?u32</code> costs padding.</li>
+<li>Optional fields with <code>= null</code> defaults express "not yet"; chains of captures peel one layer each.</li>
+<li>The point is that every possible absence is in the type, and every place you remove it is visible in the code.</li>
+</ul></div>
+</section>

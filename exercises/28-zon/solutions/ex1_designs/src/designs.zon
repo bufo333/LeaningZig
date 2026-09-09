@@ -1,0 +1,7 @@
+// The design catalogue. Typed against `Design` in designs.zig.
+.{
+    .{ .key = "LCT-1V", .name = "Locust", .tonnage = 20, .rarity = .common, .walk_mp = 8 },
+    .{ .key = "SHD-2H", .name = "Shadow Hawk", .tonnage = 55, .rarity = .common, .jump_mp = 3 },
+    .{ .key = "WHM-6R", .name = "Warhammer", .tonnage = 70, .rarity = .uncommon },
+    .{ .key = "AS7-D", .name = "Atlas", .tonnage = 100, .rarity = .rare, .walk_mp = 3 },
+}

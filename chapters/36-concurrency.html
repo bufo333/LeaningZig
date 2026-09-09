@@ -1,0 +1,418 @@
+<section id="ch36">
+<h2>36. Threads and atomics</h2>
+<p class="goals"><strong>In this chapter</strong> you will start threads with <code>std.Thread.spawn</code>, wait for them with <code>join</code>, and see exactly what goes wrong when two threads touch the same variable. Then you will fix it three ways: give each thread its own slot, use an atomic, or take a mutex. You will meet <code>std.Io.Group</code> for running a batch of tasks, and learn when a program should not use threads at all.</p>
+
+<h3 id="ch36-1">36.1 Spawn and join</h3>
+<p>A thread is a second instruction pointer running through your program at the same time as the first, sharing all the same memory. Zig starts one with <code>std.Thread.spawn</code>, which takes a configuration struct (usually empty), a function, and a tuple of arguments for that function. It returns a <code>Thread</code> handle, or an error if the OS refused. <code>join</code> blocks until the thread's function returns.</p>
+<div class="file">t1_hello.zig</div>
+<pre><code>const std = @import("std");
+
+fn greet(name: []const u8, times: u32) void {
+    for (0..times) |i| std.debug.print("{s} {d}\n", .{ name, i });
+}
+
+pub fn main() !void {
+    const t = try std.Thread.spawn(.{}, greet, .{ "worker", 3 });
+    greet("main", 3);
+    t.join();
+    std.debug.print("done\n", .{});
+}</code></pre>
+<pre class="term">$ zig run t1_hello.zig
+main 0
+main 1
+main 2
+worker 0
+worker 1
+worker 2
+done</pre>
+<p>Run it a few times and the lines interleave differently, or not at all, depending on how the operating system schedules the two threads. That is the first lesson: <em>the order in which threads run is not yours to choose</em>. The only ordering guarantee in this program is that <code>done</code> comes after both, because <code>join</code> waits.</p>
+<p>The arguments tuple <code>.{ "worker", 3 }</code> is matched to <code>greet</code>'s parameters at compile time, so passing the wrong number or type is a compile error rather than a crash. The values are copied into the new thread; to share something, pass a pointer (next section). Every thread you spawn must eventually be <code>join</code>ed (or <code>detach</code>ed if you truly do not care when it ends); forgetting is a resource leak, and a program that returns from <code>main</code> while threads are still running ends them abruptly.</p>
+
+<h3 id="ch36-2">36.2 The data race</h3>
+<p>Because threads share memory, two of them can write the same variable. Here four threads each add one to a global counter a hundred thousand times.</p>
+<div class="file">t2_race.zig</div>
+<pre><code>const std = @import("std");
+
+var counter: u64 = 0;
+
+fn bump() void {
+    for (0..100_000) |_| counter += 1;
+}
+
+pub fn main() !void {
+    var threads: [4]std.Thread = undefined;
+    for (&amp;threads) |*t| t.* = try std.Thread.spawn(.{}, bump, .{});
+    for (threads) |t| t.join();
+    std.debug.print("counter = {d} (wanted 400000)\n", .{counter});
+}</code></pre>
+<pre class="term">$ zig run t2_race.zig
+counter = 103977 (wanted 400000)
+$ zig run t2_race.zig
+counter = 103684 (wanted 400000)</pre>
+<p>Not 400,000, and a different wrong number every run. <code>counter += 1</code> is three steps on the machine: read the value, add one, write it back. If thread A reads 50, thread B reads 50, both add one and both write 51, one increment has vanished. With four threads hammering the same cache line, most of them vanish.</p>
+<div class="warn"><strong>This is undefined behaviour, not just a wrong answer.</strong> Zig, like C, defines a program with a data race as having no meaning at all. The numbers above are what happened on this machine today; on another CPU or with <code>-O ReleaseFast</code> the compiler may hoist the load out of the loop and print 100000, or anything else. Do not reason about what a race "usually" does. Remove it.</div>
+<p>There are three honest ways to remove it, and the rest of the chapter is those three.</p>
+
+<h3 id="ch36-3">36.3 Fix one: do not share</h3>
+<p>The best synchronisation is none. If every thread writes to its own slot and only the main thread reads the slots after <code>join</code>, there is nothing to race on. This is how nearly all "split the work in N pieces" programs should look.</p>
+<div class="file">t5_parts.zig</div>
+<pre><code>const std = @import("std");
+
+fn sumChunk(chunk: []const u64, out: *u64) void {
+    var s: u64 = 0;
+    for (chunk) |v| s += v;
+    out.* = s;
+}
+
+pub fn main() !void {
+    var data: [1000]u64 = undefined;
+    for (&amp;data, 0..) |*d, i| d.* = i;
+
+    var parts: [4]u64 = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&amp;threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, sumChunk, .{ data[i * 250 .. (i + 1) * 250], &amp;parts[i] });
+    }
+    for (threads) |t| t.join();
+    std.debug.print("parts {any}\n", .{parts});
+    std.debug.print("total {d}\n", .{parts[0] + parts[1] + parts[2] + parts[3]});
+}</code></pre>
+<pre class="term">$ zig run t5_parts.zig
+parts { 31125, 93625, 156125, 218625 }
+total 499500</pre>
+<p>Each thread receives a slice of the input (a view, not a copy) and a pointer to exactly one element of <code>parts</code>. The slices do not overlap and the pointers are distinct, so no two threads ever touch the same byte. <code>join</code> is what makes the main thread's reads of <code>parts</code> safe: joining a thread is a guarantee that everything it wrote is visible afterwards. The pattern generalises: chunk the input, one output slot per chunk, join, reduce.</p>
+
+<h3 id="ch36-4">36.4 Fix two: atomics</h3>
+<p>Sometimes threads really do need one shared number: a progress counter, a "stop now" flag, an ID generator. For a single machine word, the CPU can do read-modify-write as one indivisible step, and Zig exposes that as <code>std.atomic.Value(T)</code>.</p>
+<div class="file">t3_atomic.zig</div>
+<pre><code>const std = @import("std");
+
+var counter: std.atomic.Value(u64) = .init(0);
+
+fn bump() void {
+    for (0..100_000) |_| _ = counter.fetchAdd(1, .monotonic);
+}
+
+pub fn main() !void {
+    var threads: [4]std.Thread = undefined;
+    for (&amp;threads) |*t| t.* = try std.Thread.spawn(.{}, bump, .{});
+    for (threads) |t| t.join();
+    std.debug.print("counter = {d}\n", .{counter.load(.seq_cst)});
+}</code></pre>
+<pre class="term">$ zig run t3_atomic.zig
+counter = 400000</pre>
+<p>Exactly right, every time. <code>fetchAdd(1, .monotonic)</code> adds one atomically and returns the old value (which we discard with <code>_ =</code>). The methods are <code>load</code>, <code>store</code>, <code>swap</code>, <code>fetchAdd</code>, <code>fetchSub</code>, <code>fetchAnd</code>, <code>fetchOr</code>, <code>cmpxchgStrong</code> and <code>cmpxchgWeak</code>, and each takes a memory ordering as its last argument. <code>.init(0)</code> is the initial value.</p>
+<p>The ordering argument answers a question you might not know you were asking: "when this thread sees this atomic change, which of the <em>other</em> writes made before it is it guaranteed to see too?" The choices are <code>.monotonic</code>, <code>.acquire</code>, <code>.release</code>, <code>.acq_rel</code> and <code>.seq_cst</code>. For a beginner, two rules cover almost everything:</p>
+<ul>
+<li>If the atomic is the only thing shared (a pure counter), <code>.monotonic</code> is enough: you want the arithmetic to be atomic and nothing else.</li>
+<li>If the atomic <em>announces</em> other data ("the buffer is ready", "please stop"), the writer uses <code>.release</code> and the reader uses <code>.acquire</code>. Together they promise the reader sees everything the writer did before the store.</li>
+</ul>
+<p>When in doubt, <code>.seq_cst</code> is the strongest and always correct, merely a little slower. Here is the announcement pattern, a stop flag:</p>
+<div class="file">t7_flag.zig</div>
+<pre><code>const std = @import("std");
+
+var stop: std.atomic.Value(bool) = .init(false);
+var ticks: std.atomic.Value(u32) = .init(0);
+
+fn spin() void {
+    while (!stop.load(.acquire)) _ = ticks.fetchAdd(1, .monotonic);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const t = try std.Thread.spawn(.{}, spin, .{});
+    try init.io.sleep(.fromMilliseconds(20), .awake);
+    stop.store(true, .release);
+    t.join();
+    std.debug.print("worker ticked {d} times before it saw the flag\n", .{ticks.load(.seq_cst)});
+}</code></pre>
+<pre class="term">$ zig run t7_flag.zig
+worker ticked 10134572 times before it saw the flag</pre>
+<p>The worker spins reading the flag with <code>.acquire</code>; main sleeps 20 ms and stores <code>true</code> with <code>.release</code>. Without atomics, the compiler would be entitled to read <code>stop</code> once, see <code>false</code>, and loop forever; the atomic load tells it the value can change under its feet.</p>
+
+<h3 id="ch36-5">36.5 Fix three: a mutex</h3>
+<p>Atomics cover one word. When the shared thing is bigger (a list, a hash map, two fields that must change together), you need a lock. A mutex ("mutual exclusion") is a token only one thread can hold; while a thread holds it, everyone else who asks waits. In 0.16 the mutex lives in <code>std.Io</code>, because waiting for a lock is a blocking operation the I/O layer wants to know about, so <code>lock</code> and <code>unlock</code> take the <code>io</code> value.</p>
+<div class="file">t4_mutex.zig</div>
+<pre><code>const std = @import("std");
+
+var mutex: std.Io.Mutex = .init;
+var total: u64 = 0;
+var names: std.ArrayList([]const u8) = .empty;
+
+fn work(io: std.Io, gpa: std.mem.Allocator, name: []const u8, pay: u64) !void {
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    total += pay;
+    try names.append(gpa, name);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    defer names.deinit(gpa);
+    const t1 = try std.Thread.spawn(.{}, work, .{ io, gpa, "Grayson", 1500 });
+    const t2 = try std.Thread.spawn(.{}, work, .{ io, gpa, "Clay", 800 });
+    t1.join();
+    t2.join();
+    std.debug.print("total {d}, {d} names\n", .{ total, names.items.len });
+}</code></pre>
+<pre class="term">$ zig run t4_mutex.zig
+total 2300, 2 names</pre>
+<p>The shape to memorise is the pair: <code>lock</code> immediately followed by <code>defer unlock</code>. Whatever happens between them, including an early <code>return</code> or a <code>try</code> that fails, the lock is released. Everything that touches <code>total</code> or <code>names</code> happens inside that window, so the two threads take turns, and the <code>ArrayList</code>'s internal pointer juggling is never interrupted half way.</p>
+<p><code>lockUncancelable</code> is the plain blocking form. There is also <code>try mutex.lock(io)</code>, which can return <code>error.Canceled</code> if the task is cancelled while waiting; use it inside code that participates in cancellation, and the uncancelable form everywhere else.</p>
+<div class="warn"><strong>Gone in 0.16.</strong> <code>std.Thread.Mutex</code>, <code>std.Thread.Pool</code> and <code>std.Thread.WaitGroup</code> no longer exist. The mutex is <code>std.Io.Mutex</code> (initialised with <code>.init</code>, methods take <code>io</code>), and the pool-and-wait-group job is done by <code>std.Io.Group</code>, next. If you see the old names in a tutorial, translate.</div>
+<p>Hold locks briefly, and never call out to unknown code while holding one. The classic mistake is thread A holding lock 1 waiting for lock 2 while thread B holds 2 waiting for 1: a deadlock, and both wait forever. One lock per program, held for a few lines at a time, avoids it entirely.</p>
+
+<h3 id="ch36-6">36.6 A group of tasks: std.Io.Group</h3>
+<p>Spawning and joining threads by hand is fine for four fixed workers. For "run these N things and wait for all of them", 0.16 offers <code>std.Io.Group</code>. You call <code>group.async(io, function, args)</code> once per task and <code>group.await(io)</code> once at the end. The <code>io</code> implementation decides how to run them: the default <code>Threaded</code> implementation you get from <code>main</code> uses a pool of OS threads sized to the machine.</p>
+<div class="file">t6_group.zig</div>
+<pre><code>const std = @import("std");
+
+fn sumChunk(chunk: []const u64, out: *u64) void {
+    var s: u64 = 0;
+    for (chunk) |v| s += v;
+    out.* = s;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var data: [1000]u64 = undefined;
+    for (&amp;data, 0..) |*d, i| d.* = i;
+
+    var parts: [4]u64 = undefined;
+    var group: std.Io.Group = .init;
+    for (0..4) |i| group.async(io, sumChunk, .{ data[i * 250 .. (i + 1) * 250], &amp;parts[i] });
+    try group.await(io);
+    std.debug.print("total {d}\n", .{parts[0] + parts[1] + parts[2] + parts[3]});
+    std.debug.print("this machine has {d} cpus\n", .{try std.Thread.getCpuCount()});
+}</code></pre>
+<pre class="term">$ zig run t6_group.zig
+total 499500
+this machine has 14 cpus</pre>
+<p>Same work as 36.3, no thread handles to manage. <code>std.Thread.getCpuCount()</code> tells you how many hardware threads exist, which is the natural upper bound on how many chunks are worth making. <code>await</code> returns <code>error.Canceled</code> if the group was cancelled, hence the <code>try</code>. The functions you hand to a group must return <code>void</code> or an error union that includes <code>error.Canceled</code>; plain <code>void</code>, as here, is simplest.</p>
+<div class="note"><strong>The async story, in one paragraph.</strong> <code>Group.async</code> is one corner of a larger design. <code>std.Io</code> in 0.16 also has <code>io.async</code> and <code>io.concurrent</code>, which return a <code>Future</code> you later <code>await</code>, plus cancellation that propagates through them. The point of putting all of this behind the <code>io</code> value is that the <em>same</em> code can run on a thread pool today (<code>std.Io.Threaded</code>) and on an event loop tomorrow, without changing the call sites. This book stops here; the standard library's <code>Io.zig</code> has the reference, and the language keywords <code>async</code>/<code>await</code> from older Zig versions are gone.</div>
+
+<h3 id="ch36-7">36.7 When not to use threads</h3>
+<p>Threads make a program faster only when there is enough independent work to keep more than one core busy, and they make every program harder to reason about. Some honest guidance:</p>
+<ul>
+<li><strong>A turn-based simulation does not need them.</strong> IRON LEDGER advances one day in a few microseconds. Adding threads would add nothing but the risk of a data race breaking determinism.</li>
+<li><strong>I/O-bound work rarely needs them.</strong> Waiting for a disk or a socket does not use a core. The <code>std.Io</code> design exists so such waiting can overlap without you managing threads.</li>
+<li><strong>Small inputs do not need them.</strong> Spawning a thread costs tens of microseconds; summing a thousand numbers costs less than one. Exercise 36.4 measures this.</li>
+<li><strong>Anything touching a random generator or a hash map from two threads is wrong</strong> until you add a lock, and once you add the lock the threads mostly wait for each other.</li>
+</ul>
+<p>The places threads do pay off: big, chunkable, CPU-heavy work (image processing, batch parsing, running many independent simulations for statistics); and keeping a user interface responsive while something slow happens in the background. If your program is neither, single-threaded is not a compromise, it is the right design.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The simulation core in <code>src/sim/</code> is single-threaded on purpose: the golden-master test in <code>src/sim/commands.zig</code> demands that the same seed and script always produce the same state hash, and a second thread drawing from the RNG or appending to a list would break that in ways no test could reliably catch. The one place the game reaches for concurrency is the terminal client, where the soundtrack plays in a separate <em>process</em>, not a thread: <code>src/tui/music.zig</code> starts the player with <code>std.process.spawn(io, ...)</code> and reaps it with <code>std.c.waitpid</code>, so the audio can be killed and restarted without any shared memory at all. That is a good rule of thumb: prefer a process when the two halves share nothing, a thread only when they must share memory, and neither when the work is small.</div>
+
+<h3 id="ch36-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 36.1 · Spawn and join <span class="level">warm-up</span></h4>
+  <p>Start four workers, each summing its own quarter of <code>0..1_000_000</code> into its own slot, join them, and print the total. Name the file: <code>exercises/36-concurrency/ex1_spawn.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 36, exercise 1: spawn and join.
+//! Run with:  zig run ex1_spawn.zig
+//! Goal: start four worker threads, each computing the sum of its own
+//! range into its own slot, then join them and add the slots. The
+//! per-thread lines may appear in any order. Expected output:
+//!   worker 0: 0..250000
+//!   worker 1: 250000..500000
+//!   worker 2: 500000..750000
+//!   worker 3: 750000..1000000
+//!   total = 499999500000
+
+const std = @import("std");
+
+fn worker(id: usize, lo: u64, hi: u64, out: *u64) void {
+    std.debug.print("worker {d}: {d}..{d}\n", .{ id, lo, hi });
+    var s: u64 = 0;
+    var i = lo;
+    while (i &lt; hi) : (i += 1) s += i;
+    out.* = s;
+}
+
+pub fn main() !void {
+    const n_threads = 4;
+    const total_n: u64 = 1_000_000;
+    var slots: [n_threads]u64 = undefined;
+    var threads: [n_threads]std.Thread = undefined;
+    const chunk = total_n / n_threads;
+    for (&amp;threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, worker, .{ i, i * chunk, (i + 1) * chunk, &amp;slots[i] });
+    }
+    for (threads) |t| t.join();
+    var total: u64 = 0;
+    for (slots) |s| total += s;
+    std.debug.print("total = {d}\n", .{total});
+}</code></pre>
+  <p>The per-thread lines come out in scheduler order, so they differ between runs, but the total is always 499999500000 because each slot is written by exactly one thread and read only after <code>join</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 36.2 · A shared counter, done right <span class="level">practice</span></h4>
+  <p>Write <code>bumpAtomic</code>, using <code>std.atomic.Value(u64)</code>, and <code>bumpMutex</code>, using <code>std.Io.Mutex</code> around a plain <code>u64</code>, so that four threads each adding 100,000 produce exactly 400,000. The test file gets its <code>io</code> from <code>std.testing.io</code>. Name the file: <code>exercises/36-concurrency/ex2_counter.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 36, exercise 2: a shared counter, three ways.
+//! Run with:  zig test ex2_counter.zig
+//! Goal: fill in the atomic and mutex versions of `bump` so both tests
+//! count exactly 4 * 100_000. The plain version is left as a demonstration
+//! of a data race and is not tested (its result is not defined).
+
+const std = @import("std");
+
+const per_thread = 100_000;
+const n_threads = 4;
+
+var atomic_count: std.atomic.Value(u64) = .init(0);
+
+fn bumpAtomic() void {
+    for (0..per_thread) |_| _ = atomic_count.fetchAdd(1, .monotonic);
+}
+
+var mutex_count: u64 = 0;
+var mutex: std.Io.Mutex = .init;
+
+fn bumpMutex(io: std.Io) void {
+    for (0..per_thread) |_| {
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
+        mutex_count += 1;
+    }
+}
+
+test "atomic counter is exact" {
+    var threads: [n_threads]std.Thread = undefined;
+    for (&amp;threads) |*t| t.* = try std.Thread.spawn(.{}, bumpAtomic, .{});
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u64, n_threads * per_thread), atomic_count.load(.seq_cst));
+}
+
+test "mutex counter is exact" {
+    const io = std.testing.io;
+    var threads: [n_threads]std.Thread = undefined;
+    for (&amp;threads) |*t| t.* = try std.Thread.spawn(.{}, bumpMutex, .{io});
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u64, n_threads * per_thread), mutex_count);
+}</code></pre>
+  <p>The atomic version needs no <code>io</code>; the mutex version does, so it is passed as a thread argument. Note <code>std.testing.io</code>: tests are given a working I/O implementation, which is also what you would use to test file code. Try timing both: the mutex version is many times slower, because every increment is a lock and unlock.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 36.3 · Parallel sum over a slice <span class="level">practice</span></h4>
+  <p>Write <code>parallelSum(data, n_threads)</code> that splits any slice into <code>n_threads</code> chunks (the last one may be short, and there may be fewer items than threads), sums each on its own thread, and returns the total. Tests compare with a serial sum for 1001 items and 4 or 7 threads, and check a 2-item slice with 8 threads and an empty slice. Name the file: <code>exercises/36-concurrency/ex3_parallel_sum.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 36, exercise 3: a parallel sum over a slice.
+//! Run with:  zig test ex3_parallel_sum.zig
+//! Goal: implement `parallelSum` so it splits `data` into `n_threads`
+//! chunks, sums each chunk on its own thread, and returns the total.
+//! Handle a slice shorter than n_threads and a remainder chunk.
+
+const std = @import("std");
+
+fn sumChunk(chunk: []const u32, out: *u64) void {
+    var s: u64 = 0;
+    for (chunk) |v| s += v;
+    out.* = s;
+}
+
+pub fn parallelSum(data: []const u32, comptime n_threads: usize) !u64 {
+    var partial = [_]u64{0} ** n_threads;
+    var threads: [n_threads]?std.Thread = [_]?std.Thread{null} ** n_threads;
+    const chunk_len = (data.len + n_threads - 1) / n_threads; // ceil
+    for (0..n_threads) |i| {
+        const lo = @min(i * chunk_len, data.len);
+        const hi = @min(lo + chunk_len, data.len);
+        if (lo == hi) break; // fewer items than threads
+        threads[i] = try std.Thread.spawn(.{}, sumChunk, .{ data[lo..hi], &amp;partial[i] });
+    }
+    for (threads) |maybe| if (maybe) |t| t.join();
+    var total: u64 = 0;
+    for (partial) |p| total += p;
+    return total;
+}
+
+test "matches a serial sum" {
+    var data: [1001]u32 = undefined;
+    for (&amp;data, 0..) |*d, i| d.* = @intCast(i);
+    var serial: u64 = 0;
+    for (data) |v| serial += v;
+    try std.testing.expectEqual(serial, try parallelSum(&amp;data, 4));
+    try std.testing.expectEqual(serial, try parallelSum(&amp;data, 7));
+}
+
+test "short slices and empty slices" {
+    const two = [_]u32{ 5, 6 };
+    try std.testing.expectEqual(@as(u64, 11), try parallelSum(&amp;two, 8));
+    const none = [_]u32{};
+    try std.testing.expectEqual(@as(u64, 0), try parallelSum(&amp;none, 4));
+}</code></pre>
+  <p>The chunk length is rounded up, so the last chunk absorbs the remainder; <code>@min</code> clamps both bounds to the slice; and an empty chunk means "no more work", so we <code>break</code> and leave the remaining thread handles <code>null</code>. Storing <code>?std.Thread</code> lets the join loop skip the threads that were never started.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 36.4 · The same work with Io.Group <span class="level">challenge</span></h4>
+  <p>Allocate one hundred million <code>u64</code>s, sum them once with eight raw threads and once with an <code>std.Io.Group</code> of eight tasks, and time both with the monotonic clock. Print the CPU count. Then shrink the input to a thousand elements and observe that the timings are dominated by thread start-up. Name the file: <code>exercises/36-concurrency/ex4_group.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 36, exercise 4: the same work with std.Io.Group.
+//! Run with:  zig run ex4_group.zig
+//! Goal: rewrite the parallel sum with an Io.Group instead of raw
+//! threads, and time both. Expected output (timings vary):
+//!   threads: 4999999950000000 in 30 ms
+//!   group:   4999999950000000 in 30 ms
+//!   cpus: 14
+
+const std = @import("std");
+
+fn sumChunk(chunk: []const u64, out: *u64) void {
+    var s: u64 = 0;
+    for (chunk) |v| s += v;
+    out.* = s;
+}
+
+const n = 100_000_000;
+const n_tasks = 8;
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const data = try init.gpa.alloc(u64, n);
+    defer init.gpa.free(data);
+    for (data, 0..) |*d, i| d.* = i;
+    var parts: [n_tasks]u64 = undefined;
+    const chunk = n / n_tasks;
+
+    var t0 = std.Io.Clock.now(.awake, io);
+    var threads: [n_tasks]std.Thread = undefined;
+    for (&amp;threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, sumChunk, .{ data[i * chunk .. (i + 1) * chunk], &amp;parts[i] });
+    }
+    for (threads) |t| t.join();
+    var total: u64 = 0;
+    for (parts) |p| total += p;
+    var t1 = std.Io.Clock.now(.awake, io);
+    std.debug.print("threads: {d} in {d} ms\n", .{ total, t0.durationTo(t1).toMilliseconds() });
+
+    t0 = std.Io.Clock.now(.awake, io);
+    var group: std.Io.Group = .init;
+    for (0..n_tasks) |i| {
+        group.async(io, sumChunk, .{ data[i * chunk .. (i + 1) * chunk], &amp;parts[i] });
+    }
+    try group.await(io);
+    total = 0;
+    for (parts) |p| total += p;
+    t1 = std.Io.Clock.now(.awake, io);
+    std.debug.print("group:   {d} in {d} ms\n", .{ total, t0.durationTo(t1).toMilliseconds() });
+    std.debug.print("cpus: {d}\n", .{try std.Thread.getCpuCount()});
+}</code></pre>
+  <p>Both versions take about the same time, because the group is a thread pool underneath. The value of the group is not speed but bookkeeping: no handle array, no join loop, and the pool is already sized to the machine. Compare the code of the two halves and notice which one you would rather maintain.</p></details>
+</div>
+
+<h3 id="ch36-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Why did the plain counter print 103977 instead of 400000, and why is the exact number meaningless? <details class="answer"><summary>Answer</summary><code>counter += 1</code> is a read, an add and a write; two threads interleaving those steps lose increments. A program with a data race has undefined behaviour, so the value depends on the CPU, the optimiser and luck.</details></li>
+  <li>What does <code>join</code> guarantee besides "the thread has finished"? <details class="answer"><summary>Answer</summary>That everything the thread wrote is visible to the joining thread afterwards. That is what makes reading the per-thread slots after <code>join</code> safe without any atomics.</details></li>
+  <li>When is <code>.monotonic</code> ordering enough, and when do you need <code>.release</code>/<code>.acquire</code>? <details class="answer"><summary>Answer</summary><code>.monotonic</code> suffices when the atomic itself is the only shared data (a counter). When the atomic announces other data ("buffer ready", "stop"), the writer stores with <code>.release</code> and the reader loads with <code>.acquire</code>.</details></li>
+  <li>Write the idiomatic mutex pair in 0.16. <details class="answer"><summary>Answer</summary><code>mutex.lockUncancelable(io); defer mutex.unlock(io);</code> with <code>var mutex: std.Io.Mutex = .init;</code>. Note that <code>std.Thread.Mutex</code> is gone.</details></li>
+  <li>Why must a function given to <code>std.Thread.spawn</code> receive a pointer to write its result, rather than returning it? <details class="answer"><summary>Answer</summary>A spawned function may only return <code>void</code>, <code>!void</code>, <code>u8</code> or <code>noreturn</code>, and <code>join</code> does not hand the value back. Writing through a pointer to a slot the caller owns is how results come back, and <code>join</code> makes the write visible.</details></li>
+  <li>What replaced <code>std.Thread.Pool</code> and <code>WaitGroup</code>? <details class="answer"><summary>Answer</summary><code>std.Io.Group</code>: <code>group.async(io, fn, args)</code> per task and <code>try group.await(io)</code> to wait for all of them. The default <code>Io.Threaded</code> runs them on a thread pool.</details></li>
+  <li>Give two reasons IRON LEDGER's simulation stays single-threaded. <details class="answer"><summary>Answer</summary>A day's work is far too small to benefit, and any second thread touching the RNG, the maps or the lists would destroy the determinism the golden-master test guards.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>std.Thread.spawn(.{}, f, .{args})</code> starts a thread; <code>t.join()</code> waits and makes its writes visible. Arguments are copied; share by pointer.</li>
+<li>Two threads writing one variable without synchronisation is a data race: undefined behaviour, not merely a wrong count.</li>
+<li>Fix it by not sharing (one slot per thread), with <code>std.atomic.Value(T)</code> (<code>load</code>, <code>store</code>, <code>fetchAdd</code>, orderings <code>.monotonic</code>/<code>.acquire</code>/<code>.release</code>/<code>.seq_cst</code>), or with <code>std.Io.Mutex</code> and <code>lockUncancelable</code>/<code>defer unlock</code>.</li>
+<li><code>std.Io.Group</code> runs a batch of tasks on the I/O layer's thread pool; <code>std.Thread.getCpuCount()</code> sizes the batch. <code>std.Thread.Mutex</code>, <code>Pool</code> and <code>WaitGroup</code> are gone in 0.16.</li>
+<li>Use threads for large, chunkable, CPU-bound work; prefer a process when nothing is shared; stay single-threaded when the work is small or must be deterministic.</li>
+</ul></div>
+</section>

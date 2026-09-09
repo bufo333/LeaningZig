@@ -1,0 +1,581 @@
+<section id="ch34">
+<h2>34. Time and randomness</h2>
+<p class="goals"><strong>In this chapter</strong> you will read the wall clock and the monotonic clock through <code>std.Io</code>, measure how long code takes, sleep, and do calendar arithmetic by hand the way IRON LEDGER does. Then you will meet <code>std.Random</code>: seeding a generator, rolling dice, shuffling, and, most importantly, understanding why a simulation wants its randomness to be reproducible.</p>
+
+<h3 id="ch34-1">34.1 Two clocks</h3>
+<p>Every operating system offers at least two clocks, and it matters which one you ask.</p>
+<p>The <strong>wall clock</strong> tells you what time it is in the world: seconds since midnight on the first of January 1970, UTC, the "Unix epoch". It can jump. A user changes the time zone, NTP corrects a drift, a laptop wakes from sleep; the wall clock moves accordingly, sometimes backwards.</p>
+<p>The <strong>monotonic clock</strong> tells you how long the machine has been running since some arbitrary moment. It never goes backwards. Its absolute value means nothing, but the difference between two readings is a trustworthy duration. That is the clock for "how long did this take".</p>
+<p>In Zig 0.16 both live behind <code>std.Io</code>, because reading a clock is talking to the outside world. Just as with files in <a href="#ch33">Chapter 33</a>, you need the <code>io</code> value that <code>main</code> receives. The clock is an enum, <code>std.Io.Clock</code>, and <code>now</code> is a method on it:</p>
+<div class="file">s1_wall.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const now = std.Io.Clock.now(.real, io);
+    std.debug.print("nanoseconds since 1970: {d}\n", .{now.nanoseconds});
+    std.debug.print("seconds since 1970:     {d}\n", .{now.toSeconds()});
+    const days = @divFloor(now.toSeconds(), std.time.s_per_day);
+    std.debug.print("days since 1970:        {d}\n", .{days});
+}</code></pre>
+<pre class="term">$ zig run s1_wall.zig
+nanoseconds since 1970: 1788964937601115000
+seconds since 1970:     1788964937
+days since 1970:        20705</pre>
+<p>Three things to notice. <code>Clock.now</code> returns a plain <code>std.Io.Timestamp</code>, not an error union: reading the clock cannot fail, so there is no <code>try</code>. The timestamp has one field, <code>nanoseconds</code>, of type <code>i96</code> (wide enough that it will never overflow), and helper methods <code>toSeconds</code>, <code>toMilliseconds</code> and <code>toMicroseconds</code>. And the constants for converting between units live in <code>std.time</code>: <code>ns_per_s</code>, <code>ns_per_ms</code>, <code>s_per_day</code>, <code>ms_per_min</code> and so on. They are comptime integers, so <code>@divFloor(secs, std.time.s_per_day)</code> is ordinary integer arithmetic.</p>
+<div class="note"><strong>The clock names.</strong> The variants of <code>std.Io.Clock</code> in 0.16 are <code>.real</code> (the wall clock), <code>.awake</code> (monotonic, not counting time the machine was suspended), <code>.boot</code> (monotonic, including suspend), <code>.cpu_process</code> and <code>.cpu_thread</code> (CPU time consumed). There is no variant literally called <code>monotonic</code>; when this book says "the monotonic clock" it means <code>.awake</code>. On macOS <code>.awake</code> is <code>CLOCK_UPTIME_RAW</code>, on Linux it is <code>CLOCK_MONOTONIC</code>.</div>
+<div class="warn"><strong>Gone in 0.16.</strong> <code>std.time.timestamp()</code>, <code>std.time.milliTimestamp()</code>, <code>std.time.nanoTimestamp()</code> and <code>std.time.Timer</code> no longer exist. Tutorials that use them will not compile. The replacement for all of them is <code>std.Io.Clock.now</code> plus the duration arithmetic below.</div>
+
+<h3 id="ch34-2">34.2 Measuring elapsed time</h3>
+<p>To time something, read the monotonic clock before and after, and subtract. Zig gives you a method for the subtraction, <code>durationTo</code>, which returns an <code>std.Io.Duration</code> with the same shape as a timestamp: a <code>nanoseconds</code> field and the same <code>toMilliseconds</code> family of helpers.</p>
+<div class="file">s2_elapsed.zig</div>
+<pre><code>const std = @import("std");
+
+fn slowSum(n: u64) u64 {
+    var total: u64 = 0;
+    var i: u64 = 0;
+    while (i &lt; n) : (i += 1) total +%= i;
+    return total;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const start = std.Io.Clock.now(.awake, io);
+    const result = slowSum(50_000_000);
+    const stop = std.Io.Clock.now(.awake, io);
+    const took = start.durationTo(stop);
+    std.debug.print("result {d}\n", .{result});
+    std.debug.print("took {d} ns\n", .{took.nanoseconds});
+    std.debug.print("took {d} ms\n", .{took.toMilliseconds()});
+}</code></pre>
+<pre class="term">$ zig run s2_elapsed.zig
+result 1249999975000000
+took 99296500 ns
+took 99 ms</pre>
+<p>This is the whole of what <code>std.time.Timer</code> used to do. If you find yourself timing things often, wrap it in a two-line helper struct that stores the start timestamp and has a <code>read</code> method; that is exactly what the old Timer was.</p>
+<p>Two habits make timings honest. First, run the program with <code>-O ReleaseFast</code> when you care about the number; the Debug build above spends much of its 99 ms on overflow checks (the <code>+%=</code> avoids one, but the loop counter still has them). Second, do something with the result (here we print it) so the optimiser cannot delete the work you are measuring.</p>
+
+<h3 id="ch34-3">34.3 Sleeping</h3>
+<p>Sleeping also goes through <code>io</code>, for the same reason: it is a request to the operating system. The method is <code>io.sleep(duration, clock)</code>. The duration is an <code>std.Io.Duration</code>, which you build with <code>.fromMilliseconds</code>, <code>.fromSeconds</code>, or <code>.fromNanoseconds</code>. Because the argument type is known, you can write the shorthand <code>.fromMilliseconds(200)</code> without naming the type.</p>
+<div class="file">s3_sleep.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const before = std.Io.Clock.now(.awake, io);
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const after = std.Io.Clock.now(.awake, io);
+    std.debug.print("asked for 200 ms, slept {d} ms\n", .{before.durationTo(after).toMilliseconds()});
+}</code></pre>
+<pre class="term">$ zig run s3_sleep.zig
+asked for 200 ms, slept 206 ms</pre>
+<p>Sleep can return an error, <code>error.Canceled</code>, because 0.16's I/O layer supports cancelling a blocked operation from another task. In a plain program that never happens, but the type is honest about the possibility, so you write <code>try</code>. And note the 206: sleep promises "at least this long", never "exactly this long". Never build a clock out of repeated sleeps.</p>
+
+<h3 id="ch34-4">34.4 Calendars by hand</h3>
+<p>The standard library will turn a Unix timestamp into a civil date for you (<code>std.time.epoch</code> has <code>EpochSeconds</code>, <code>getEpochDay</code>, <code>calculateYearDay</code> and <code>calculateMonthDay</code>), and that is the right tool when you need today's real date:</p>
+<div class="file">s7_epoch.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const secs = std.Io.Clock.now(.real, init.io).toSeconds();
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    std.debug.print("UTC now: {d}-{d:0&gt;2}-{d:0&gt;2} {d:0&gt;2}:{d:0&gt;2}\n", .{
+        yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(),
+    });
+}</code></pre>
+<pre class="term">$ zig run s7_epoch.zig
+UTC now: 2026-09-09 14:42</pre>
+<p>But a simulation set in the year 3025 does not want the real date; it wants its own calendar, one it can advance a day at a time, forever, and render as "3025-02-01" when the player asks. This is a small and pleasant piece of code to write yourself, and IRON LEDGER does. There are two representations to keep straight:</p>
+<ul>
+<li>A <strong>day counter</strong>: an integer, "days since the campaign began". Perfect for arithmetic. "Was this person hired more than 90 days ago?" is a subtraction. Every transaction in the game's ledger is stamped with this integer.</li>
+<li>A <strong>civil date</strong>: year, month, day. Perfect for humans and for rules that care about the calendar ("payday is the first of the month").</li>
+</ul>
+<p>The trick is to store both and advance both together, so you never convert. Advancing a civil date by one day needs only the length of the current month, and that needs only the leap year rule: divisible by 4, except years divisible by 100, except years divisible by 400.</p>
+<div class="file">s6_date.zig</div>
+<pre><code>const std = @import("std");
+
+const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+
+    fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+            4, 6, 9, 11 =&gt; 30,
+            2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+            else =&gt; unreachable,
+        };
+    }
+
+    fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+};
+
+pub fn main() void {
+    var d: Date = .{ .year = 3024, .month = 2, .day = 27 };
+    var day_index: u32 = 0;
+    for (0..4) |_| {
+        std.debug.print("day {d} = {d}-{d:0&gt;2}-{d:0&gt;2}\n", .{ day_index, d.year, d.month, d.day });
+        d = d.next();
+        day_index += 1;
+    }
+}</code></pre>
+<pre class="term">$ zig run s6_date.zig
+day 0 = 3024-02-27
+day 1 = 3024-02-28
+day 2 = 3024-02-29
+day 3 = 3024-03-01</pre>
+<p>Three details are worth a second look. <code>daysInMonth</code> uses <code>else =&gt; unreachable</code> because a month outside 1 to 12 is a bug in the caller, not a runtime condition; in Debug builds the program will stop there with a stack trace if you ever break the rule (<a href="#ch37">Chapter 37</a> has more on this choice). The <code>@as(u8, 29)</code> in the February arm forces both branches of the <code>if</code> to the same type, because <code>29</code> and <code>28</code> on their own are <code>comptime_int</code>. And <code>next</code> takes <code>self</code> by value and returns a new <code>Date</code>: no mutation, easy to test.</p>
+<p>The format specifier <code>{d:0&gt;2}</code> means "decimal, pad with zeros on the left to width 2", which is how <code>2</code> becomes <code>02</code>. <a href="#ch23">Chapter 23</a> has the full table.</p>
+
+<h3 id="ch34-5">34.5 Random numbers</h3>
+<p>Randomness in Zig is a small interface, <code>std.Random</code>, and a handful of generators that implement it. You create a generator with a seed, ask it for a <code>std.Random</code> value, and call methods on that. The generator you want by default is <code>std.Random.DefaultPrng</code>, which is Xoshiro256++: fast, good statistical quality, and 64-bit seeded.</p>
+<div class="file">s4_dice.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+
+    std.debug.print("d6:      {d}\n", .{r.intRangeAtMost(u8, 1, 6)});
+    std.debug.print("d6:      {d}\n", .{r.intRangeAtMost(u8, 1, 6)});
+    std.debug.print("0..99:   {d}\n", .{r.intRangeLessThan(u32, 0, 100)});
+    std.debug.print("any u16: {d}\n", .{r.int(u16)});
+    std.debug.print("float:   {d:.3}\n", .{r.float(f64)});
+    std.debug.print("coin:    {}\n", .{r.boolean()});
+
+    var deck = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    r.shuffle(u8, &amp;deck);
+    std.debug.print("shuffle: {any}\n", .{deck});
+
+    const weights = [_]u32{ 70, 20, 10 }; // common, uncommon, rare
+    std.debug.print("rarity:  {d}\n", .{r.weightedIndex(u32, &amp;weights)});
+
+    const Weather = enum { clear, rain, storm };
+    std.debug.print("weather: {s}\n", .{@tagName(r.enumValue(Weather))});
+}</code></pre>
+<pre class="term">$ zig run s4_dice.zig
+d6:      4
+d6:      4
+0..99:   4
+any u16: 13752
+float:   0.597
+coin:    true
+shuffle: { 2, 6, 4, 8, 7, 3, 1, 5 }
+rarity:  0
+weather: rain</pre>
+<p>The methods you will use most:</p>
+<table>
+<tr><th>Call</th><th>Gives</th></tr>
+<tr><td><code>r.intRangeAtMost(T, lo, hi)</code></td><td>an integer in <code>lo..hi</code>, both ends included: a die is <code>(u8, 1, 6)</code></td></tr>
+<tr><td><code>r.intRangeLessThan(T, lo, hi)</code></td><td>an integer in <code>lo..hi</code>, upper end excluded: an index is <code>(usize, 0, len)</code></td></tr>
+<tr><td><code>r.uintLessThan(T, n)</code></td><td>same, starting at 0, unsigned only</td></tr>
+<tr><td><code>r.int(T)</code></td><td>any value of the integer type, all bits random</td></tr>
+<tr><td><code>r.float(T)</code></td><td>a float in <code>[0, 1)</code></td></tr>
+<tr><td><code>r.boolean()</code></td><td>a fair coin</td></tr>
+<tr><td><code>r.shuffle(T, slice)</code></td><td>rearranges the slice in place, every order equally likely</td></tr>
+<tr><td><code>r.weightedIndex(T, weights)</code></td><td>an index into <code>weights</code>, chosen proportionally: 70/20/10 above</td></tr>
+<tr><td><code>r.enumValue(E)</code></td><td>a random tag of an enum</td></tr>
+<tr><td><code>r.bytes(buf)</code></td><td>fills a byte slice</td></tr>
+</table>
+<p>Notice that <code>prng</code> is declared with <code>var</code>: every draw advances the generator's internal state, so <code>random()</code> needs a mutable pointer to it. The <code>std.Random</code> value you get back is a small struct holding that pointer plus a function pointer; it is cheap to pass around by value and you can call <code>prng.random()</code> as often as you like.</p>
+<div class="warn"><strong>Not for secrets.</strong> <code>DefaultPrng</code> is predictable by design. For anything security-related (tokens, keys, salts) use the operating system's generator instead: <code>io.random(&amp;buf)</code> fills a buffer from the OS, and <code>std.Random.DefaultCsprng</code> is a cryptographic generator you can seed from it.</div>
+
+<h3 id="ch34-6">34.6 Seeds, and why determinism matters</h3>
+<p>A pseudo-random generator is a pure function of its seed. Same seed, same sequence, on every machine, forever. That is not a weakness to work around; it is the most useful property a simulation's randomness can have.</p>
+<div class="file">s5_seed.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    // Fixed seed: the same three numbers every run.
+    var fixed = std.Random.DefaultPrng.init(3025);
+    std.debug.print("fixed: {d} {d} {d}\n", .{
+        fixed.random().intRangeAtMost(u8, 1, 6),
+        fixed.random().intRangeAtMost(u8, 1, 6),
+        fixed.random().intRangeAtMost(u8, 1, 6),
+    });
+
+    // Seed from the operating system: different every run.
+    var seed_bytes: [8]u8 = undefined;
+    init.io.random(&amp;seed_bytes);
+    const seed = std.mem.readInt(u64, &amp;seed_bytes, .little);
+    var fresh = std.Random.DefaultPrng.init(seed);
+    std.debug.print("fresh: {d} {d} {d} (seed {d})\n", .{
+        fresh.random().intRangeAtMost(u8, 1, 6),
+        fresh.random().intRangeAtMost(u8, 1, 6),
+        fresh.random().intRangeAtMost(u8, 1, 6),
+        seed,
+    });
+}</code></pre>
+<pre class="term">$ zig run s5_seed.zig
+fixed: 4 1 1
+fresh: 2 4 5 (seed 13483122203582859263)
+$ zig run s5_seed.zig
+fixed: 4 1 1
+fresh: 4 1 5 (seed 10071616139519654204)</pre>
+<p>The fixed line never changes. The fresh line does, because the seed came from the OS. (You could also seed from the wall clock, <code>@bitCast</code>-ing the nanoseconds into a <code>u64</code>; the OS generator is simpler and better.) The pattern to copy from this program is: <em>print the seed</em>. A game that shows "seed 13483122203582859263" on its title screen can reproduce any bug report exactly.</p>
+<p>Determinism buys you three things:</p>
+<ol>
+<li><strong>Reproducible bugs.</strong> "It crashed on day 212 with seed 42" is a test case. "It crashed sometimes" is a mystery.</li>
+<li><strong>Testable rules.</strong> A test can seed a generator with 7, run a thousand days, and assert on the exact outcome, because the outcome is a fact about the code and the seed, not about luck.</li>
+<li><strong>Save files that replay.</strong> If the state after 90 days is a function of (seed, commands), then a save file need not store every dice roll, only the seed and the state.</li>
+</ol>
+<p>There is a subtle trap, and IRON LEDGER's answer to it is one of the nicest small designs in the game. Suppose every subsystem shares one generator: the market draws, then a battle draws, then a medical check draws. Now you add one extra weather roll to battles. Every market roll after the first battle shifts by one position; a saved game replays differently after your update; every golden-master test breaks. The fix is to give each subsystem its own <em>stream</em>: a separate generator, derived from the master seed in a stable way. Adding a draw to the battle stream leaves the market stream untouched. Exercise 34.5 has you build exactly this.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game's clock is <code>src/sim/clock.zig</code>: a <code>Date</code> struct with <code>isLeapYear</code>, <code>daysInMonth</code>, <code>next</code> and <code>isPayday</code> (the first of the month), wrapped in a <code>Clock</code> that carries both the civil date and <code>day_index</code>, "the canonical timestamp". Everything that records <em>when</em> stores the integer; everything that displays a date renders the struct. Randomness is <code>src/sim/rng.zig</code>: an enum of eight streams (<code>generation, market, maintenance, acquisition, battle, events, medical, travel</code>) and an <code>Rng</code> holding one <code>DefaultPrng</code> per stream, each seeded with <code>seed ^ (0x9E3779B97F4A7C15 *% (i + 1))</code>. Every die in the game is <code>gs.rng.roll2d6(.some_stream)</code>. The simulation core never receives an <code>io</code>, so it cannot read the real clock even by accident, and the golden-master test in <code>src/sim/commands.zig</code> (same seed, same script, same hash, twice) guards the whole property on every build.
+<pre><code>pub fn roll2d6(self: *Rng, stream: Stream) u8 {
+    const r = self.random(stream);
+    return r.intRangeAtMost(u8, 1, 6) + r.intRangeAtMost(u8, 1, 6);
+}</code></pre></div>
+
+<h3 id="ch34-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 34.1 · Elapsed time <span class="level">warm-up</span></h4>
+  <p>Time a busy loop at three sizes (one million, ten million, one hundred million iterations) with the monotonic clock, and print each result in milliseconds to stdout. Then run it again with <code>-O ReleaseFast</code> and compare. Name the file: <code>exercises/34-time-random/ex1_elapsed.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 34, exercise 1: measuring elapsed time.
+//! Run with:  zig run ex1_elapsed.zig
+//! Goal: time three sizes of a busy loop with the monotonic clock and print
+//! each duration in milliseconds. Your numbers will differ; the shape
+//! (each line roughly ten times the last) should not.
+//!
+//! Example output:
+//!   n=1000000     sum=499999500000        took 1 ms
+//!   n=10000000    sum=49999995000000      took 12 ms
+//!   n=100000000   sum=4999999950000000    took 121 ms
+
+const std = @import("std");
+
+fn busyLoop(n: u64) u64 {
+    var sum: u64 = 0;
+    var i: u64 = 0;
+    while (i &lt; n) : (i += 1) sum +%= i;
+    return sum;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &amp;buf);
+    const out = &amp;w.interface;
+
+    const sizes = [_]u64{ 1_000_000, 10_000_000, 100_000_000 };
+    for (sizes) |n| {
+        const t0 = std.Io.Clock.now(.awake, io);
+        const sum = busyLoop(n);
+        const t1 = std.Io.Clock.now(.awake, io);
+        const took = t0.durationTo(t1);
+        try out.print("n={d:&lt;12} sum={d:&lt;20} took {d} ms\n", .{ n, sum, took.toMilliseconds() });
+    }
+    try out.flush();
+}</code></pre>
+  <p>Two readings of <code>.awake</code> bracket the work, <code>durationTo</code> subtracts them, and <code>toMilliseconds</code> scales. The <code>{d:&lt;12}</code> specifier left-aligns in a 12-character field so the columns line up. In ReleaseFast the compiler may compute the closed-form sum and every line becomes 0 ms, which is a lesson in its own right.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 34.2 · A dice roller <span class="level">practice</span></h4>
+  <p>Write <code>roll(r, count, sides)</code> that returns the total of <code>count</code> dice with <code>sides</code> faces, and <code>roll2d6(r)</code> on top of it. The tests check the range, that 2 and 12 both appear over enough rolls, that the average is near 7, and that two generators with the same seed agree roll for roll. Name the file: <code>exercises/34-time-random/ex2_dice.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 34, exercise 2: a dice roller.
+//! Run with:  zig test ex2_dice.zig
+//! Goal: implement `roll` and `roll2d6`, then make every test pass
+//! without changing the tests.
+
+const std = @import("std");
+
+/// Roll `count` dice with `sides` sides each and return the total.
+pub fn roll(r: std.Random, count: u8, sides: u8) u32 {
+    std.debug.assert(sides &gt;= 1);
+    var total: u32 = 0;
+    for (0..count) |_| total += r.intRangeAtMost(u8, 1, sides);
+    return total;
+}
+
+/// The BattleTech die roll.
+pub fn roll2d6(r: std.Random) u32 {
+    return roll(r, 2, 6);
+}
+
+test "one die stays in range" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const r = prng.random();
+    for (0..1000) |_| {
+        const v = roll(r, 1, 6);
+        try std.testing.expect(v &gt;= 1 and v &lt;= 6);
+    }
+}
+
+test "2d6 stays in range and hits both ends" {
+    var prng = std.Random.DefaultPrng.init(2);
+    const r = prng.random();
+    var seen_2 = false;
+    var seen_12 = false;
+    for (0..5000) |_| {
+        const v = roll2d6(r);
+        try std.testing.expect(v &gt;= 2 and v &lt;= 12);
+        if (v == 2) seen_2 = true;
+        if (v == 12) seen_12 = true;
+    }
+    try std.testing.expect(seen_2 and seen_12);
+}
+
+test "2d6 averages close to 7" {
+    var prng = std.Random.DefaultPrng.init(3);
+    const r = prng.random();
+    var total: u64 = 0;
+    const n = 20_000;
+    for (0..n) |_| total += roll2d6(r);
+    const avg: f64 = @as(f64, @floatFromInt(total)) / n;
+    try std.testing.expect(avg &gt; 6.8 and avg &lt; 7.2);
+}
+
+test "same seed, same rolls" {
+    var a = std.Random.DefaultPrng.init(99);
+    var b = std.Random.DefaultPrng.init(99);
+    for (0..100) |_| {
+        try std.testing.expectEqual(roll2d6(a.random()), roll2d6(b.random()));
+    }
+}</code></pre>
+  <p>Each die is one <code>intRangeAtMost(u8, 1, sides)</code>, summed into a <code>u32</code> so many dice cannot overflow. The average test converts with <code>@floatFromInt</code> and allows a small tolerance; with 20,000 rolls the sample mean of 2d6 is within 0.2 of 7 essentially always, and because the seed is fixed the test is not flaky at all.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 34.3 · A seeded shuffle <span class="level">practice</span></h4>
+  <p>Given a fixed array of six names, write <code>shuffledCopy(seed)</code> that returns a shuffled copy. Tests check that every name survives, that the same seed gives the same order, and that two different seeds give different orders. Name the file: <code>exercises/34-time-random/ex3_shuffle.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 34, exercise 3: a seeded shuffle.
+//! Run with:  zig test ex3_shuffle.zig
+//! Goal: implement `shuffledCopy` so the tests pass. A shuffle must keep
+//! every element exactly once, and the same seed must give the same order.
+
+const std = @import("std");
+
+const names = [_][]const u8{ "Grayson", "Lori", "Clay", "Delmar", "Ricol", "Yorinaga" };
+
+/// Return a shuffled copy of `names`, driven by `seed`.
+pub fn shuffledCopy(seed: u64) [names.len][]const u8 {
+    var copy = names;
+    var prng = std.Random.DefaultPrng.init(seed);
+    prng.random().shuffle([]const u8, &amp;copy);
+    return copy;
+}
+
+fn contains(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |h| if (std.mem.eql(u8, h, needle)) return true;
+    return false;
+}
+
+test "every name survives the shuffle" {
+    const s = shuffledCopy(1);
+    for (names) |n| try std.testing.expect(contains(&amp;s, n));
+    try std.testing.expectEqual(names.len, s.len);
+}
+
+test "same seed gives same order" {
+    const a = shuffledCopy(2024);
+    const b = shuffledCopy(2024);
+    for (a, b) |x, y| try std.testing.expectEqualStrings(x, y);
+}
+
+test "different seeds usually differ" {
+    const a = shuffledCopy(1);
+    const b = shuffledCopy(2);
+    var same = true;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) {
+        same = false;
+    };
+    try std.testing.expect(!same);
+}</code></pre>
+  <p>Copying the array (<code>var copy = names;</code>) is what makes the function pure: the original is never touched. <code>shuffle</code> takes the element type and a slice, and <code>&amp;copy</code> turns the array into one. Returning the array by value is fine; it is six slices, 96 bytes.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 34.4 · Calendar arithmetic <span class="level">practice</span></h4>
+  <p>Complete a <code>Date</code> struct with <code>isLeapYear</code>, <code>daysInMonth</code>, <code>next</code>, <code>addDays(n)</code> and <code>dayOfYear</code>. Tests include the century rules (1900 is not a leap year, 2000 is), month and year rollover, a 45-day jump, and day 366 of 3024. Name the file: <code>exercises/34-time-random/ex4_calendar.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 34, exercise 4: civil calendar arithmetic by hand.
+//! Run with:  zig test ex4_calendar.zig
+//! Goal: implement `daysInMonth`, `next`, `addDays` and `dayOfYear` so
+//! the tests pass. Leap years: divisible by 4, except centuries, except
+//! every 400th year.
+
+const std = @import("std");
+
+pub const Date = struct {
+    year: u16,
+    month: u8, // 1..12
+    day: u8, // 1..31
+
+    pub fn isLeapYear(year: u16) bool {
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    }
+
+    pub fn daysInMonth(year: u16, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+            4, 6, 9, 11 =&gt; 30,
+            2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+            else =&gt; unreachable,
+        };
+    }
+
+    pub fn next(self: Date) Date {
+        var d = self;
+        d.day += 1;
+        if (d.day &gt; daysInMonth(d.year, d.month)) {
+            d.day = 1;
+            d.month += 1;
+            if (d.month &gt; 12) {
+                d.month = 1;
+                d.year += 1;
+            }
+        }
+        return d;
+    }
+
+    pub fn addDays(self: Date, n: u32) Date {
+        var d = self;
+        for (0..n) |_| d = d.next();
+        return d;
+    }
+
+    /// 1 for January 1st, 365 or 366 for December 31st.
+    pub fn dayOfYear(self: Date) u16 {
+        var total: u16 = self.day;
+        var m: u8 = 1;
+        while (m &lt; self.month) : (m += 1) total += daysInMonth(self.year, m);
+        return total;
+    }
+};
+
+test "leap year rules" {
+    try std.testing.expect(Date.isLeapYear(2024));
+    try std.testing.expect(!Date.isLeapYear(2023));
+    try std.testing.expect(!Date.isLeapYear(1900));
+    try std.testing.expect(Date.isLeapYear(2000));
+    try std.testing.expect(Date.isLeapYear(3024));
+}
+
+test "february length" {
+    try std.testing.expectEqual(@as(u8, 29), Date.daysInMonth(3024, 2));
+    try std.testing.expectEqual(@as(u8, 28), Date.daysInMonth(3025, 2));
+}
+
+test "month and year rollover" {
+    const d: Date = .{ .year = 3025, .month = 12, .day = 31 };
+    try std.testing.expectEqual(Date{ .year = 3026, .month = 1, .day = 1 }, d.next());
+    const f: Date = .{ .year = 3024, .month = 2, .day = 28 };
+    try std.testing.expectEqual(Date{ .year = 3024, .month = 2, .day = 29 }, f.next());
+}
+
+test "addDays crosses months" {
+    const d: Date = .{ .year = 3025, .month = 1, .day = 1 };
+    try std.testing.expectEqual(Date{ .year = 3025, .month = 2, .day = 15 }, d.addDays(45));
+    try std.testing.expectEqual(Date{ .year = 3026, .month = 1, .day = 1 }, d.addDays(365));
+}
+
+test "dayOfYear" {
+    try std.testing.expectEqual(@as(u16, 1), (Date{ .year = 3025, .month = 1, .day = 1 }).dayOfYear());
+    try std.testing.expectEqual(@as(u16, 365), (Date{ .year = 3025, .month = 12, .day = 31 }).dayOfYear());
+    try std.testing.expectEqual(@as(u16, 366), (Date{ .year = 3024, .month = 12, .day = 31 }).dayOfYear());
+}</code></pre>
+  <p><code>addDays</code> simply calls <code>next</code> in a loop, which is plenty fast for a game that advances a day at a time and avoids a page of tricky arithmetic. <code>dayOfYear</code> adds up the lengths of the months before this one. Notice that <code>expectEqual</code> compares two <code>Date</code> structs field by field.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 34.5 · Named streams <span class="level">challenge</span></h4>
+<p>Build a miniature of IRON LEDGER's <code>Rng</code>: an enum <code>Stream { market, battle, events }</code> and a struct holding one <code>DefaultPrng</code> per stream, all derived from one seed. Write <code>init(seed)</code>, <code>random(stream)</code> and <code>roll2d6(stream)</code>. The key test draws a thousand times from <code>.market</code> in one instance and then checks that <code>.battle</code> still matches an untouched twin. Name the file: <code>exercises/34-time-random/ex5_streams.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 34, exercise 5: named random streams.
+//! Run with:  zig test ex5_streams.zig
+//! Goal: implement `Rng.init` so every stream gets its own generator
+//! derived from the seed, and make the tests pass.
+
+const std = @import("std");
+
+pub const Stream = enum(u8) {
+    market,
+    battle,
+    events,
+
+    const count = @typeInfo(Stream).@"enum".fields.len;
+};
+
+pub const Rng = struct {
+    prngs: [Stream.count]std.Random.DefaultPrng,
+
+    pub fn init(seed: u64) Rng {
+        var self: Rng = undefined;
+        for (&amp;self.prngs, 0..) |*prng, i| {
+            prng.* = std.Random.DefaultPrng.init(seed ^ (0x9E3779B97F4A7C15 *% (i + 1)));
+        }
+        return self;
+    }
+
+    pub fn random(self: *Rng, stream: Stream) std.Random {
+        return self.prngs[@intFromEnum(stream)].random();
+    }
+
+    pub fn roll2d6(self: *Rng, stream: Stream) u8 {
+        const r = self.random(stream);
+        return r.intRangeAtMost(u8, 1, 6) + r.intRangeAtMost(u8, 1, 6);
+    }
+};
+
+test "streams are independent" {
+    var a = Rng.init(42);
+    var b = Rng.init(42);
+    for (0..1000) |_| _ = a.roll2d6(.market);
+    for (0..10) |_| try std.testing.expectEqual(b.roll2d6(.battle), a.roll2d6(.battle));
+}
+
+test "streams differ from each other" {
+    var r = Rng.init(7);
+    var same: usize = 0;
+    for (0..50) |_| {
+        if (r.roll2d6(.market) == r.roll2d6(.events)) same += 1;
+    }
+    try std.testing.expect(same &lt; 50);
+}
+
+test "2d6 stays in range" {
+    var r = Rng.init(7);
+    for (0..1000) |_| {
+        const v = r.roll2d6(.events);
+        try std.testing.expect(v &gt;= 2 and v &lt;= 12);
+    }
+}</code></pre>
+  <p><code>Stream.count</code> is computed by reflection so adding a stream to the enum grows the array automatically. The seed for stream <code>i</code> is the master seed XORed with a large odd constant times <code>i + 1</code> (wrapping multiply, <code>*%</code>), which spreads the seeds far apart; any stable, distinct derivation would do. The struct starts as <code>undefined</code> and every slot is filled in the loop, which is the idiomatic way to build an array of non-default values.</p></details>
+</div>
+
+<h3 id="ch34-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Which clock do you use to measure how long a function took, and why not the other one? <details class="answer"><summary>Answer</summary>The monotonic clock, <code>.awake</code>. The wall clock (<code>.real</code>) can jump forwards or backwards when the system time is adjusted, so a difference of two wall-clock readings is not a reliable duration.</details></li>
+  <li>Why does <code>std.Io.Clock.now(.real, io)</code> not need <code>try</code>? <details class="answer"><summary>Answer</summary>It returns a plain <code>Timestamp</code>, not an error union. Reading a clock cannot fail in a way the program could handle. Sleeping, by contrast, returns <code>Cancelable!void</code> because it blocks and can be cancelled.</details></li>
+  <li>What happened to <code>std.time.Timer</code> and <code>std.time.timestamp()</code>? <details class="answer"><summary>Answer</summary>They are gone in 0.16. Use <code>std.Io.Clock.now</code> for both, with <code>durationTo</code> for elapsed time. The unit constants in <code>std.time</code> (<code>ns_per_s</code> and friends) remain.</details></li>
+  <li>Is 3000 a leap year? Is 3024? <details class="answer"><summary>Answer</summary>3000 is divisible by 100 but not by 400, so it is not a leap year. 3024 is divisible by 4 and not by 100, so it is.</details></li>
+  <li>Why does IRON LEDGER store both a day counter and a civil date? <details class="answer"><summary>Answer</summary>The integer is for arithmetic and for stamping records (a subtraction answers "how many days ago"); the struct is for display and for calendar rules like payday on the 1st. Advancing both together avoids ever converting between them.</details></li>
+  <li>What does <code>r.intRangeAtMost(u8, 1, 6)</code> return, and how would you write "a random index into a slice of length n"? <details class="answer"><summary>Answer</summary>An integer from 1 to 6 inclusive. For an index use <code>r.intRangeLessThan(usize, 0, n)</code> or <code>r.uintLessThan(usize, n)</code>, since the upper bound is excluded.</details></li>
+  <li>Two runs with the same seed produce different results. Name three possible causes. <details class="answer"><summary>Answer</summary>Something read the wall clock; a hash map with unordered iteration decided an order; a second generator was created somewhere with a different seed (or a thread interleaved draws). The golden-master test exists to catch all of these.</details></li>
+  <li>Why give each subsystem its own random stream? <details class="answer"><summary>Answer</summary>So that adding or removing a draw in one subsystem does not shift the sequence every other subsystem sees. Saved games and tests stay stable across updates that touch only one area.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>std.Io.Clock.now(.real, io)</code> gives Unix time; <code>.awake</code> is the monotonic clock. Both return a <code>Timestamp</code> with a <code>nanoseconds</code> field and <code>toSeconds</code>-style helpers.</li>
+<li>Elapsed time is <code>start.durationTo(stop)</code>; sleeping is <code>try io.sleep(.fromMilliseconds(n), .awake)</code>. <code>std.time.Timer</code> and <code>std.time.timestamp()</code> are gone.</li>
+<li>Unit constants live in <code>std.time</code>: <code>ns_per_s</code>, <code>s_per_day</code>, and so on. Real-date conversion is in <code>std.time.epoch</code>.</li>
+<li>A simulation calendar is a small struct: leap years, days in month, <code>next()</code>. Keep an integer day counter alongside it.</li>
+<li><code>std.Random.DefaultPrng.init(seed)</code> then <code>.random()</code> gives an <code>std.Random</code> with <code>intRangeAtMost</code>, <code>float</code>, <code>boolean</code>, <code>shuffle</code>, <code>weightedIndex</code>, <code>enumValue</code>.</li>
+<li>Seed from <code>io.random</code> for variety, from a constant for reproducibility, and always print the seed. One generator per subsystem keeps saves and tests stable.</li>
+</ul></div>
+</section>

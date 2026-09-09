@@ -1,0 +1,369 @@
+<section id="ch48">
+<h2>48. The terminal client</h2>
+<p class="goals"><strong>In this chapter</strong> you read the one part of the program that is not pure: the terminal client in <code>src/tui/</code>. It is layered so that the impure parts stay small, from raw bytes on a file descriptor up to a state machine whose main loop is five lines. You will see how a byte becomes a <code>Key</code>, how a grid of cells becomes ANSI, how the client is kept from touching the simulation directly, and how a program that reads a keyboard is tested without a human.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch33">Chapter 33</a> (<code>std.Io</code>, writers with buffers and <code>flush</code>), <a href="#ch32">Chapter 32</a> (a program's main loop and its options), <a href="#ch14">Chapter 14</a> (the <code>Key</code> union and switching on it), <a href="#ch06">Chapter 6</a> (switch on integer ranges), <a href="#ch20">Chapter 20</a> (an arena reset per frame), <a href="#ch17">Chapter 17</a> (<code>defer</code> that restores the terminal however the program exits), <a href="#ch36">Chapter 36</a> (an atomic flag set from a signal handler) and <a href="#ch35">Chapter 35</a> (<code>std.posix</code> calls with C-shaped arguments).</div>
+
+<h3 id="ch48-1">48.1 The layers</h3>
+<p>The client is eight files, and each does one thing:</p>
+<table>
+<tr><th>File</th><th>Lines</th><th>Job</th></tr>
+<tr><td><code>term.zig</code></td><td>238</td><td>Raw mode, the alternate screen, window size, reading bytes with a timeout, decoding them into <code>Key</code>, the resize signal.</td></tr>
+<tr><td><code>screen.zig</code></td><td>414</td><td>A grid of cells with a style each; text, panes, borders, the <code>{a}…{/}</code> markup parser; <code>flush</code> to ANSI.</td></tr>
+<tr><td><code>app.zig</code></td><td>4,740</td><td>The state machine: mode, tab, cursors, modals; <code>draw</code> per screen; <code>handleKey</code> per screen; the lobby and the new-campaign wizard.</td></tr>
+<tr><td><code>png.zig</code></td><td></td><td>An 8-bit PNG decoder, inflate included, for emblems. No library.</td></tr>
+<tr><td><code>emblem.zig</code></td><td></td><td>The kitty and iTerm2 image protocols, and half-block fallbacks.</td></tr>
+<tr><td><code>music.zig</code></td><td></td><td>Runs the system audio player as a child process and reaps it.</td></tr>
+<tr><td><code>splash.zig</code></td><td></td><td>The title screen.</td></tr>
+<tr><td><code>paths.zig</code></td><td></td><td>Where the save file, logos and music live for a source tree versus an installed copy.</td></tr>
+</table>
+<p>The rule that governs all of them is in <code>CLAUDE.md</code>: the client may only call <code>game.commands.execute</code>, parse through <code>game.cli</code>, and read through <code>game.queries</code>. It never mutates <code>GameState</code> directly. A reviewer can grep for violations, and Exercise 48.2 has you do exactly that.</p>
+
+<h3 id="ch48-2">48.2 Bytes to keys</h3>
+<p><code>term.zig</code> is the bottom. Its <code>init</code> puts the terminal into raw mode with <code>tcsetattr</code> and its <code>deinit</code> restores it:</p>
+<div class="file">src/tui/term.zig</div>
+<pre><code>pub const Term = struct {
+    in_fd: posix.fd_t,
+    orig: posix.termios,
+    out: *std.Io.Writer,
+    pending: [64]u8 = undefined,
+    pending_len: usize = 0,
+
+    /// Enter raw mode + alternate screen. `out` must outlive the Term.
+    pub fn init(out: *std.Io.Writer) !Term {
+        const fd = posix.STDIN_FILENO;
+        const orig = try posix.tcgetattr(fd);
+        var raw = orig;
+        raw.lflag.ECHO = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.ISIG = false;
+        raw.lflag.IEXTEN = false;
+        raw.iflag.IXON = false;
+        raw.iflag.ICRNL = false;
+        raw.iflag.BRKINT = false;
+        raw.iflag.ISTRIP = false;
+        raw.oflag.OPOST = false;
+        raw.cc[@intFromEnum(posix.V.MIN)] = 0;
+        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+        try posix.tcsetattr(fd, .FLUSH, raw);
+
+        var act: posix.Sigaction = .{
+            .handler = .{ .handler = onWinch },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(.WINCH, &amp;act, null);
+
+        // Alternate screen, hide cursor, clear.
+        try out.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        try out.flush();
+        return .{ .in_fd = fd, .orig = orig, .out = out };
+    }
+
+    pub fn deinit(self: *Term) void {
+        self.out.writeAll("\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l") catch {};
+        self.out.flush() catch {};
+        posix.tcsetattr(self.in_fd, .FLUSH, self.orig) catch {};
+    }</code></pre>
+<p>Zig's <code>std.posix</code> exposes <code>termios</code> as a struct with named flag fields, so raw mode is a list of assignments rather than the bit-masking you would do in C. The original settings are kept in <code>orig</code> and restored by <code>deinit</code>, which the caller pairs with <code>defer term.deinit()</code> so that a crash, an error or a normal quit all leave the terminal usable. Every call in <code>deinit</code> ends in <code>catch {}</code>, because there is nothing sensible to do if restoring the terminal fails on the way out.</p>
+<p>The resize signal is handled with an atomic flag, the pattern from <a href="#ch36">Chapter 36</a>: a signal handler may not do much, so <code>onWinch</code> stores <code>true</code> and the main loop asks <code>tookResize</code>, which swaps it back to <code>false</code>.</p>
+<p>Reading is a small buffer, a <code>poll</code> with a timeout, and a decoder:</p>
+<pre><code>    /// Decode one key, waiting up to `timeout_ms`.
+    pub fn readKey(self: *Term, timeout_ms: i32) Key {
+        if (!self.fill(timeout_ms)) return .none;
+        const b = self.take() orelse return .none;
+        return switch (b) {
+            0x1b =&gt; self.readEscape(),
+            '\r', '\n' =&gt; .enter,
+            '\t' =&gt; .tab,
+            0x7f, 0x08 =&gt; .backspace,
+            1...7, 11, 12, 14...26 =&gt; .{ .ctrl = 'a' + b - 1 },
+            else =&gt; self.readUtf8(b),
+        };
+    }
+
+    fn readEscape(self: *Term) Key {
+        // A lone ESC arrives with nothing behind it; sequences follow fast.
+        if (!self.fill(25)) return .escape;
+        const b = self.take() orelse return .escape;
+        if (b == 'O') { /* SS3 sequences: F1..F4, arrows on some terminals */ }
+        if (b != '[') return .escape;
+        var num: u32 = 0;
+        var have_num = false;
+        while (true) {
+            if (!self.fill(25)) return .escape;
+            const c = self.take() orelse return .escape;
+            switch (c) {
+                '0'...'9' =&gt; {
+                    num = num * 10 + (c - '0');
+                    have_num = true;
+                },
+                ';' =&gt; { num = 0; have_num = false; },
+                'A' =&gt; return .up,
+                'B' =&gt; return .down,
+                'C' =&gt; return .right,
+                'D' =&gt; return .left,
+                'Z' =&gt; return .backtab,
+                '~' =&gt; return switch (num) {
+                    1, 7 =&gt; .home,
+                    3 =&gt; .delete,
+                    5 =&gt; .pgup,
+                    6 =&gt; .pgdn,
+                    11 =&gt; .{ .f = 1 },
+                    // … F2 to F12 …
+                    else =&gt; .escape,
+                },
+                else =&gt; return .escape,
+            }
+        }
+    }</code></pre>
+<p><code>readKey</code> is the byte-to-key switch you saw in <a href="#ch14">Chapter 14</a>: ranges and lists of integers, and the control-key arm computes the letter with arithmetic on the byte. The interesting part is <code>readEscape</code>. An escape sequence for an arrow key is three bytes, <code>ESC [ A</code>, but the user pressing the Escape key alone sends one. The decoder cannot tell them apart from the first byte, so it waits 25 milliseconds for a second byte: nothing arrives, it was Escape; something arrives, it is a sequence. That is the classic terminal ambiguity, solved the classic way, in a function you can read in one sitting.</p>
+
+<h3 id="ch48-3">48.3 Cells to ANSI</h3>
+<p><code>screen.zig</code> is a grid. Each cell is a character, a semantic style and, for pictures, two pixel colours:</p>
+<div class="file">src/tui/screen.zig</div>
+<pre><code>pub const Style = enum(u8) {
+    normal,
+    dim,
+    amber,
+    good,
+    crit,
+    sel, // cursor row / focused pane title
+    tab, // active tab
+    purple,
+    box, // borders
+    focus, // the focused pane's border line
+    // Political colours for the star map (12B.9).
+    blue, red, yellow, green, magenta, cyan, white, grey,
+
+    fn sgr(self: Style) []const u8 {
+        return switch (self) {
+            .normal =&gt; "\x1b[0m",
+            .dim =&gt; "\x1b[0;90m",
+            .amber =&gt; "\x1b[0;33m",
+            .good =&gt; "\x1b[0;32m",
+            .crit =&gt; "\x1b[0;31m",
+            .sel =&gt; "\x1b[0;30;46m",
+            // …
+        };
+    }
+
+    fn fromMarkup(c: u8) ?Style {
+        return switch (c) {
+            'a' =&gt; .amber,
+            'g' =&gt; .good,
+            'c' =&gt; .crit,
+            's' =&gt; .sel,
+            'd' =&gt; .dim,
+            't' =&gt; .tab,
+            'p' =&gt; .purple,
+            '/' =&gt; .normal,
+            else =&gt; null,
+        };
+    }
+};
+
+pub const Cell = struct {
+    ch: u21 = ' ',
+    style: Style = .normal,
+    px: ?Pixels = null,
+};</code></pre>
+<p>Styles are semantic (<code>good</code>, <code>crit</code>), not colours; the mapping to escape codes is one private function, and the eight markup letters from <a href="#ch44">Chapter 44</a> map to styles in another. A query that writes <code>{c}not admitted{/}</code> never knows what red is. Drawing writes cells into the grid; <code>text</code> parses the markup as it goes; <code>pane</code> draws a titled box; <code>lines</code> fills a rectangle with rows and highlights the cursor row. Then one function emits the frame:</p>
+<pre><code>    pub fn flush(self: *Screen, out: *std.Io.Writer) !void {
+        try out.writeAll("\x1b[H");
+        var y: u16 = 0;
+        while (y &lt; self.rows) : (y += 1) {
+            try out.print("\x1b[{d};1H", .{y + 1});
+            var cur: ?Style = null;
+            var x: u16 = 0;
+            while (x &lt; self.cols) : (x += 1) {
+                const c = self.get(x, y);
+                if (c.px) |p| { /* half-block pixel cell, true colour or 256-colour */ continue; }
+                if (cur == null or cur.? != c.style) {
+                    try out.writeAll(c.style.sgr());
+                    cur = c.style;
+                }
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(c.ch, &amp;buf) catch 1;
+                try out.writeAll(buf[0..n]);
+            }
+        }
+        try out.writeAll("\x1b[0m");
+        try out.flush();
+    }</code></pre>
+<p>No diffing: every frame is the whole grid, cell by cell, with an escape code emitted only when the style changes from the previous cell. At terminal sizes (200 by 50 is ten thousand cells) that is a few tens of kilobytes twice a second, which is fast enough, and it makes the renderer trivially correct. The writer is the buffered stdout writer from <code>main</code> (a 64 KiB buffer, <a href="#ch33">Chapter 33</a>), so the frame goes out in one or two system calls at the final <code>flush</code>.</p>
+
+<h3 id="ch48-4">48.4 The loop</h3>
+<p><code>app.zig</code> is the state machine. Its state is a struct with a mode (welcome, wizard, game), a tab, a modal, per-tab cursors and the campaign itself as an optional:</p>
+<div class="file">src/tui/app.zig (fields, abridged)</div>
+<pre><code>const Tab = enum(u8) { desk, map, forces, contracts, ledger, supply, hq, lab, people, market };
+const Mode = enum { welcome, wizard, game };
+
+pub const App = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    term: *Term,
+    screen: Screen,
+    store: game.store.Store,
+    frame: std.heap.ArenaAllocator,
+    lobby: std.heap.ArenaAllocator,
+    gs: ?GameState = null,
+    running: bool = true,
+    music: ?music_mod.Player = null,
+    // …
+    mode: Mode = .welcome,
+    tab: Tab = .desk,
+    modal: Modal = .none,
+    focus: u8 = 0,
+    /// Cursor per tab per pane (welcome uses tab 0, wizard tab 1).
+    cursor: [10][4]usize = [_][4]usize{[_]usize{0} ** 4} ** 10,
+    msg: TextBuf = .{},
+    msg_style: Style = .dim,
+    // …
+};</code></pre>
+<p>The client has grown since the original guide (ten tabs now, with People and Market added), but the loop is the same shape:</p>
+<pre><code>    pub fn run(self: *App) !void {
+        // … defaults, terminal probe, music settings, splash …
+        while (self.running) {
+            if (self.term.tookResize()) {
+                const size = self.term.size();
+                try self.screen.resize(size.cols, size.rows);
+            }
+            try self.draw();
+            const key = self.term.readKey(500);
+            if (self.music) |*m| {
+                m.poll();
+                // … announce a new track in the status strip …
+            }
+            if (key == .none) continue;
+            _ = self.frame.reset(.retain_capacity);
+            self.handleKey(key) catch |err| self.say(.crit, "error: {s}", .{@errorName(err)});
+        }
+    }
+
+    fn draw(self: *App) !void {
+        _ = self.frame.reset(.retain_capacity);
+        self.screen.clear();
+        self.n_placements = 0;
+        switch (self.mode) {
+            .welcome =&gt; try self.drawWelcome(),
+            .wizard =&gt; try self.drawWizard(),
+            .game =&gt; try self.drawGame(),
+        }
+        // … modal over the top; emblem placement for kitty/iTerm2 …
+        try self.screen.flush(self.term.out);
+    }
+
+    fn handleKey(self: *App, key: Key) !void {
+        if (self.modal != .none) return self.handleModalKey(key);
+        switch (self.mode) {
+            .welcome =&gt; try self.handleWelcomeKey(key),
+            .wizard =&gt; try self.handleWizardKey(key),
+            .game =&gt; try self.handleGameKey(key),
+        }
+    }
+
+    fn exec(self: *App, cmd: Command) !void {
+        const g = &amp;self.gs.?;
+        _ = game.commands.execute(g, cmd) catch |err| {
+            self.say(.crit, "refused: {s}", .{game.cli.errorText(err)});
+            return;
+        };
+    }</code></pre>
+<p>Draw, wait up to half a second for a key, poll the music player, and if a key came, handle it. The half-second timeout is why the clock in the status strip ticks and a finished track is noticed without a keypress. <code>draw</code> resets the frame arena first, so every query result from the previous frame is gone before the new ones are made (<a href="#ch44">Chapter 44</a>); the loop resets it again before <code>handleKey</code>, because handlers call queries too. <code>.retain_capacity</code> keeps the arena's memory for reuse instead of returning it to the general-purpose allocator, so a steady state allocates nothing new per frame.</p>
+<p>The error handling in the loop is the client's whole safety net: any error from a handler becomes a red line in the status strip, and the loop continues. <code>exec</code> is the narrower version for commands: a refusal from <code>execute</code> becomes a sentence via <code>cli.errorText</code> (<a href="#ch42">Chapter 42</a>). <code>handleKey</code> dispatches by modal, then mode, then (inside <code>handleGameKey</code>) by global keys, then tab, then a <code>switch</code> on the character. That is four levels of <code>switch</code> and no table of callbacks, which keeps every key's behaviour readable at its site.</p>
+
+<h3 id="ch48-5">48.5 What the loop looks like from the game's side</h3>
+<p>Here is a game-mode key handler, showing all three doors in a few lines. <code>row</code> is the highlighted <code>ToeRow</code> from the Forces query, <code>q</code> is <code>game.queries</code> and <code>g</code> is the campaign:</p>
+<pre><code>                    'A' =&gt; if (row) |r| {
+                        const co = g.companyOf(r.force);
+                        if (co != .none) {
+                            try self.exec(.{ .auto_assign = co });
+                            self.say(.good, "auto-assigned {s}", .{q.forceName(g, co)});
+                        }
+                    },
+                    'c' =&gt; if (row) |r| {
+                        const co = g.companyOf(r.force);
+                        if (co != .none) {
+                            const res = game.commands.execute(g, .{ .crew_company = co }) catch |err| {
+                                self.say(.crit, "{s}", .{game.cli.errorText(err)});
+                                return;
+                            };
+                            self.say(if (res.still_open == 0) .good else .amber, "{s}: {d} hired to fill the manning table · {d} lines still open (no candidates on the boards yet)", .{ q.forceName(g, co), res.hired_count, res.still_open });
+                        }
+                    },</code></pre>
+<p>The client reads <code>g.companyOf(…)</code> and <code>q.forceName(…)</code> (queries and pure helpers), builds a command, calls <code>execute</code>, and formats the result. It never writes a field of <code>g</code>. <a href="#ch50">Chapter 50</a> follows the <code>c</code> key all the way down.</p>
+
+<h3 id="ch48-6">48.6 Testing a program that reads a keyboard</h3>
+<p>The client is driven by bytes on a file descriptor, so it can be tested without a human. <code>docs/tui_smoke.py</code> forks the game under a pseudo-terminal, sends keystrokes, and asserts on the text that comes back:</p>
+<pre class="term">assert "hired to fill the manning table" in plain()[-1200:], plain()[-1500:]
+…
+# ---- second pass: the minimum tier (80x24) and --ascii, every screen ----
+os.execv(exe, [exe, "--tui", "--ascii", "--no-splash", "--no-music", "--store", db])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+assert "F1 Desk" in p and "+-" in p, p[-2000:]          # ascii borders</pre>
+<p>Every screen and most modals are visited, twice: once at a large size and once at 80 by 24 with <code>--ascii</code>, which is why <code>main</code> has those flags. When the market pane was retitled, this script failed on the old title within seconds, which is the point of it. A sibling script, <code>docs/repl_smoke.sh</code>, pipes a list of verbs into <code>--repl</code> and greps for landmarks. Neither is a Zig test; both are part of "a change is done" in <code>CLAUDE.md</code>.</p>
+<p>Inside Zig, the parts that do not need a terminal have ordinary tests: <code>screen.zig</code> tests that text clips to a width and honours markup, that pane borders land on the rectangle's edges, that a square image blits at a 2:1 cell aspect; <code>app.zig</code> tests the size-tier thresholds; <code>png.zig</code> decodes a tiny embedded image (<code>@embedFile</code>, <a href="#ch25">Chapter 25</a>). The <code>test</code> block at the top of <code>main.zig</code> is what pulls these files into the test build, since they are not part of the <code>game</code> module.</p>
+
+<h3 id="ch48-reading">Guided reading</h3>
+<ol>
+<li><code>src/tui/term.zig</code>, all of it: <code>Key</code>, <code>init</code>, <code>deinit</code>, <code>fill</code>, <code>take</code>, <code>readKey</code>, <code>readUtf8</code>, <code>readEscape</code>.</li>
+<li><code>src/tui/screen.zig</code>: <code>Style</code>, <code>Cell</code>, <code>Screen.text</code> (the markup parser), <code>pane</code>, <code>lines</code>, <code>flush</code>, and the tests.</li>
+<li><code>src/tui/app.zig</code>: the <code>Tab</code>, <code>Mode</code> and <code>Modal</code> types, the <code>App</code> fields, then <code>run</code>, <code>draw</code>, <code>handleKey</code>, <code>handleGameKey</code>, <code>exec</code>, <code>say</code>. Then one screen pair: <code>drawForces</code> and the Forces arm of <code>screenKey</code>. Then <code>pub fn run</code> at the very bottom, which is where <code>main</code> hands over.</li>
+<li><code>docs/tui.md</code>: the frame, the keyboard model and the screen table. It was written before the code and is still accurate about the boundary.</li>
+<li><code>docs/tui_smoke.py</code>: skim for the shape (send, drain, assert).</li>
+</ol>
+
+<h3 id="ch48-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 48.1 · Markup becomes styles <span class="level">warm-up</span></h4>
+<p>Write a test in <code>screen.zig</code> that draws <code>"{g}ok{/}!"</code> into a ten-by-one screen and checks the cells: the first is styled <code>.good</code>, the second holds <code>'k'</code>, the third is back to <code>.normal</code>. Also check <code>visibleLen</code> of the same string.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "markup lands as styles in the cells" {
+    var s = try Screen.init(std.testing.allocator, 10, 1);
+    defer s.deinit();
+    _ = s.text(0, 0, 10, "{g}ok{/}!", .normal);
+    try std.testing.expectEqual(Style.good, s.get(0, 0).style);
+    try std.testing.expectEqual(@as(u21, 'k'), s.get(1, 0).ch);
+    try std.testing.expectEqual(Style.normal, s.get(2, 0).style);
+    try std.testing.expectEqual(@as(usize, 3), visibleLen("{g}ok{/}!"));
+}</code></pre>
+<p><code>Screen</code> is one of the few structs in the program that takes an allocator it keeps (the grid must outlive many frames), so the test uses <code>std.testing.allocator</code> and pairs <code>init</code> with <code>defer s.deinit()</code>. <code>text</code> returns the number of cells used, discarded here with <code>_ =</code>. <code>get</code> takes <code>u16</code> coordinates.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 48.2 · Grep the boundary <span class="level">practice</span></h4>
+<p>The rule says the client never mutates <code>GameState</code>. Write a <code>grep</code> that would find an assignment through the campaign pointer (<code>g.funds = …</code>, <code>g.people…</code>) in <code>app.zig</code>, run it, and report. Then count how many times the file calls <code>execute</code> or <code>self.exec</code>, and how many times it calls a query.</p>
+<details class="answer"><summary>Solution</summary>
+<pre class="term">$ grep -nE '\bg\.[a-z_]+(\.[a-z_]+)* (\+|-)?= ' src/tui/app.zig
+(no output)
+$ grep -cE 'game\.commands\.execute|self\.exec\(' src/tui/app.zig
+69
+$ grep -cE '\bq\.[a-zA-Z]+\(' src/tui/app.zig
+175</pre>
+<p>No direct writes; sixty-nine command sites; a hundred and seventy-five query calls. The grep is not a proof (a write through a pointer obtained from a query would slip past it), but it is the cheap check a reviewer runs, and it says the same thing the design document says. The ratio, roughly 2.5 reads per write, is what a view over a command/query boundary should look like.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 48.3 · The escape ambiguity <span class="level">practice</span></h4>
+<p>Without running anything, trace <code>readKey</code> for these byte sequences arriving together: (a) <code>1b 5b 41</code>; (b) <code>1b</code> alone; (c) <code>1b 5b 31 35 7e</code>; (d) <code>03</code>. Say what <code>Key</code> each yields and which branch decides it.</p>
+<details class="answer"><summary>Solution</summary>
+<p>(a) <code>ESC [ A</code>: <code>readEscape</code> sees <code>'['</code>, then <code>'A'</code>, returns <code>.up</code>. (b) A lone <code>ESC</code>: <code>fill(25)</code> times out with nothing behind it, returns <code>.escape</code>. (c) <code>ESC [ 1 5 ~</code>: the digits accumulate <code>num = 15</code>, then <code>'~'</code> switches on <code>num</code> and returns <code>.{ .f = 5 }</code>. (d) Byte 3 is in the range <code>1...7</code>, so the control arm returns <code>.{ .ctrl = 'a' + 3 - 1 }</code>, which is <code>.{ .ctrl = 'c' }</code>; Ctrl-C reaches the program as a key because raw mode cleared <code>ISIG</code>, and the app decides what to do with it rather than the kernel.</p></details>
+</div>
+
+<h3 id="ch48-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>Why does <code>Term.deinit</code> swallow every error with <code>catch {}</code>? <details class="answer"><summary>Answer</summary>It runs on the way out, often from a <code>defer</code> during an error; there is no useful recovery from failing to restore the terminal, and returning an error from a <code>deinit</code> would complicate every caller.</details></li>
+<li>How does the client tell Escape from an arrow key? <details class="answer"><summary>Answer</summary>After an <code>ESC</code> byte, <code>readEscape</code> waits 25 milliseconds for a following byte; none means the Escape key, a <code>'['</code> or <code>'O'</code> means a sequence to decode.</details></li>
+<li>What does <code>Screen.flush</code> not do, and why is that acceptable? <details class="answer"><summary>Answer</summary>It does not diff against the previous frame; it emits every cell. At terminal sizes that is tens of kilobytes per frame, which a buffered writer handles easily, and it makes the renderer trivially correct.</details></li>
+<li>Where is the frame arena reset, and why twice? <details class="answer"><summary>Answer</summary>At the top of <code>draw</code> and just before <code>handleKey</code> in the loop; both draw functions and key handlers call queries that allocate into it, and neither should see the other's leftovers.</details></li>
+<li>Why is the timeout in <code>readKey(500)</code> half a second rather than blocking? <details class="answer"><summary>Answer</summary>So the loop redraws periodically without input: the music player is polled, a resize is noticed, the status strip updates.</details></li>
+<li>What are the client's three permitted calls into the simulation? <details class="answer"><summary>Answer</summary><code>game.commands.execute</code> (through <code>exec</code> or directly), <code>game.cli.parseCommand</code> for the <code>:</code> line, and the functions of <code>game.queries</code>.</details></li>
+<li>How is a screen tested without a terminal? <details class="answer"><summary>Answer</summary><code>screen.zig</code>'s grid is a plain struct with tests on cell contents; the whole client is driven under a pseudo-terminal by <code>docs/tui_smoke.py</code>, which sends keys and asserts on the text that comes back.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>The client is layered: <code>term.zig</code> turns bytes into a <code>Key</code> union, <code>screen.zig</code> turns cells into ANSI, <code>app.zig</code> is a state machine over mode, tab, modal and cursors.</li>
+<li>Raw mode is entered with <code>tcsetattr</code> and restored by a <code>deinit</code> that never fails; a resize is an atomic flag set by a signal handler.</li>
+<li>The main loop is draw, wait half a second for a key, poll, handle; every handler error becomes a status-line sentence.</li>
+<li>A frame arena is reset before drawing and before handling, so queries allocate freely and nothing accumulates.</li>
+<li>The client only ever calls <code>execute</code>, <code>parseCommand</code> and queries; a grep confirms it, and a pseudo-terminal script tests every screen.</li>
+</ul></div>
+</section>

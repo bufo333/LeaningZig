@@ -1,0 +1,585 @@
+<section id="ch33">
+<h2>33. Files and directories with std.Io</h2>
+<p class="goals"><strong>In this chapter</strong> you will create, write, read, append to and delete files, make and list directories, ask for a file's size, handle a missing file gracefully, take paths apart with <code>std.fs.path</code>, and test all of it inside a throw-away directory. Every operation goes through the <code>std.Io</code> interface introduced in Zig 0.16, so this chapter also fixes the habits that older tutorials will try to break.</p>
+
+<h3 id="ch33-1">33.1 The io parameter</h3>
+<p>In older Zig, <code>std.fs.cwd()</code> was a global you could call from anywhere. In 0.16 the file system, like the clock and the network, is reached through a value of type <code>std.Io</code> that your program receives in <code>main</code> as <code>init.io</code> and passes down explicitly. A directory is <code>std.Io.Dir</code>, a file is <code>std.Io.File</code>, and every method on them takes <code>io</code> as its first argument after the receiver.</p>
+<p>The starting point is <code>std.Io.Dir.cwd()</code>, a handle to the current working directory. From it you open, create and delete things by relative path. Absolute paths have their own variants ending in <code>Absolute</code>, such as <code>std.Io.Dir.accessAbsolute(io, "/tmp", .{})</code>. This chapter uses relative paths almost everywhere, because programs that work relative to a directory handle are easier to test.</p>
+<div class="warn"><strong>Do not write these.</strong> <code>std.fs.cwd()</code>, <code>std.fs.File</code>, <code>file.writeAll(…)</code> without a writer, <code>std.fs.cwd().readFileAlloc(allocator, path, max)</code> with the old argument order. They are from 0.13 and 0.14 and do not exist now. If a snippet does not mention <code>io</code>, it is not for 0.16.</div>
+
+<h3 id="ch33-2">33.2 Writing a file</h3>
+<p>There are two ways to write, and you will use both. <code>dir.writeFile(io, .{ .sub_path, .data })</code> creates (or truncates) a file and writes a slice in one call, ideal for small things that already exist in memory. For anything built up piece by piece, <code>dir.createFile</code> returns a <code>File</code>, <code>file.writer(io, &amp;buf)</code> wraps it in a buffered writer, and you use the familiar <code>print</code>, <code>writeAll</code> and <code>flush</code> on its <code>interface</code>.</p>
+<p class="file">write.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+
+    // 1. The short way: whole contents in one call.
+    try cwd.writeFile(io, .{ .sub_path = "notes.txt", .data = "day 1: founded the company\n" });
+
+    // 2. The streaming way: a file plus a buffered writer.
+    var file = try cwd.createFile(io, "ledger.csv", .{});
+    defer file.close(io);
+    var wbuf: [512]u8 = undefined;
+    var fw = file.writer(io, &amp;wbuf);
+    const w = &amp;fw.interface;
+    try w.writeAll("day,funds\n");
+    var funds: i64 = 1000;
+    for (1..6) |day| {
+        funds -= 120;
+        try w.print("{d},{d}\n", .{ day, funds });
+    }
+    try w.flush();
+    std.debug.print("wrote notes.txt and ledger.csv\n", .{});
+}</code></pre>
+<pre class="term">$ zig run write.zig
+wrote notes.txt and ledger.csv
+$ cat notes.txt ledger.csv
+day 1: founded the company
+day,funds
+1,880
+2,760
+3,640
+4,520
+5,400</pre>
+<p>Three details. The <code>defer file.close(io)</code> line comes immediately after the successful open, before anything can fail; that is the habit this chapter is named for. The writer holds a buffer you own, so nothing reaches the disk until <code>flush</code>, and a missing flush is the most common reason for an empty file. And <code>createFile</code>'s options struct is empty here, which means "truncate if it exists, create if not, writable".</p>
+
+<h3 id="ch33-3">33.3 Reading a file</h3>
+<p>Reading mirrors writing. <code>readFileAlloc</code> loads a whole file into memory you own, with a size limit so a surprise gigabyte cannot exhaust memory. <code>openFile</code> plus <code>file.reader(io, &amp;buf)</code> streams it, and <code>takeDelimiter('\n')</code> hands you one line at a time, exactly as it did for standard input in <a href="#ch32">Chapter 32</a>. And <code>readFile</code> fills a buffer you already have, with no allocator at all.</p>
+<p class="file">read.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+
+    // 1. Whole file into memory. You own the bytes; free them.
+    const notes = try cwd.readFileAlloc(io, "notes.txt", init.gpa, .limited(1 &lt;&lt; 20));
+    defer init.gpa.free(notes);
+    std.debug.print("notes.txt ({d} bytes): {s}", .{ notes.len, notes });
+
+    // 2. Line by line through a buffered reader.
+    var file = try cwd.openFile(io, "ledger.csv", .{});
+    defer file.close(io);
+    var rbuf: [512]u8 = undefined;
+    var fr = file.reader(io, &amp;rbuf);
+    const r = &amp;fr.interface;
+    var total: i64 = 0;
+    var rows: u32 = 0;
+    _ = try r.takeDelimiter('\n'); // skip the header
+    while (try r.takeDelimiter('\n')) |line| {
+        var it = std.mem.splitScalar(u8, line, ',');
+        _ = it.next();
+        const funds = try std.fmt.parseInt(i64, it.next() orelse "0", 10);
+        total += funds;
+        rows += 1;
+    }
+    std.debug.print("{d} rows, average funds {d}\n", .{ rows, @divTrunc(total, rows) });
+
+    // 3. Into a fixed buffer, no allocator at all.
+    var small: [64]u8 = undefined;
+    const got = try cwd.readFile(io, "notes.txt", &amp;small);
+    std.debug.print("readFile gave {d} bytes\n", .{got.len});
+}</code></pre>
+<pre class="term">$ zig run read.zig
+notes.txt (27 bytes): day 1: founded the company
+5 rows, average funds 640
+readFile gave 27 bytes</pre>
+<p>The argument order of <code>readFileAlloc</code> is <code>(io, path, allocator, limit)</code>, and the limit is a <code>std.Io.Limit</code>: <code>.limited(n)</code> or <code>.unlimited</code>. Exceeding it is <code>error.StreamTooLong</code>. The line reader's buffer is also a limit: a line longer than the buffer is <code>error.StreamTooLong</code> too, which Exercise 33.2 turns into a friendlier error.</p>
+<div class="note"><strong>Which to use?</strong> Whole-file for configuration and anything under a few megabytes: simplest code, one allocation, one free. Streaming for logs, large data, or when you want to stop early. Fixed buffer when you know the maximum size and want zero allocation, as in a test or an embedded program.</div>
+
+<h3 id="ch33-4">33.4 Appending</h3>
+<p>To add to the end of an existing file, open it for writing and position the writer at the current length. The file's <code>length(io)</code> method reports its size, and the <code>File.Writer</code> keeps a <code>pos</code> field that you can set before writing.</p>
+<p class="file">append.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    var file = try cwd.openFile(io, "notes.txt", .{ .mode = .write_only });
+    defer file.close(io);
+    const end = try file.length(io);
+    var wbuf: [256]u8 = undefined;
+    var fw = file.writer(io, &amp;wbuf);
+    fw.pos = end;
+    try fw.interface.print("day 2: hired a tech\n", .{});
+    try fw.interface.flush();
+    const back = try cwd.readFileAlloc(io, "notes.txt", init.gpa, .limited(4096));
+    defer init.gpa.free(back);
+    std.debug.print("{s}", .{back});
+}</code></pre>
+<pre class="term">$ zig run append.zig
+day 1: founded the company
+day 2: hired a tech</pre>
+<p><code>openFile</code>'s options carry a <code>mode</code>: <code>.read_only</code> is the default, <code>.write_only</code> and <code>.read_write</code> are the others. Opening an existing file for writing does not truncate it; only <code>createFile</code> does.</p>
+
+<h3 id="ch33-5">33.5 When the file is not there</h3>
+<p>Every open and read returns an error union, and the error you will handle most is <code>error.FileNotFound</code>. A program that loads settings or a save file should treat it as "first run", not as a crash, and a <code>switch</code> on the error makes that policy explicit while letting everything else propagate.</p>
+<p class="file">missing.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const data = cwd.readFileAlloc(io, "does-not-exist.txt", init.gpa, .limited(1024)) catch |err| switch (err) {
+        error.FileNotFound =&gt; {
+            std.debug.print("no such file, starting fresh\n", .{});
+            return;
+        },
+        else =&gt; return err,
+    };
+    defer init.gpa.free(data);
+    std.debug.print("loaded {d} bytes\n", .{data.len});
+}</code></pre>
+<pre class="term">$ zig run missing.zig
+no such file, starting fresh</pre>
+<p>Other errors you will see: <code>error.AccessDenied</code> (permissions), <code>error.IsDir</code> (you opened a directory as a file), <code>error.PathAlreadyExists</code> (creating a directory that exists, or a file with <code>.exclusive = true</code>), and <code>error.NotDir</code>. All of them are in the error set of the function, so <code>zig build</code> will tell you if a <code>switch</code> is exhaustive.</p>
+
+<h3 id="ch33-6">33.6 Directories</h3>
+<p>Directories have their own small vocabulary. <code>createDirPath</code> makes a directory and any missing parents (the <code>mkdir -p</code> of Zig; there is no <code>makePath</code> in 0.16). <code>openDir</code> with <code>.iterate = true</code> opens one for listing; without that flag, iteration is illegal. <code>iterate()</code> gives an iterator whose <code>next(io)</code> yields entries with a <code>name</code> and a <code>kind</code>. <code>statFile</code> reports size, kind and timestamps. <code>deleteFile</code>, <code>deleteDir</code> and <code>deleteTree</code> remove things, and <code>access</code> asks whether a path exists.</p>
+<p class="file">dirs.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+
+    try cwd.createDirPath(io, "saves/campaign-1/backups");
+    try cwd.writeFile(io, .{ .sub_path = "saves/campaign-1/day-001.zon", .data = ".{ .day = 1 }\n" });
+    try cwd.writeFile(io, .{ .sub_path = "saves/campaign-1/day-002.zon", .data = ".{ .day = 2 }\n" });
+    try cwd.writeFile(io, .{ .sub_path = "saves/campaign-1/notes.txt", .data = "hi\n" });
+
+    var dir = try cwd.openDir(io, "saves/campaign-1", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        std.debug.print("{s:&lt;10} {s}\n", .{ @tagName(entry.kind), entry.name });
+    }
+
+    const st = try dir.statFile(io, "day-002.zon", .{});
+    std.debug.print("day-002.zon is {d} bytes, kind {s}\n", .{ st.size, @tagName(st.kind) });
+
+    try dir.deleteFile(io, "notes.txt");
+    dir.access(io, "notes.txt", .{}) catch |err| std.debug.print("after delete: {s}\n", .{@errorName(err)});
+
+    // cwd() itself is not iterable; open "." with .iterate to walk it.
+    var root = try cwd.openDir(io, ".", .{ .iterate = true });
+    defer root.close(io);
+    var walker = try root.walk(init.gpa);
+    defer walker.deinit();
+    var count: u32 = 0;
+    while (try walker.next(io)) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.basename, ".zon")) count += 1;
+    }
+    std.debug.print("{d} .zon files below the current directory\n", .{count});
+    try cwd.deleteTree(io, "saves");
+    std.debug.print("cleaned up\n", .{});
+}</code></pre>
+<pre class="term">$ zig run dirs.zig
+file       notes.txt
+file       day-001.zon
+file       day-002.zon
+directory  backups
+day-002.zon is 14 bytes, kind file
+after delete: FileNotFound
+2 .zon files below the current directory
+cleaned up</pre>
+<p>The order of entries is whatever the file system returns, not alphabetical; sort them yourself if it matters (Exercise 33.3). The <code>walk</code> method visits a whole tree recursively, giving each entry's <code>basename</code>, <code>path</code> and <code>kind</code>; it needs an allocator for its stack of open directories, and it must be called on a directory that was opened with <code>.iterate = true</code>. <code>cwd()</code> itself is not iterable, which is why the program opens <code>"."</code> first. Forgetting that produces a confusing failure deep inside the iterator rather than a clear error, so remember: to list or walk, open with <code>.iterate = true</code>.</p>
+
+<h3 id="ch33-7">33.7 Paths</h3>
+<p>Paths are strings, and <code>std.fs.path</code> has the functions to build and dissect them without hand-written slicing. This namespace is unchanged by the <code>std.Io</code> move because it never touches the disk.</p>
+<p class="file">paths.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const p = try std.fs.path.join(init.gpa, &amp;.{ "saves", "campaign-1", "day-002.zon" });
+    defer init.gpa.free(p);
+    std.debug.print("join:      {s}\n", .{p});
+    std.debug.print("basename:  {s}\n", .{std.fs.path.basename(p)});
+    std.debug.print("dirname:   {?s}\n", .{std.fs.path.dirname(p)});
+    std.debug.print("extension: {s}\n", .{std.fs.path.extension(p)});
+    std.debug.print("stem:      {s}\n", .{std.fs.path.stem(p)});
+    std.debug.print("absolute?  {}\n", .{std.fs.path.isAbsolute(p)});
+    std.debug.print("separator: '{c}'\n", .{std.fs.path.sep});
+    std.Io.Dir.accessAbsolute(init.io, "/tmp", .{}) catch |e| std.debug.print("/tmp: {s}\n", .{@errorName(e)});
+    std.debug.print("/tmp exists\n", .{});
+}</code></pre>
+<pre class="term">$ zig run paths.zig
+join:      saves/campaign-1/day-002.zon
+basename:  day-002.zon
+dirname:   saves/campaign-1
+extension: .zon
+stem:      day-002
+absolute?  false
+separator: '/'
+/tmp exists</pre>
+<p><code>join</code> allocates, because it builds a new string; everything else returns a slice into the string you passed. <code>dirname</code> is optional (a bare file name has no directory). <code>extension</code> includes the dot, so compare against <code>".zon"</code>. On Windows the separator is a backslash and <code>join</code> uses it; write your paths with <code>join</code> rather than string concatenation and they will work there too.</p>
+
+<h3 id="ch33-8">33.8 Testing file code with tmpDir</h3>
+<p>File code is easy to test badly: tests that write into the project directory leave litter and fail when run twice. The standard library gives you <code>std.testing.tmpDir(.{})</code>, which creates a uniquely named directory under <code>.zig-cache/tmp</code>, hands you it as <code>tmp.dir</code>, and deletes it in <code>cleanup</code>. Inside tests, the <code>io</code> value is <code>std.testing.io</code>.</p>
+<p class="file">tmptest.zig</p>
+<pre><code>const std = @import("std");
+
+fn saveScore(dir: std.Io.Dir, io: std.Io, score: u32) !void {
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&amp;buf, "{d}\n", .{score});
+    try dir.writeFile(io, .{ .sub_path = "score.txt", .data = text });
+}
+
+fn loadScore(dir: std.Io.Dir, io: std.Io) !u32 {
+    var buf: [32]u8 = undefined;
+    const text = try dir.readFile(io, "score.txt", &amp;buf);
+    return std.fmt.parseInt(u32, std.mem.trimEnd(u8, text, "\n"), 10);
+}
+
+test "save and load through a temporary directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try saveScore(tmp.dir, io, 4242);
+    try std.testing.expectEqual(@as(u32, 4242), try loadScore(tmp.dir, io));
+}
+
+test "missing file is FileNotFound" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.FileNotFound, loadScore(tmp.dir, std.testing.io));
+}</code></pre>
+<pre class="term">$ zig test tmptest.zig
+1/2 tmptest.test.save and load through a temporary directory...OK
+2/2 tmptest.test.missing file is FileNotFound...OK
+All 2 tests passed.</pre>
+<p>The pattern to copy is in the two helper functions: they take a <code>std.Io.Dir</code> and an <code>io</code> as parameters instead of reaching for <code>cwd()</code>. That one design choice is what makes them testable in a temporary directory and, later, usable against a real save directory with no change. IRON LEDGER's persistence layer is written the same way.</p>
+
+<h3 id="ch33-9">33.9 The rest of the toolbox</h3>
+<p>You now know the dozen calls that cover almost every program. For completeness, here are the other <code>std.Io.Dir</code> and <code>std.Io.File</code> methods you will meet in real code, all taking <code>io</code> in the positions you have seen. None of them introduces a new idea.</p>
+<table>
+<tr><th>Call</th><th>What it does</th></tr>
+<tr><td><code>dir.rename(old, new_dir, new, io)</code></td><td>Moves or renames a file or directory; the basis of atomic saves (Exercise 33.4). Note that <code>io</code> comes last here.</td></tr>
+<tr><td><code>dir.copyFile(src, dest_dir, dest, io, .{})</code></td><td>Copies a file, creating the destination.</td></tr>
+<tr><td><code>dir.deleteDir(io, path)</code> / <code>dir.deleteTree(io, path)</code></td><td>Removes an empty directory, or a whole tree.</td></tr>
+<tr><td><code>dir.createDirPathOpen(io, path, .{})</code></td><td>Makes the path and returns it opened, in one call; <code>tmpDir</code> is built on it.</td></tr>
+<tr><td><code>dir.realPathFileAlloc(io, path, allocator)</code></td><td>Resolves a relative path to an absolute one.</td></tr>
+<tr><td><code>file.stat(io)</code>, <code>file.length(io)</code></td><td>Metadata for an open file. <code>Stat</code> has <code>size</code>, <code>kind</code>, <code>permissions</code>, <code>mtime</code> (an <code>Io.Timestamp</code>) and <code>atime</code> (optional, since some systems do not track it).</td></tr>
+<tr><td><code>file.sync(io)</code></td><td>Asks the operating system to push the bytes to the physical disk; call it before you tell the user a save is safe.</td></tr>
+<tr><td><code>file.lock(io, .exclusive)</code> / <code>file.unlock(io)</code></td><td>Advisory locking, so two copies of a program do not write the same save at once.</td></tr>
+<tr><td><code>file.setTimestampsNow(io)</code></td><td>Touches the file.</td></tr>
+</table>
+<p>Two habits close the chapter. First, keep the functions that touch files small and at the edge of the program, taking a <code>Dir</code> and an <code>io</code>, and keep the logic that decides what to save pure; the game's persistence layer is a thin shell around an in-memory <code>GameState</code> for exactly this reason. Second, when something goes wrong, print <code>@errorName(err)</code> and the path; a message like <code>saves/day-002.zon: FileNotFound</code> is worth more than any stack trace to the person reading it.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The clearest file-system code in the game is the soundtrack scanner in <code>game/src/tui/music.zig</code>, which lists a directory of audio files in exactly the style of section 33.6:
+<pre><code>var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return;
+defer dir.close(self.io);
+var it = dir.iterate();
+while (try it.next(self.io)) |e| {
+    if (e.kind == .directory) { /* a soundtrack */ continue; }
+    if (e.kind != .file or !isAudio(e.name)) continue;
+    // …
+}</code></pre>
+Note the <code>catch return</code>: a missing music directory simply means no music. The <code>io</code> arrives as a field of the client (<code>self.io</code>), threaded in from <code>main</code>. The build script uses the same API at build time, <code>b.build_root.handle.access(b.graph.io, candidate, .{})</code>, to check whether a mod file exists. And the reason none of this appears in <code>game/src/sim/</code> is the point the guide makes about purity: the simulation never receives an <code>io</code>, so it cannot touch a file, and its determinism is guaranteed by a parameter that is not there. <a href="#ch47">Chapter 47</a> shows the SQLite save files that sit on top of all this.</div>
+
+<h3 id="ch33-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 33.1 · Save and load records <span class="level">practice</span></h4>
+  <p>Write <code>save(dir, io, path, pilots)</code> that writes one <code>name,gunnery,piloting</code> line per pilot, and <code>load</code> that reads it back into an owned slice, treating a missing file as an empty roster and a malformed line as <code>error.BadRecord</code> without leaking. File: <code>exercises/33-files/ex1_records.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 33, exercise 1: save and load a list of records.
+//! Run with:  zig test ex1_records.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Pilot = struct { name: []const u8, gunnery: u8, piloting: u8 };
+
+/// Write one line per pilot: "name,gunnery,piloting\n".
+pub fn save(dir: std.Io.Dir, io: std.Io, path: []const u8, pilots: []const Pilot) !void {
+    var file = try dir.createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [512]u8 = undefined;
+    var fw = file.writer(io, &amp;buf);
+    const w = &amp;fw.interface;
+    for (pilots) |p| try w.print("{s},{d},{d}\n", .{ p.name, p.gunnery, p.piloting });
+    try w.flush();
+}
+
+/// Read the file back. Names are copied into `gpa`; the caller frees them
+/// with `freePilots`. A missing file yields an empty list, not an error.
+pub fn load(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]Pilot {
+    var file = dir.openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound =&gt; return try gpa.alloc(Pilot, 0),
+        else =&gt; return err,
+    };
+    defer file.close(io);
+    var buf: [512]u8 = undefined;
+    var fr = file.reader(io, &amp;buf);
+    const r = &amp;fr.interface;
+    var out: std.ArrayList(Pilot) = .empty;
+    errdefer {
+        // On any failure below, give back every name we already copied,
+        // then the list itself. One block, so the order is explicit.
+        for (out.items) |p| gpa.free(p.name);
+        out.deinit(gpa);
+    }
+    while (try r.takeDelimiter('\n')) |line| {
+        if (line.len == 0) continue;
+        var it = std.mem.splitScalar(u8, line, ',');
+        const name = it.next() orelse return error.BadRecord;
+        const g = it.next() orelse return error.BadRecord;
+        const p = it.next() orelse return error.BadRecord;
+        try out.append(gpa, .{
+            .name = try gpa.dupe(u8, name),
+            .gunnery = try std.fmt.parseInt(u8, g, 10),
+            .piloting = try std.fmt.parseInt(u8, p, 10),
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn freePilots(gpa: std.mem.Allocator, pilots: []Pilot) void {
+    for (pilots) |p| gpa.free(p.name);
+    gpa.free(pilots);
+}
+
+test "round trip" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const roster = [_]Pilot{
+        .{ .name = "Kell", .gunnery = 3, .piloting = 4 },
+        .{ .name = "Ana Ruiz", .gunnery = 5, .piloting = 5 },
+    };
+    try save(tmp.dir, io, "roster.csv", &amp;roster);
+    const back = try load(tmp.dir, io, gpa, "roster.csv");
+    defer freePilots(gpa, back);
+    try std.testing.expectEqual(@as(usize, 2), back.len);
+    try std.testing.expectEqualStrings("Ana Ruiz", back[1].name);
+    try std.testing.expectEqual(@as(u8, 3), back[0].gunnery);
+}
+
+test "missing file is an empty roster" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const back = try load(tmp.dir, std.testing.io, gpa, "nothing.csv");
+    defer freePilots(gpa, back);
+    try std.testing.expectEqual(@as(usize, 0), back.len);
+}
+
+test "a broken line is an error and leaks nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.csv", .data = "Kell,3,4\nAna,5\n" });
+    try std.testing.expectError(error.BadRecord, load(tmp.dir, io, std.testing.allocator, "bad.csv"));
+}</code></pre>
+  <p>The <code>errdefer</code> block is the subtle part: on failure it must free the names already copied <em>and</em> the list, in that order. Two separate <code>errdefer</code>s run in reverse order, which would free the list first and then read freed memory; one block makes the order explicit. This is a preview of <a href="#ch47">Chapter 47</a>, where the same records go to SQLite.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 33.2 · Word count for files <span class="level">warm-up</span></h4>
+  <p>Stream a file through a deliberately tiny buffer, counting lines, words and bytes, and turn <code>error.StreamTooLong</code> into <code>error.LineTooLong</code>. File: <code>exercises/33-files/ex2_wordcount.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 33, exercise 2: count lines, words and bytes of a file.
+//! Run with:  zig test ex2_wordcount.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Counts = struct { lines: u32 = 0, words: u32 = 0, bytes: u64 = 0 };
+
+/// Stream the file through a small buffer; never load it whole.
+pub fn count(dir: std.Io.Dir, io: std.Io, path: []const u8) !Counts {
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var buf: [64]u8 = undefined; // tiny on purpose: lines may be longer
+    var fr = file.reader(io, &amp;buf);
+    const r = &amp;fr.interface;
+    var c = Counts{};
+    while (true) {
+        const maybe = r.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong =&gt; return error.LineTooLong,
+            else =&gt; return err,
+        };
+        const line = maybe orelse break;
+        c.lines += 1;
+        c.bytes += line.len + 1;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        while (it.next()) |_| c.words += 1;
+    }
+    return c;
+}
+
+test "counts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.txt", .data = "alpha beta\ngamma\n\ndelta epsilon zeta\n" });
+    const c = try count(tmp.dir, io, "t.txt");
+    try std.testing.expectEqual(@as(u32, 4), c.lines);
+    try std.testing.expectEqual(@as(u32, 6), c.words);
+    try std.testing.expectEqual(@as(u64, 37), c.bytes);
+}
+
+test "empty file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "e.txt", .data = "" });
+    try std.testing.expectEqual(Counts{}, try count(tmp.dir, io, "e.txt"));
+}
+
+test "a line longer than the buffer is reported" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const long = "x" ** 100 ++ "\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "l.txt", .data = long });
+    try std.testing.expectError(error.LineTooLong, count(tmp.dir, io, "l.txt"));
+}</code></pre>
+  <p><code>takeDelimiter</code> returns <code>null</code> at the end, so the loop reads naturally; the <code>catch</code> on the call itself translates the one error you expect.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 33.3 · List the save files <span class="level">practice</span></h4>
+  <p>Write <code>listSaves(dir, io, gpa, sub_path, ext)</code> returning the sorted names of regular files with the given extension directly inside <code>sub_path</code>. File: <code>exercises/33-files/ex3_listing.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 33, exercise 3: list save files in a directory.
+//! Run with:  zig test ex3_listing.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Names of the regular files directly inside `sub_path` whose extension is
+/// `ext` (for example ".zon"), sorted, copied into `gpa`.
+pub fn listSaves(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator, sub_path: []const u8, ext: []const u8) ![][]u8 {
+    var d = try dir.openDir(io, sub_path, .{ .iterate = true });
+    defer d.close(io);
+    var names: std.ArrayList([]u8) = .empty;
+    errdefer freeNames(gpa, names.items);
+    errdefer names.deinit(gpa);
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file) continue;
+        if (!std.mem.eql(u8, std.fs.path.extension(e.name), ext)) continue;
+        try names.append(gpa, try gpa.dupe(u8, e.name));
+    }
+    std.mem.sort([]u8, names.items, {}, lessThan);
+    return names.toOwnedSlice(gpa);
+}
+
+fn lessThan(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+pub fn freeNames(gpa: std.mem.Allocator, names: [][]u8) void {
+    for (names) |n| gpa.free(n);
+    gpa.free(names);
+}
+
+test "only .zon files, sorted" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "saves/old");
+    try tmp.dir.writeFile(io, .{ .sub_path = "saves/day-002.zon", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "saves/day-001.zon", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "saves/readme.txt", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "saves/old/day-000.zon", .data = "" });
+    const names = try listSaves(tmp.dir, io, gpa, "saves", ".zon");
+    defer freeNames(gpa, names);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("day-001.zon", names[0]);
+    try std.testing.expectEqualStrings("day-002.zon", names[1]);
+}
+
+test "missing directory is FileNotFound" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.FileNotFound, listSaves(tmp.dir, std.testing.io, std.testing.allocator, "nope", ".zon"));
+}</code></pre>
+  <p>Entry names are only valid until the next <code>next</code>, so each is copied with <code>dupe</code> before it goes in the list. <code>std.fs.path.extension</code> keeps the comparison honest for names like <code>archive.zon.bak</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 33.4 · A config file with a default and an atomic rewrite <span class="level">challenge</span></h4>
+  <p><code>load</code> returns defaults when <code>config.zon</code> is missing but propagates a parse error; <code>store</code> writes to <code>config.zon.tmp</code> and renames it over the real name so a crash never leaves a half-written file. File: <code>exercises/33-files/ex4_config.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 33, exercise 4: a config file with a default, and a safe rewrite.
+//! Run with:  zig test ex4_config.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Config = struct { seed: u64 = 3025, autosave: bool = true };
+
+/// Load "config.zon" from `dir`. If the file does not exist, return the
+/// defaults. Any other error (including a bad file) propagates.
+pub fn load(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) !Config {
+    var buf: [256]u8 = undefined;
+    const text = dir.readFile(io, "config.zon", &amp;buf) catch |err| switch (err) {
+        error.FileNotFound =&gt; return Config{},
+        else =&gt; return err,
+    };
+    const z = try gpa.dupeZ(u8, text);
+    defer gpa.free(z);
+    return std.zon.parse.fromSlice(Config, gpa, z, null, .{});
+}
+
+/// Write "config.zon" atomically: serialize to "config.zon.tmp", then rename
+/// over the real name, so a crash mid-write never leaves a half file.
+pub fn store(dir: std.Io.Dir, io: std.Io, cfg: Config) !void {
+    var file = try dir.createFile(io, "config.zon.tmp", .{});
+    var buf: [256]u8 = undefined;
+    var fw = file.writer(io, &amp;buf);
+    try std.zon.stringify.serialize(cfg, .{}, &amp;fw.interface);
+    try fw.interface.writeByte('\n');
+    try fw.interface.flush();
+    file.close(io);
+    try dir.rename("config.zon.tmp", dir, "config.zon", io);
+}
+
+test "defaults when absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try load(tmp.dir, std.testing.io, std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3025), cfg.seed);
+    try std.testing.expect(cfg.autosave);
+}
+
+test "store then load" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try store(tmp.dir, io, .{ .seed = 7, .autosave = false });
+    const cfg = try load(tmp.dir, io, std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), cfg.seed);
+    try std.testing.expect(!cfg.autosave);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "config.zon.tmp", .{}));
+}
+
+test "a corrupt file is an error, not a default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .seed = \"no\" }" });
+    try std.testing.expectError(error.ParseZon, load(tmp.dir, io, std.testing.allocator));
+}</code></pre>
+  <p>The signature of <code>rename</code> in 0.16 is <code>rename(old_dir, old_path, new_dir, new_path, io)</code>, with <code>io</code> last. Writing to a temporary name and renaming is the standard way to make a save atomic on every major operating system.</p></details>
+</div>
+
+<h3 id="ch33-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What replaced <code>std.fs.cwd()</code> in 0.16, and what extra argument do its methods take? <details class="answer"><summary>Answer</summary><code>std.Io.Dir.cwd()</code>; every operation takes an <code>io: std.Io</code>, which <code>main</code> receives as <code>init.io</code>.</details></li>
+  <li>Why might a file you wrote with a writer be empty afterwards? <details class="answer"><summary>Answer</summary>The writer buffers; without <code>flush()</code> nothing reaches the disk.</details></li>
+  <li>What is the argument order of <code>readFileAlloc</code>? <details class="answer"><summary>Answer</summary><code>dir.readFileAlloc(io, path, allocator, limit)</code>, where the limit is <code>.limited(n)</code> or <code>.unlimited</code>.</details></li>
+  <li>How do you create nested directories in one call? <details class="answer"><summary>Answer</summary><code>dir.createDirPath(io, "a/b/c")</code>. There is no <code>makePath</code>.</details></li>
+  <li>What must be true of a directory before you can iterate or walk it? <details class="answer"><summary>Answer</summary>It must have been opened with <code>.{ .iterate = true }</code>. <code>cwd()</code> is not iterable; open <code>"."</code>.</details></li>
+  <li>How should a program react to <code>error.FileNotFound</code> when loading a save? <details class="answer"><summary>Answer</summary>Switch on the error, treat that case as a fresh start, and propagate everything else.</details></li>
+  <li>Where does <code>std.testing.tmpDir</code> put its directory, and which <code>io</code> do tests use? <details class="answer"><summary>Answer</summary>Under <code>.zig-cache/tmp/</code> with a random name; tests use <code>std.testing.io</code>. <code>cleanup()</code> deletes it.</details></li>
+  <li>Why write file functions to take a <code>Dir</code> parameter instead of calling <code>cwd()</code> inside? <details class="answer"><summary>Answer</summary>So the same function works in a temporary test directory and in production, and so its signature shows that it touches the file system.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>All file system access goes through <code>std.Io</code>; start from <code>std.Io.Dir.cwd()</code> and pass <code>io</code> to every call.</li>
+<li>Write with <code>writeFile</code> for slices, or <code>createFile</code> + <code>file.writer(io, &amp;buf)</code> + <code>flush</code>; always <code>defer file.close(io)</code>.</li>
+<li>Read with <code>readFileAlloc(io, path, allocator, limit)</code>, <code>readFile</code> into a buffer, or <code>openFile</code> + <code>reader</code> + <code>takeDelimiter</code>.</li>
+<li>Append by opening <code>.write_only</code> and setting the writer's <code>pos</code> to <code>file.length(io)</code>.</li>
+<li>Handle <code>error.FileNotFound</code> with a <code>switch</code>; let other errors propagate.</li>
+<li><code>createDirPath</code>, <code>openDir(.., .{ .iterate = true })</code>, <code>iterate()</code>, <code>walk()</code>, <code>statFile</code>, <code>deleteFile</code>, <code>deleteTree</code>, <code>access</code>, <code>rename</code>, <code>copyFile</code>, <code>file.sync</code> and <code>file.lock</code> round out the toolbox.</li>
+<li><code>std.fs.path.join</code>, <code>basename</code>, <code>dirname</code>, <code>extension</code>, <code>stem</code>, <code>isAbsolute</code>.</li>
+<li>Test with <code>std.testing.tmpDir(.{})</code> and <code>std.testing.io</code>; write functions that take a <code>Dir</code> and an <code>io</code>.</li>
+</ul></div>
+</section>

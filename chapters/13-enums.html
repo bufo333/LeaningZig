@@ -1,0 +1,659 @@
+<section id="ch13">
+<h2>13. Enums</h2>
+<p class="goals"><strong>In this chapter</strong> you will define closed sets of named values, switch over them with the compiler checking that you forgot nothing, give them methods and explicit integer representations, convert between enums and integers and strings, and learn the trick IRON LEDGER uses for every entity ID: the non-exhaustive enum. By the end you should reach for an enum whenever you catch yourself about to use a string or a magic number to mean "which kind".</p>
+
+<h3 id="ch13-1">13.1 A closed set of names</h3>
+<p>A person in the company has a role: pilot, technician, doctor, administrator. You could store that as a string, but then <code>"Tech"</code>, <code>"tech"</code> and <code>"tehc"</code> are all valid and only one is what you meant. An enum lists the allowed values once and makes anything else a compile error.</p>
+<p class="file">basics.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum {
+    mekwarrior,
+    tech,
+    doctor,
+    admin,
+};
+
+pub fn main() void {
+    const r = Role.mekwarrior;
+    const t: Role = .tech; // shorthand when the type is known
+    std.debug.print("{any} {any}\n", .{ r, t });
+    std.debug.print("{s}\n", .{@tagName(t)});
+    std.debug.print("{}\n", .{r == .mekwarrior});
+    std.debug.print("{}\n", .{r == t});
+}</code></pre>
+<pre class="term">.mekwarrior .tech
+tech
+true
+false</pre>
+<p><code>Role.mekwarrior</code> is the full spelling. When the type is already known, from a declared variable type, a parameter, or a comparison against an existing enum value, you write just the dot and the name: <code>.tech</code>. That shorthand is used far more than the full form; the guide calls it the leading-dot style and you will see it in every switch and every function call that takes an enum.</p>
+<p>Enums compare with <code>==</code> and <code>!=</code>; that is one of the reasons to prefer them over strings. <code>@tagName</code> gives you the name as a string, which is how <code>{s}</code> printed <code>tech</code>. <code>{any}</code> prints the leading-dot form.</p>
+
+<h3 id="ch13-2">13.2 Methods and switch</h3>
+<p>Like a struct, an enum can contain functions, and a function taking the enum as its first parameter is a method. Inside them, <code>switch</code> is the natural tool:</p>
+<p class="file">switch.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum {
+    mekwarrior,
+    tech,
+    doctor,
+    admin,
+
+    /// Monthly salary in C-bills.
+    pub fn baseSalary(self: Role) i64 {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+            .doctor =&gt; 1_500,
+            .admin =&gt; 500,
+        };
+    }
+
+    pub fn isCombat(self: Role) bool {
+        return self == .mekwarrior;
+    }
+};
+
+pub fn main() void {
+    const roster = [_]Role{ .mekwarrior, .mekwarrior, .tech, .doctor, .admin };
+    var payroll: i64 = 0;
+    for (roster) |r| {
+        payroll += r.baseSalary();
+        std.debug.print("{s:&lt;10} {d} combat={}\n", .{ @tagName(r), r.baseSalary(), r.isCombat() });
+    }
+    std.debug.print("payroll {d}\n", .{payroll});
+}</code></pre>
+<pre class="term">mekwarrior 1500 combat=true
+mekwarrior 1500 combat=true
+tech       800 combat=false
+doctor     1500 combat=false
+admin      500 combat=false
+payroll 5800</pre>
+<p><code>switch</code> is an expression here: each arm produces a value and the whole thing is returned. The arms name enum values with the leading dot. And every value is named, which brings us to the property that makes enums worth using.</p>
+
+<h3 id="ch13-3">13.3 The compiler checks exhaustiveness</h3>
+<p>Add a role and forget to update the salary table:</p>
+<p class="file">missing.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { mekwarrior, tech, doctor, admin, medic };
+
+fn baseSalary(r: Role) i64 {
+    return switch (r) {
+        .mekwarrior =&gt; 1_500,
+        .tech =&gt; 800,
+        .doctor =&gt; 1_500,
+        .admin =&gt; 500,
+    };
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{baseSalary(.medic)});
+}</code></pre>
+<pre class="term">missing.zig:6:12: error: switch must handle all possibilities
+    return switch (r) {
+           ^~~~~~
+missing.zig:3:54: note: unhandled enumeration value: 'medic'
+const Role = enum { mekwarrior, tech, doctor, admin, medic };
+                                                     ^~~~~
+missing.zig:3:14: note: enum 'missing.Role' declared here
+const Role = enum { mekwarrior, tech, doctor, admin, medic };
+             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    main: missing.zig:15:42
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=5' to see all references</pre>
+<p><code>switch must handle all possibilities</code>, and the note tells you which value is unhandled and where the enum is declared. This is the reason IRON LEDGER uses enums for roles, phases, contract states, unit conditions and everything else with a fixed set of kinds: add a variant and the compiler lists every switch in 31,000 lines that needs a decision. A string-based design would fail at runtime, in the one code path nobody tested.</p>
+<p>Several values can share an arm, separated by commas, and <code>else</code> catches everything not named:</p>
+<p class="file">grouped.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { mekwarrior, aero_pilot, tech_mek, tech_aero, astech, doctor, medic, admin };
+
+fn baseSalary(r: Role) i64 {
+    return switch (r) {
+        .mekwarrior, .aero_pilot =&gt; 1_500,
+        .tech_mek, .tech_aero =&gt; 800,
+        .astech =&gt; 400,
+        .doctor =&gt; 1_500,
+        .medic =&gt; 400,
+        else =&gt; 500, // everything not named above
+    };
+}
+
+pub fn main() void {
+    std.debug.print("{d} {d} {d}\n", .{
+        baseSalary(.aero_pilot), baseSalary(.medic), baseSalary(.admin),
+    });
+}</code></pre>
+<pre class="term">1500 400 500</pre>
+<div class="warn"><strong><code>else</code> switches off the safety net.</strong> The moment a switch has an <code>else</code> arm, adding a new enum value no longer produces an error there; it silently falls into <code>else</code>. Use <code>else</code> when "everything else" genuinely means the same thing, as a default salary might. When each value deserves its own thought, name them all and let the compiler nag you.</div>
+
+<h3 id="ch13-4">13.4 Explicit tag types and integer conversion</h3>
+<p>Every enum is stored as an integer. By default Zig picks the smallest that fits; you can choose it yourself with <code>enum(u8)</code>, and you can assign the values:</p>
+<p class="file">tagtype.zig</p>
+<pre><code>const std = @import("std");
+
+const Quality = enum(u8) {
+    f = 0,
+    d = 1,
+    c = 2,
+    b = 3,
+    a = 4,
+};
+
+const Phase = enum(u8) { travel, supply, events, battle, finances }; // 0, 1, 2, ...
+
+pub fn main() void {
+    std.debug.print("{d} bytes\n", .{@sizeOf(Quality)});
+    std.debug.print("{d}\n", .{@intFromEnum(Quality.b)});
+    const q: Quality = @enumFromInt(4);
+    std.debug.print("{s}\n", .{@tagName(q)});
+    std.debug.print("{d} {d}\n", .{ @intFromEnum(Phase.travel), @intFromEnum(Phase.finances) });
+    std.debug.print("{}\n", .{@intFromEnum(Phase.travel) &lt; @intFromEnum(Phase.battle)});
+
+    var counts = [_]u32{0} ** 5;
+    for ([_]Quality{ .a, .c, .a, .f }) |x| counts[@intFromEnum(x)] += 1;
+    std.debug.print("{any}\n", .{counts});
+}</code></pre>
+<pre class="term">1 bytes
+3
+a
+0 4
+true
+{ 1, 0, 1, 0, 2 }</pre>
+<p><code>@intFromEnum</code> goes from enum to integer; <code>@enumFromInt</code> goes back, taking its target type from context. With no explicit values, they count up from zero in declaration order, which makes <code>@intFromEnum(a) &lt; @intFromEnum(b)</code> a test of declaration order; IRON LEDGER's <code>clock.zig</code> has a test that checks its day phases are in the right order exactly this way. The last lines show the most common use of the integer: indexing an array of counters by enum value.</p>
+<p>Going from an integer to an enum is checked. If the number matches no value, Debug builds panic:</p>
+<pre><code>const std = @import("std");
+
+const Quality = enum(u8) { f, d, c, b, a };
+
+pub fn main() void {
+    var n: u8 = 4;
+    n += 3;
+    const q: Quality = @enumFromInt(n);
+    std.debug.print("{s}\n", .{@tagName(q)});
+}</code></pre>
+<pre class="term">thread 6011123 panic: invalid enum value
+ch13/badint.zig:8:24: in main (badint)
+    const q: Quality = @enumFromInt(n);
+                       ^
+&lt;zig&gt;/lib/std/start.zig:698:59: in callMain (badint)
+    if (fn_info.params.len == 0) return wrapMain(root.main());
+                                                          ^
+???:?:?: in start (/usr/lib/dyld)</pre>
+<p>So <code>@enumFromInt</code> is safe to use on trusted numbers (an index you computed from a valid enum) and should be guarded on untrusted ones (a byte from a file). Section 13.5 shows the enum kind that accepts any integer on purpose.</p>
+
+<h3 id="ch13-5">13.5 Non-exhaustive enums and typed IDs</h3>
+<p>An enum whose last member is <code>_</code> is <em>non-exhaustive</em>: it declares that any value of the tag type is valid, not only the named ones. It must have an explicit tag type. IRON LEDGER uses this for every entity ID:</p>
+<p class="file">nonexh.zig</p>
+<pre><code>const std = @import("std");
+
+pub const PersonId = enum(u32) { none = 0, _ };
+pub const UnitId = enum(u32) { none = 0, _ };
+
+fn describe(id: PersonId) void {
+    switch (id) {
+        .none =&gt; std.debug.print("nobody\n", .{}),
+        _ =&gt; std.debug.print("person #{d}\n", .{@intFromEnum(id)}),
+    }
+}
+
+pub fn main() void {
+    const kai: PersonId = @enumFromInt(7);
+    describe(kai);
+    describe(.none);
+    std.debug.print("{}\n", .{kai == .none});
+    std.debug.print("{d} bytes, same as u32\n", .{@sizeOf(PersonId)});
+}</code></pre>
+<pre class="term">person #7
+nobody
+false
+4 bytes, same as u32</pre>
+<p>Read <code>enum(u32) { none = 0, _ }</code> as "a <code>u32</code> with one named value, <code>none</code>, and every other number allowed". At runtime a <code>PersonId</code> is four bytes, exactly a <code>u32</code>; it costs nothing. But it is a distinct type. Its purpose is the error below:</p>
+<pre><code>const std = @import("std");
+
+pub const PersonId = enum(u32) { none = 0, _ };
+pub const UnitId = enum(u32) { none = 0, _ };
+
+fn fire(id: PersonId) void {
+    std.debug.print("fired #{d}\n", .{@intFromEnum(id)});
+}
+
+pub fn main() void {
+    const atlas: UnitId = @enumFromInt(3);
+    fire(atlas);
+}</code></pre>
+<pre class="term">nonexh_err.zig:12:10: error: expected type 'nonexh_err.PersonId', found 'nonexh_err.UnitId'
+    fire(atlas);
+         ^~~~~
+nonexh_err.zig:4:20: note: enum declared here
+pub const UnitId = enum(u32) { none = 0, _ };
+                   ^~~~~~~~~~~~~~~~~~~~~~~~~
+nonexh_err.zig:3:22: note: enum declared here
+pub const PersonId = enum(u32) { none = 0, _ };
+                     ^~~~~~~~~~~~~~~~~~~~~~~~~
+nonexh_err.zig:6:13: note: parameter type declared here
+fn fire(id: PersonId) void {
+            ^~~~~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>A function that wants a person's ID will not accept a unit's ID, even though both are 32-bit numbers underneath. With plain <code>u32</code> IDs this bug compiles and corrupts a save file; with typed IDs it does not compile. And <code>.none</code> gives a spelled-out "no one" value instead of a magic zero.</p>
+<p>A switch on a non-exhaustive enum uses <code>_</code> as its catch-all arm for the unnamed values, as <code>describe</code> shows. It is different from <code>else</code>: <code>else</code> would also cover any <em>named</em> values you left out, while <code>_</code> covers only the unnamed ones, so the exhaustiveness check still protects the names.</p>
+<div class="note"><strong>The whole pattern, as the game writes it.</strong>
+<pre><code>// src/domain/types.zig
+pub const PersonId = enum(u32) { none = 0, _ };
+pub const UnitId = enum(u32) { none = 0, _ };
+pub const ForceId = enum(u32) { none = 0, _ };
+pub const ContractId = enum(u32) { none = 0, _ };</code></pre>
+Converting is explicit and rare: <code>@enumFromInt(n)</code> where a user typed a number, <code>@intFromEnum(id)</code> where the ID is written to a file or printed. Everywhere in between, the ID is opaque.</div>
+
+<h3 id="ch13-6">13.6 From strings to enums</h3>
+<p>User input arrives as text. <code>std.meta.stringToEnum</code> looks a name up and returns an optional:</p>
+<p class="file">stringto.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { mekwarrior, tech, doctor, admin };
+
+pub fn main() void {
+    const inputs = [_][]const u8{ "tech", "doctor", "pilot", "Tech" };
+    for (inputs) |s| {
+        if (std.meta.stringToEnum(Role, s)) |r| {
+            std.debug.print("{s} -&gt; {any}\n", .{ s, r });
+        } else {
+            std.debug.print("{s} -&gt; not a role\n", .{s});
+        }
+    }
+}</code></pre>
+<pre class="term">tech -&gt; .tech
+doctor -&gt; .doctor
+pilot -&gt; not a role
+Tech -&gt; not a role</pre>
+<p>The match is exact and case-sensitive, so <code>"Tech"</code> is rejected; lower-case the input first if you want to be lenient. Together with <code>@tagName</code> this gives you a free, always-in-sync parser and printer for any enum: the names in the source are the names in the file format.</p>
+<p>To iterate over every value, <code>std.enums.values</code> returns them in declaration order, and <code>@typeInfo</code> can count them:</p>
+<p class="file">fields.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { mekwarrior, tech, doctor, admin };
+
+pub fn main() void {
+    // Walk every value of an enum.
+    for (std.enums.values(Role)) |r| {
+        std.debug.print("{d}: {s}\n", .{ @intFromEnum(r), @tagName(r) });
+    }
+    std.debug.print("{d} roles\n", .{@typeInfo(Role).@"enum".fields.len});
+}</code></pre>
+<pre class="term">0: mekwarrior
+1: tech
+2: doctor
+3: admin
+4 roles</pre>
+
+<h3 id="ch13-7">13.7 Enum literals</h3>
+<p>What is <code>.tech</code> on its own, before it meets a type? Zig calls it an <em>enum literal</em>. It is a compile-time value that becomes whichever enum the context asks for:</p>
+<p class="file">literal.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { mekwarrior, tech };
+const Status = enum { active, tech };
+
+fn roleName(r: Role) []const u8 {
+    return @tagName(r);
+}
+
+pub fn main() void {
+    std.debug.print("{s}\n", .{roleName(.tech)}); // .tech becomes Role.tech
+    const s: Status = .tech; // the same literal, a different enum
+    std.debug.print("{s}\n", .{@tagName(s)});
+    const lit = .tech; // no context: an enum literal, not yet any enum
+    std.debug.print("{any}\n", .{@TypeOf(lit)});
+}</code></pre>
+<pre class="term">tech
+tech
+@EnumLiteral()</pre>
+<p>The same literal <code>.tech</code> became a <code>Role</code> in the call and a <code>Status</code> in the declaration, because both enums have a member with that name. Assigned to a plain <code>const</code> with no type, it stays an enum literal (<code>@EnumLiteral()</code>) and can be used later wherever an enum with that member is expected. You will see enum literals as lightweight options in the standard library, for example the <code>.real</code> in <code>std.Io.Clock.now(.real, io)</code> and the <code>.scalar</code> in <code>std.mem.TokenIterator(u8, .scalar)</code>.</p>
+
+<h3 id="ch13-8">13.8 When to reach for an enum</h3>
+<p>A few habits will serve you well. If a value can only ever be one of a fixed list of things, it is an enum, even when there are only two of them: <code>enum { attacker, defender }</code> reads better than a <code>bool</code> called <code>is_attacker</code>, and it can grow to three sides without a rewrite. If you find a <code>u8</code> whose comment says "0 = green, 1 = regular, 2 = veteran", it is an enum with an explicit tag type, and the comment becomes the member names. If a function takes a string and immediately compares it against a handful of known words, parse it once with <code>stringToEnum</code> at the edge and pass the enum inward, so the rest of the program never sees the text.</p>
+<p>The one thing an enum cannot do is carry data with each alternative. A key press is <code>enter</code> or <code>escape</code> or <em>a character, and which character</em>; a command is <code>advance_day</code> or <em>hire, and whom</em>. For that you need the enum's bigger sibling, the tagged union, which is the subject of <a href="#ch14">Chapter 14</a>. Everything you learned here, the leading-dot literals, exhaustive <code>switch</code>, <code>@tagName</code>, carries over unchanged.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The roles enum is the largest in the domain layer, and its salary method is the canonical exhaustive switch:
+<pre><code>// src/domain/person.zig
+pub const Role = enum {
+    mekwarrior, vehicle_crew, aero_pilot, ba_trooper, infantry,
+    tech_mek, tech_mechanic, tech_aero, tech_ba, astech,
+    doctor, medic,
+    admin_command, admin_logistics, admin_transport, admin_hr, admin_finance,
+    dropship_crew, jumpship_crew,
+
+    /// CamOps base monthly salary in C-bills (MekHQ defaults).
+    pub fn baseSalary(self: Role) types.CBills {
+        return switch (self) {
+            .mekwarrior, .aero_pilot =&gt; 1_500,
+            .vehicle_crew =&gt; 900,
+            .tech_mek, .tech_aero, .tech_ba =&gt; 800,
+            .astech =&gt; 400,
+            .doctor =&gt; 1_500,
+            .medic =&gt; 400,
+            .admin_command, .admin_logistics, .admin_transport, .admin_hr, .admin_finance =&gt; 500,
+            .dropship_crew, .jumpship_crew =&gt; 750,
+            // ...
+        };
+    }
+};</code></pre>
+<p>Elsewhere the same ideas recur: <code>src/main.zig</code> prints <code>@tagName(c.status)</code> and <code>@intFromEnum(c.id)</code> in its reports; <code>src/sim/clock.zig</code> tests that <code>@intFromEnum(DayPhase.travel) &lt; @intFromEnum(DayPhase.supply_consumption)</code>; and the typed IDs in <code>src/domain/types.zig</code> keep a <code>PersonId</code> from ever being handed to a function that wanted a <code>UnitId</code>.</p></div>
+
+<h3 id="ch13-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 13.1 · An enum with methods <span class="level">warm-up</span></h4>
+  <p>Give <code>Role</code> three methods: an exhaustive <code>baseSalary</code> with grouped arms, <code>isCombat</code>, and <code>supervisor</code>, which returns an optional <code>Role</code>. The last test walks every value with <code>std.enums.values</code>. Name the file: <code>exercises/13-enums/ex1_roles.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 13, exercise 1: an enum with methods.
+//! Run with:  zig test ex1_roles.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Role = enum {
+    mekwarrior,
+    aero_pilot,
+    tech,
+    astech,
+    doctor,
+    medic,
+    admin,
+
+    pub fn baseSalary(self: Role) i64 {
+        return switch (self) {
+            .mekwarrior, .aero_pilot, .doctor =&gt; 1_500,
+            .tech =&gt; 800,
+            .astech, .medic =&gt; 400,
+            .admin =&gt; 500,
+        };
+    }
+
+    pub fn isCombat(self: Role) bool {
+        return switch (self) {
+            .mekwarrior, .aero_pilot =&gt; true,
+            else =&gt; false,
+        };
+    }
+
+    /// The role that supervises this one, or null at the top.
+    pub fn supervisor(self: Role) ?Role {
+        return switch (self) {
+            .astech =&gt; .tech,
+            .medic =&gt; .doctor,
+            .mekwarrior, .aero_pilot, .tech, .doctor =&gt; .admin,
+            .admin =&gt; null,
+        };
+    }
+};
+
+test "salaries" {
+    try std.testing.expectEqual(@as(i64, 1_500), Role.mekwarrior.baseSalary());
+    try std.testing.expectEqual(@as(i64, 400), Role.medic.baseSalary());
+    try std.testing.expectEqual(@as(i64, 500), Role.admin.baseSalary());
+}
+
+test "combat" {
+    try std.testing.expect(Role.aero_pilot.isCombat());
+    try std.testing.expect(!Role.tech.isCombat());
+}
+
+test "supervisor chain" {
+    try std.testing.expectEqual(@as(?Role, .tech), Role.astech.supervisor());
+    try std.testing.expectEqual(@as(?Role, .admin), Role.tech.supervisor());
+    try std.testing.expectEqual(@as(?Role, null), Role.admin.supervisor());
+}
+
+test "payroll over every role" {
+    var total: i64 = 0;
+    for (std.enums.values(Role)) |r| total += r.baseSalary();
+    try std.testing.expectEqual(@as(i64, 6_600), total);
+}</code></pre>
+  <p><code>baseSalary</code> and <code>supervisor</code> name every value so that adding a role forces a decision in both. <code>isCombat</code> uses <code>else</code> deliberately: a new role is non-combat until someone says otherwise, and that default is safe.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 13.2 · Explicit tags and conversions <span class="level">practice</span></h4>
+  <p><code>Quality</code> is an <code>enum(u8)</code> with values 0 to 4. Implement <code>improve</code> and <code>degrade</code> (stepping through the integer, clamped at the ends), <code>parse</code> from a letter, and <code>letter</code> for display. Name the file: <code>exercises/13-enums/ex2_quality.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 13, exercise 2: explicit tag types and conversions.
+//! Run with:  zig test ex2_quality.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Unit quality grades, worst to best. The integer is the index into tables.
+const Quality = enum(u8) {
+    f = 0,
+    d = 1,
+    c = 2,
+    b = 3,
+    a = 4,
+
+    /// One grade better, capped at a.
+    pub fn improve(self: Quality) Quality {
+        if (self == .a) return .a;
+        return @enumFromInt(@intFromEnum(self) + 1);
+    }
+
+    /// One grade worse, capped at f.
+    pub fn degrade(self: Quality) Quality {
+        if (self == .f) return .f;
+        return @enumFromInt(@intFromEnum(self) - 1);
+    }
+
+    /// Parse a single letter, either case. Anything else is null.
+    pub fn parse(c: u8) ?Quality {
+        return switch (std.ascii.toLower(c)) {
+            'f' =&gt; .f,
+            'd' =&gt; .d,
+            'c' =&gt; .c,
+            'b' =&gt; .b,
+            'a' =&gt; .a,
+            else =&gt; null,
+        };
+    }
+
+    /// Upper-case letter for display.
+    pub fn letter(self: Quality) u8 {
+        return std.ascii.toUpper(@tagName(self)[0]);
+    }
+};
+
+test "size and values" {
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(Quality));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(Quality.b));
+}
+
+test "improve and degrade clamp" {
+    try std.testing.expectEqual(Quality.d, Quality.f.improve());
+    try std.testing.expectEqual(Quality.a, Quality.a.improve());
+    try std.testing.expectEqual(Quality.f, Quality.f.degrade());
+    try std.testing.expectEqual(Quality.c, Quality.b.degrade());
+}
+
+test "parse and letter" {
+    try std.testing.expectEqual(@as(?Quality, .b), Quality.parse('b'));
+    try std.testing.expectEqual(@as(?Quality, .b), Quality.parse('B'));
+    try std.testing.expectEqual(@as(?Quality, null), Quality.parse('x'));
+    try std.testing.expectEqual(@as(u8, 'A'), Quality.a.letter());
+}
+
+test "histogram indexed by the tag" {
+    var counts = [_]u32{0} ** 5;
+    for ([_]Quality{ .a, .c, .a, .f }) |q| counts[@intFromEnum(q)] += 1;
+    try std.testing.expectEqual([5]u32{ 1, 0, 1, 0, 2 }, counts);
+}</code></pre>
+  <p>The clamp checks come first so that <code>@enumFromInt</code> is only ever given 0 to 4; without them, <code>.a.improve()</code> would build the value 5 and panic. <code>letter</code> leans on <code>@tagName</code> so the display letter can never disagree with the source.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 13.3 · Typed IDs <span class="level">practice</span></h4>
+  <p>Declare <code>PersonId</code> and <code>UnitId</code> exactly as IRON LEDGER does, then write a generator that hands out fresh IDs, a <code>Pilot</code> whose <code>unit</code> defaults to <code>.none</code>, and a parser from text. Name the file: <code>exercises/13-enums/ex3_ids.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 13, exercise 3: typed IDs with non-exhaustive enums.
+//! Run with:  zig test ex3_ids.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const PersonId = enum(u32) { none = 0, _ };
+pub const UnitId = enum(u32) { none = 0, _ };
+
+/// Hands out fresh PersonIds, starting at 1.
+const IdGen = struct {
+    next: u32 = 1,
+
+    pub fn newPerson(self: *IdGen) PersonId {
+        const id: PersonId = @enumFromInt(self.next);
+        self.next += 1;
+        return id;
+    }
+};
+
+/// A pilot may or may not be assigned to a unit.
+const Pilot = struct {
+    id: PersonId,
+    unit: UnitId = .none,
+
+    pub fn isAssigned(self: Pilot) bool {
+        return self.unit != .none;
+    }
+};
+
+/// Parse text like "7" into a PersonId. "0" or garbage is null.
+fn parsePersonId(s: []const u8) ?PersonId {
+    const n = std.fmt.parseInt(u32, s, 10) catch return null;
+    if (n == 0) return null;
+    return @enumFromInt(n);
+}
+
+test "ids are distinct values" {
+    var gen = IdGen{};
+    const a = gen.newPerson();
+    const b = gen.newPerson();
+    try std.testing.expect(a != b);
+    try std.testing.expect(a != .none);
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(a));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(b));
+}
+
+test "assignment uses .none as absent" {
+    var gen = IdGen{};
+    var p = Pilot{ .id = gen.newPerson() };
+    try std.testing.expect(!p.isAssigned());
+    p.unit = @enumFromInt(42);
+    try std.testing.expect(p.isAssigned());
+}
+
+test "parsing" {
+    try std.testing.expectEqual(@as(?PersonId, @enumFromInt(7)), parsePersonId("7"));
+    try std.testing.expectEqual(@as(?PersonId, null), parsePersonId("0"));
+    try std.testing.expectEqual(@as(?PersonId, null), parsePersonId("seven"));
+}
+
+test "ids cost nothing" {
+    try std.testing.expectEqual(@sizeOf(u32), @sizeOf(PersonId));
+}</code></pre>
+  <p>The last test is the point of the exercise: <code>@sizeOf(PersonId) == @sizeOf(u32)</code>. Type safety here is free at runtime. The parser refuses zero so that <code>.none</code> can only be produced on purpose, never by a user typing <code>0</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 13.4 · A day-phase state machine <span class="level">challenge</span></h4>
+  <p>The phases of a campaign day are an ordered enum. Implement <code>next</code> (using <code>std.enums.values</code>), <code>before</code>, a <code>label</code> that capitalises the tag name into a buffer, and <code>runDay</code>, which steps from a starting phase to the end. Name the file: <code>exercises/13-enums/ex4_phases.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 13, exercise 4: a day-phase state machine (challenge).
+//! Run with:  zig test ex4_phases.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// The phases of one campaign day, in order.
+const Phase = enum(u8) {
+    travel,
+    supply,
+    events,
+    battle,
+    finances,
+    decisions,
+
+    /// The next phase, or null after the last one.
+    pub fn next(self: Phase) ?Phase {
+        const all = std.enums.values(Phase);
+        const i = @intFromEnum(self);
+        if (i + 1 &gt;= all.len) return null;
+        return all[i + 1];
+    }
+
+    /// True when `self` happens before `other`.
+    pub fn before(self: Phase, other: Phase) bool {
+        return @intFromEnum(self) &lt; @intFromEnum(other);
+    }
+
+    /// Human label: the tag name with the first letter upper-cased, into buf.
+    pub fn label(self: Phase, buf: []u8) []const u8 {
+        const name = @tagName(self);
+        @memcpy(buf[0..name.len], name);
+        buf[0] = std.ascii.toUpper(buf[0]);
+        return buf[0..name.len];
+    }
+};
+
+/// Run every phase from `start` to the end, writing the names visited into `out`.
+/// Returns how many phases ran.
+fn runDay(start: Phase, out: []Phase) usize {
+    var n: usize = 0;
+    var p: ?Phase = start;
+    while (p) |cur| : (p = cur.next()) {
+        out[n] = cur;
+        n += 1;
+    }
+    return n;
+}
+
+test "next walks in declaration order" {
+    try std.testing.expectEqual(@as(?Phase, .supply), Phase.travel.next());
+    try std.testing.expectEqual(@as(?Phase, .decisions), Phase.finances.next());
+    try std.testing.expectEqual(@as(?Phase, null), Phase.decisions.next());
+}
+
+test "ordering" {
+    try std.testing.expect(Phase.travel.before(.battle));
+    try std.testing.expect(!Phase.battle.before(.travel));
+    try std.testing.expect(!Phase.battle.before(.battle));
+}
+
+test "labels" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("Finances", Phase.finances.label(&amp;buf));
+}
+
+test "runDay" {
+    var out: [8]Phase = undefined;
+    try std.testing.expectEqual(@as(usize, 6), runDay(.travel, &amp;out));
+    try std.testing.expectEqual(Phase.travel, out[0]);
+    try std.testing.expectEqual(Phase.decisions, out[5]);
+    try std.testing.expectEqual(@as(usize, 2), runDay(.finances, &amp;out));
+    try std.testing.expectEqual(Phase.finances, out[0]);
+}</code></pre>
+  <p><code>runDay</code> uses <code>while (p) |cur| : (p = cur.next())</code>: loop while the optional holds a value, and after each pass replace it with the next phase, which becomes <code>null</code> after the last one. That loop shape returns in <a href="#ch15">Chapter 15</a>. IRON LEDGER's daily tick (<a href="#ch43">Chapter 43</a>) walks its <code>DayPhase</code> enum in the same spirit.</p></details>
+</div>
+
+<h3 id="ch13-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>When can you write <code>.tech</code> instead of <code>Role.tech</code>? <details class="answer"><summary>Answer</summary>Whenever the expected type is known from context: a typed declaration, a parameter, a switch arm, a comparison with an existing <code>Role</code>.</details></li>
+  <li>What happens when a <code>switch</code> over an enum leaves a value out? <details class="answer"><summary>Answer</summary>A compile error, <code>switch must handle all possibilities</code>, naming the unhandled value. Unless the switch has an <code>else</code> arm, which absorbs it silently.</details></li>
+  <li>What do <code>@intFromEnum</code> and <code>@enumFromInt</code> do, and which one can panic? <details class="answer"><summary>Answer</summary>They convert between an enum and its integer tag. <code>@enumFromInt</code> panics in safe builds if the integer matches no named value of an exhaustive enum.</details></li>
+  <li>What does the <code>_</code> at the end of <code>enum(u32) { none = 0, _ }</code> mean? <details class="answer"><summary>Answer</summary>The enum is non-exhaustive: every <code>u32</code> is a valid value, not only the named ones. It needs an explicit tag type.</details></li>
+  <li>Why does IRON LEDGER use <code>PersonId</code> instead of <code>u32</code>? <details class="answer"><summary>Answer</summary>Same size, same cost, but a distinct type: passing a <code>UnitId</code> where a <code>PersonId</code> is expected is a compile error rather than a silent bug, and <code>.none</code> is a named absent value.</details></li>
+  <li>How do you turn the string <code>"doctor"</code> into <code>Role.doctor</code>? <details class="answer"><summary>Answer</summary><code>std.meta.stringToEnum(Role, "doctor")</code>, which returns <code>?Role</code>: <code>null</code> if the name does not match exactly.</details></li>
+  <li>What is the difference between <code>else</code> and <code>_</code> as a switch arm? <details class="answer"><summary>Answer</summary><code>else</code> matches every value not listed, named or not, and disables the exhaustiveness check. <code>_</code> matches only the unnamed values of a non-exhaustive enum; named values must still all be handled.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>const E = enum { a, b, c };</code> declares a closed set; write values as <code>E.a</code> or, with context, <code>.a</code>. Enums compare with <code>==</code>.</li>
+<li>Enums hold methods and constants like structs. <code>switch</code> over an enum must be exhaustive unless it has <code>else</code>; grouped arms use commas.</li>
+<li><code>enum(u8)</code> fixes the tag type; values may be assigned explicitly. <code>@intFromEnum</code> and <code>@enumFromInt</code> convert; the latter is checked.</li>
+<li><code>enum(u32) { none = 0, _ }</code> is a non-exhaustive enum: a typed integer with a named "none". IRON LEDGER uses it for every ID. Switch on it with <code>_</code>.</li>
+<li><code>@tagName</code> gives the name; <code>std.meta.stringToEnum</code> parses one; <code>std.enums.values</code> lists them all.</li>
+<li>A bare <code>.name</code> is an enum literal that becomes whatever enum the context needs.</li>
+</ul></div>
+</section>

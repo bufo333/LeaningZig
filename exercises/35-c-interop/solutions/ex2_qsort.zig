@@ -1,0 +1,26 @@
+//! Chapter 35, exercise 2: qsort with a Zig comparator.
+//! Run with:  zig run -lc ex2_qsort.zig
+//! Goal: sort an array of salaries with libc's qsort, using a comparator
+//! written in Zig with callconv(.c). Expected output:
+//!   before: { 1500, 400, 800, 640, 1500, 500 }
+//!   after:  { 400, 500, 640, 800, 1500, 1500 }
+
+const std = @import("std");
+
+const CompareFn = *const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
+extern fn qsort(base: ?*anyopaque, nmemb: usize, size: usize, compar: CompareFn) void;
+
+fn byValue(a: ?*const anyopaque, b: ?*const anyopaque) callconv(.c) c_int {
+    const x: *const i64 = @ptrCast(@alignCast(a.?));
+    const y: *const i64 = @ptrCast(@alignCast(b.?));
+    if (x.* < y.*) return -1;
+    if (x.* > y.*) return 1;
+    return 0;
+}
+
+pub fn main() void {
+    var salaries = [_]i64{ 1500, 400, 800, 640, 1500, 500 };
+    std.debug.print("before: {any}\n", .{salaries});
+    qsort(&salaries, salaries.len, @sizeOf(i64), byValue);
+    std.debug.print("after:  {any}\n", .{salaries});
+}

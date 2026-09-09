@@ -1,0 +1,557 @@
+<section id="ch37">
+<h2>37. Style, idioms and reading compile errors</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn how Zig code is expected to look (the formatter, the naming rules, the order of things in a file, the idioms every library uses), and then spend most of the chapter on the skill that matters most day to day: reading what the compiler and the runtime tell you. Six real compile errors, a panic with a stack trace, an error return trace, and the three build modes that decide which checks stay on.</p>
+
+<h3 id="ch37-1">37.1 zig fmt</h3>
+<p>Zig has one formatting style and a tool that applies it. There is nothing to configure and no argument to have.</p>
+<div class="file">before.zig</div>
+<pre><code>const std=@import("std");
+pub fn main( ) void{
+std.debug.print("x\n",.{});}</code></pre>
+<pre class="term">$ zig fmt --check before.zig
+before.zig
+$ echo $status
+1
+$ zig fmt before.zig
+before.zig
+$ cat before.zig
+const std = @import("std");
+pub fn main() void {
+    std.debug.print("x\n", .{});
+}</pre>
+<p><code>zig fmt file.zig</code> rewrites the file in place; <code>zig fmt --check</code> lists files that would change and exits non-zero, which is the form you put in a pre-commit hook or CI. Run it on a directory to format everything under it. The style is four-space indent, one statement per line, and a rule you will come to rely on: a trailing comma in any list (<code>.{ a, b, }</code>, struct fields, arguments) makes the formatter put one item per line; removing it makes the formatter put them on one line. That comma is the only formatting decision left to you, and it is a good one.</p>
+
+<h3 id="ch37-2">37.2 Names</h3>
+<p>The conventions are simple and the standard library follows them without exception, so your code will read as native if you do too.</p>
+<table>
+<tr><th>Thing</th><th>Style</th><th>Examples</th></tr>
+<tr><td>Types (structs, enums, unions, and functions that return types)</td><td><code>TitleCase</code></td><td><code>Person</code>, <code>PersonId</code>, <code>ArrayList</code>, <code>fn Stack(comptime T: type) type</code></td></tr>
+<tr><td>Functions and methods</td><td><code>camelCase</code></td><td><code>baseSalary</code>, <code>advanceDay</code>, <code>readFileAlloc</code></td></tr>
+<tr><td>Variables, constants, fields, parameters, enum tags, error names' fields</td><td><code>snake_case</code></td><td><code>hired_day</code>, <code>max_roster_size</code>, <code>.mekwarrior</code></td></tr>
+<tr><td>Error values</td><td><code>TitleCase</code></td><td><code>error.UnknownPerson</code>, <code>error.OutOfMemory</code></td></tr>
+<tr><td>Files</td><td><code>snake_case.zig</code>, or <code>TitleCase.zig</code> when the file <em>is</em> a struct</td><td><code>finance.zig</code>, <code>rng.zig</code>; <code>ArrayList.zig</code></td></tr>
+</table>
+<p>A useful consequence: you can tell what an identifier is from its shape. <code>Role.baseSalary</code> is a function on a type; <code>role.base_salary</code> would be a field. Acronyms are treated as words: <code>HqId</code>, not <code>HQID</code>; <code>parseJson</code>, not <code>parseJSON</code>.</p>
+
+<h3 id="ch37-3">37.3 Doc comments and the order of a file</h3>
+<p>Two kinds of comment carry meaning for tools. <code>//!</code> at the top of a file documents the file itself (that is what every exercise header in this book is). <code>///</code> immediately before a declaration documents that declaration, and <code>zig build-exe -femit-docs</code> or an editor will show it. Ordinary <code>//</code> comments are for humans reading the code right there.</p>
+<div class="file">s_style.zig</div>
+<pre><code>//! A file-level doc comment: what this file is for.
+const std = @import("std");
+
+/// Money in C-bills. Doc comments (three slashes) attach to the next declaration.
+pub const CBills = i64;
+
+/// A person's job.
+pub const Role = enum {
+    mekwarrior,
+    tech,
+
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+        };
+    }
+};
+
+pub const Roster = struct {
+    people: std.ArrayList(Role) = .empty,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+        self.people.deinit(gpa);
+    }
+
+    pub fn add(self: *Self, gpa: std.mem.Allocator, role: Role) !void {
+        try self.people.append(gpa, role);
+    }
+
+    pub fn payroll(self: Self) CBills {
+        var total: CBills = 0;
+        for (self.people.items) |r| total += r.baseSalary();
+        return total;
+    }
+};
+
+const max_roster_size = 12;
+
+test "payroll" {
+    var roster: Roster = .{};
+    defer roster.deinit(std.testing.allocator);
+    try roster.add(std.testing.allocator, .mekwarrior);
+    try roster.add(std.testing.allocator, .tech);
+    try std.testing.expectEqual(@as(CBills, 2_300), roster.payroll());
+    try std.testing.expect(roster.people.items.len &lt;= max_roster_size);
+}</code></pre>
+<pre class="term">$ zig test s_style.zig
+All 1 tests passed.
+$ zig fmt --check s_style.zig &amp;&amp; echo clean
+clean</pre>
+<p>The file also shows the conventional order, top to bottom: the file doc comment; imports; public types; the functions that belong to each type inside it; free functions; private constants near where they are used; tests at the bottom. Within a struct: fields first, then <code>const Self = @This();</code> if the struct needs to name itself, then <code>init</code>/<code>deinit</code>, then the rest. None of this is enforced, but every file in the standard library follows it and readers expect it.</p>
+
+<h3 id="ch37-4">37.4 The idioms</h3>
+<p>You have met each of these in an earlier chapter; here they are together, as the checklist a reviewer would apply.</p>
+<ul>
+<li><strong><code>init</code> and <code>deinit</code>.</strong> A type that owns resources has a function that creates it and a method that releases them, in that order and with those names. <code>deinit</code> takes <code>*Self</code> (it may need to mutate) and, for unmanaged containers, the allocator that was used.</li>
+<li><strong>The allocator is the first parameter.</strong> <code>fn init(gpa: std.mem.Allocator, ...)</code>, <code>list.append(gpa, item)</code>. Seeing an allocator in a signature is how you know a function may allocate; not seeing one is how you know it cannot.</li>
+<li><strong><code>.empty</code> and <code>.init</code> as starting values.</strong> <code>var list: std.ArrayList(T) = .empty;</code>, <code>var mutex: std.Io.Mutex = .init;</code>. A declaration with a type and a leading-dot value, and no allocation until the first use.</li>
+<li><strong><code>Self</code>.</strong> Inside a struct, <code>const Self = @This();</code> so methods can say <code>self: *Self</code> and the struct can be renamed without touching every method.</li>
+<li><strong><code>defer</code> right after acquire, <code>errdefer</code> for partial construction.</strong> The line that gets a resource is immediately followed by the line that gives it back (<a href="#ch17">Chapter 17</a>). <code>errdefer</code> undoes the steps already taken when a later step fails.</li>
+<li><strong>Errors are values; <code>try</code> is the default.</strong> Handle an error where you can do something about it; otherwise <code>try</code> and let the caller decide. Never <code>catch unreachable</code> to silence one.</li>
+<li><strong>Slices in, slices out.</strong> Functions take <code>[]const u8</code>, not arrays or pointers to arrays; they return slices of memory the caller owns or was told about.</li>
+<li><strong>Prefer <code>const</code>.</strong> The compiler insists: a <code>var</code> that is never mutated is an error.</li>
+<li><strong>Pure core, I/O at the edges.</strong> Functions that compute take values and return values; the <code>io</code> and the allocator are handed in from <code>main</code> and stay near it. IRON LEDGER's simulation never sees an <code>io</code>.</li>
+</ul>
+
+<h3 id="ch37-5">37.5 Reading compile errors</h3>
+<p>Zig's compiler is strict, and a beginner's first hour is mostly spent being told no. That is the language doing its job: each of these errors is a bug in another language. Every message has the same anatomy: <code>file:line:column: error: what</code>, then the offending line with a caret under the exact spot, then zero or more <code>note:</code> lines that point at the other half of the story. Read the first error only; later ones are often consequences of it. Here are the six you will hit most.</p>
+
+<p><strong>1. Unused constant or variable.</strong></p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    const unused = 5;
+    std.debug.print("hi\n", .{});
+}</code></pre>
+<pre class="term">$ zig run e1.zig
+e1.zig:3:11: error: unused local constant
+    const unused = 5;
+          ^~~~~~</pre>
+<p>Zig refuses dead values because they are almost always a mistake (you meant to use it) or leftovers (delete it). If you genuinely need to discard something, say so: <code>_ = unused;</code>. The same rule applies to function parameters (<code>_ = param;</code>) and to a <code>var</code> that is never written, which gets its own message, <code>local variable is never mutated</code>, with the note <code>consider using 'const'</code>.</p>
+
+<p><strong>2. Shadowing.</strong></p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    const count: u32 = 1;
+    for (0..3) |count| {
+        std.debug.print("{d}\n", .{count});
+    }
+}</code></pre>
+<pre class="term">$ zig run e2.zig
+e2.zig:4:17: error: capture 'count' shadows local constant from outer scope
+    for (0..3) |count| {
+                ^~~~~
+e2.zig:3:11: note: previous declaration here
+    const count: u32 = 1;
+          ^~~~~</pre>
+<p>In Zig a name means one thing within a function. The note tells you where the other <code>count</code> is; rename one of them. This also applies to a local that shadows a top-level declaration (naming a variable <code>std</code>, for instance).</p>
+
+<p><strong>3. Missing switch case.</strong></p>
+<pre><code>const std = @import("std");
+const Role = enum { mekwarrior, tech, medic };
+fn salary(r: Role) i64 {
+    return switch (r) {
+        .mekwarrior =&gt; 1500,
+        .tech =&gt; 800,
+    };
+}
+pub fn main() void {
+    std.debug.print("{d}\n", .{salary(.medic)});
+}</code></pre>
+<pre class="term">$ zig run e3.zig
+e3.zig:4:12: error: switch must handle all possibilities
+    return switch (r) {
+           ^~~~~~
+e3.zig:2:39: note: unhandled enumeration value: 'medic'
+const Role = enum { mekwarrior, tech, medic };
+                                      ^~~~~
+e3.zig:2:14: note: enum 'e3.Role' declared here</pre>
+<p>This is the error you <em>want</em>. Add a variant to an enum and the compiler lists every switch that needs a new arm. The fix is an arm for <code>.medic</code>, or, if you truly mean "everything else", an <code>else</code> arm (which silences future additions, so use it sparingly).</p>
+
+<p><strong>4. Type mismatch between branches.</strong></p>
+<pre><code>const std = @import("std");
+fn describe(funds: i64) i64 {
+    const bonus: i64 = 100;
+    return if (funds &gt; 0) bonus else "broke";
+}
+pub fn main() void {
+    std.debug.print("{d}\n", .{describe(5)});
+}</code></pre>
+<pre class="term">$ zig run e4.zig
+e4.zig:4:38: error: expected type 'i64', found '*const [5:0]u8'
+    return if (funds &gt; 0) bonus else "broke";
+                                     ^~~~~~~</pre>
+<p>An <code>if</code> used as a value must produce one type from both branches ("peer type resolution"), and here the result is also being returned as <code>i64</code>. The message names the type it wanted and the type it found; <code>*const [5:0]u8</code> is what a string literal is. When you see an unexpected type in one of these messages, the fix is usually to make both branches the same kind of thing, or to add <code>@as(T, ...)</code> to a literal so the compiler knows what you meant.</p>
+
+<p><strong>5. try in a function that cannot fail.</strong></p>
+<pre><code>const std = @import("std");
+fn parse(s: []const u8) i32 {
+    const n = try std.fmt.parseInt(i32, s, 10);
+    return n;
+}
+pub fn main() void {
+    std.debug.print("{d}\n", .{parse("12")});
+}</code></pre>
+<pre class="term">$ zig run e5.zig
+e5.zig:3:15: error: expected type 'i32', found 'error{InvalidCharacter,Overflow}'
+    const n = try std.fmt.parseInt(i32, s, 10);
+              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+e5.zig:2:25: note: function cannot return an error
+fn parse(s: []const u8) i32 {
+                        ^~~</pre>
+<p>The message looks like a type mismatch, and it is: <code>try</code> means "return the error to my caller", and this function's return type <code>i32</code> has no room for an error. The note says it plainly. Change the return type to <code>!i32</code>, or handle the error right there with <code>catch</code>.</p>
+
+<p><strong>6. Integer overflow at compile time.</strong></p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    const days: u8 = 200 + 100;
+    std.debug.print("{d}\n", .{days});
+}</code></pre>
+<pre class="term">$ zig run e6.zig
+e6.zig:3:26: error: type 'u8' cannot represent integer value '300'
+    const days: u8 = 200 + 100;
+                     ~~~~^~~~~</pre>
+<p>Both operands are known at compile time, so the sum is computed at compile time, and 300 does not fit in a <code>u8</code>. The compiler refuses rather than wrapping. Widen the type (<code>u16</code>) or reconsider the value. The same computation with runtime values produces the runtime panic in the next section.</p>
+
+<h3 id="ch37-6">37.6 Reading a panic and a stack trace</h3>
+<p>When a safety check fails at runtime, the program panics: it prints a message, a stack trace, and exits. Here is an index one past the end:</p>
+<pre><code>const std = @import("std");
+pub fn main() void {
+    const items = [_]u8{ 1, 2, 3 };
+    var idx: usize = 2;
+    idx += 1;
+    std.debug.print("{d}\n", .{items[idx]});
+}</code></pre>
+<pre class="term">$ zig run e9.zig
+thread 5965804 panic: index out of bounds: index 3, len 3
+/.../e9.zig:6:37: 0x102f7dcd3 in main (e9)
+    std.debug.print("{d}\n", .{items[idx]});
+                                    ^
+/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/start.zig:698:59: 0x102f7dbb3 in callMain (e9)
+    if (fn_info.params.len == 0) return wrapMain(root.main());
+                                                          ^
+???:?:?: 0x18a24c4e3 in start (/usr/lib/dyld)</pre>
+<p>Read it top down. The first line is the message, with the numbers you need (index 3, length 3). Then one frame per function on the call stack, innermost first: the panic happened at <code>e9.zig:6:37</code> in <code>main</code>, which was called by <code>callMain</code> in the standard library's start code, which was called by the dynamic loader. The frames below your own file are scaffolding; the first frame in a file you wrote is where to look, and the caret is under the exact expression. The other messages of this family are <code>integer overflow</code>, <code>attempt to unwrap null</code> (using <code>.?</code> on a null optional), <code>attempt to use null value</code>, <code>division by zero</code>, <code>reached unreachable code</code>, and <code>attempt to cast negative value to unsigned</code>.</p>
+<p>An <em>error return trace</em> looks similar but tells a different story: not where the program stopped, but the path an error travelled before nobody handled it.</p>
+<pre><code>const std = @import("std");
+fn open(name: []const u8) !u32 {
+    if (name.len == 0) return error.EmptyName;
+    return 1;
+}
+fn load(name: []const u8) !u32 {
+    const h = try open(name);
+    return h * 2;
+}
+pub fn main() !void {
+    const v = try load("");
+    std.debug.print("{d}\n", .{v});
+}</code></pre>
+<pre class="term">$ zig run e8.zig
+error: EmptyName
+/.../e8.zig:3:24: 0x10479199b in open (e8)
+    if (name.len == 0) return error.EmptyName;
+                       ^
+/.../e8.zig:7:15: 0x104791a7f in load (e8)
+    const h = try open(name);
+              ^
+/.../e8.zig:11:15: 0x104791bbf in main (e8)
+    const v = try load("");
+              ^</pre>
+<p>The error was created in <code>open</code>, passed through the <code>try</code> in <code>load</code>, passed through the <code>try</code> in <code>main</code>, and <code>main</code> returned it, so the runtime printed it. Each frame is a <code>try</code> or <code>return error.X</code> the error went through. This trace is unique to Zig and costs almost nothing in Debug builds; it is the reason "just <code>try</code> it" is good advice, because when the error finally surfaces you still know where it was born.</p>
+
+<h3 id="ch37-7">37.7 Panicking on purpose: @panic, assert, unreachable</h3>
+<p>Three tools let you say "this cannot happen", and they mean slightly different things.</p>
+<p><strong><code>@panic("message")</code></strong> stops the program with your message and a stack trace. Use it for a situation the program cannot continue from and that is not the caller's fault to handle: a corrupted data file, an impossible state.</p>
+<pre><code>const std = @import("std");
+
+fn withdraw(funds: i64, amount: i64) i64 {
+    if (amount &gt; funds) @panic("withdraw: insufficient funds");
+    return funds - amount;
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{withdraw(100, 30)});
+    std.debug.print("{d}\n", .{withdraw(100, 300)});
+}</code></pre>
+<pre class="term">$ zig run s_panic.zig
+70
+thread 5998933 panic: withdraw: insufficient funds
+/.../s_panic.zig:4:25: 0x102572faf in withdraw (s_panic)
+    if (amount &gt; funds) @panic("withdraw: insufficient funds");
+                        ^
+/.../s_panic.zig:10:40: 0x102571c67 in main (s_panic)</pre>
+<p>(In real code this particular case should be an error, <code>error.InsufficientFunds</code>, because the caller can do something about it. A panic is for when nobody can.)</p>
+<p><strong><code>std.debug.assert(condition)</code></strong> documents a promise the caller must keep. If the condition is false, it panics with <code>reached unreachable code</code> and a trace pointing at the assert. The point is the documentation: an assert at the top of a function is a precondition anyone can read. IRON LEDGER's <code>daysInMonth</code> could assert <code>month &gt;= 1 and month &lt;= 12</code>.</p>
+<p><strong><code>unreachable</code></strong> is an expression that says "control never gets here". You have seen it as the <code>else</code> arm of a switch over values the type system does not exclude:</p>
+<pre><code>const std = @import("std");
+
+fn dayName(d: u8) []const u8 {
+    return switch (d) {
+        0 =&gt; "Mon", 1 =&gt; "Tue", 2 =&gt; "Wed", 3 =&gt; "Thu", 4 =&gt; "Fri", 5 =&gt; "Sat", 6 =&gt; "Sun",
+        else =&gt; unreachable,
+    };
+}
+
+pub fn main() void {
+    std.debug.print("{s}\n", .{dayName(2)});
+    std.debug.print("{s}\n", .{dayName(9)});
+}</code></pre>
+<pre class="term">$ zig run s_unreachable.zig
+Wed
+thread 5998793 panic: reached unreachable code
+/.../s_unreachable.zig:6:17: 0x1009222ef in dayName (s_unreachable)
+        else =&gt; unreachable,
+                ^</pre>
+<p>The rule for choosing: if the bad input can come from the outside world (a user, a file, the network), it is an <em>error</em> and the caller handles it. If it can only come from a bug in your own program, it is an <em>assert</em> or <em>unreachable</em>, and you want the loudest possible failure as close to the bug as possible. Exercise 37.3 practises the distinction.</p>
+
+<h3 id="ch37-8">37.8 Debug, ReleaseSafe, ReleaseFast</h3>
+<p>Every panic in this chapter came from a <em>safety check</em> the compiler inserted: bounds checks on indexing, overflow checks on arithmetic, null checks on <code>.?</code>, and the check that <code>unreachable</code> really is. Whether those checks exist depends on the build mode.</p>
+<table>
+<tr><th>Mode</th><th>Safety checks</th><th>Optimisation</th><th>Use it for</th></tr>
+<tr><td><code>Debug</code> (default)</td><td>on</td><td>none</td><td>development, tests, this whole book</td></tr>
+<tr><td><code>ReleaseSafe</code></td><td>on</td><td>full</td><td>shipping software; fast and still panics instead of corrupting</td></tr>
+<tr><td><code>ReleaseFast</code></td><td>off</td><td>full</td><td>benchmarks, code you have tested to exhaustion</td></tr>
+<tr><td><code>ReleaseSmall</code></td><td>off</td><td>for size</td><td>embedded targets, tiny binaries</td></tr>
+</table>
+<p>The same out-of-bounds program under each mode:</p>
+<pre class="term">$ zig run e9.zig
+thread 5965804 panic: index out of bounds: index 3, len 3
+...
+$ zig run -O ReleaseSafe e9.zig
+thread 5969181 panic: index out of bounds: index 3, len 3
+...
+$ zig run -O ReleaseFast e9.zig
+0</pre>
+<p>ReleaseFast printed <code>0</code>: it read whatever byte happened to follow the array. No message, no trace, no guarantee it will do the same tomorrow. That is undefined behaviour, and it is why the default for anything you ship should be <code>ReleaseSafe</code>. Likewise <code>unreachable</code> in ReleaseFast is a promise to the optimiser, which will happily delete the branch and any code it can prove leads there.</p>
+<p>To build a standalone executable rather than run one: <code>zig build-exe -O ReleaseFast e7.zig</code> writes <code>e7</code> next to the source. In a <code>build.zig</code> project the same choice is <code>zig build -Doptimize=ReleaseSafe</code> (<a href="#ch31">Chapter 31</a>). You can also change safety for one block with <code>@setRuntimeSafety(false)</code>, which is the right granularity for the rare inner loop that needs it.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The whole repository is <code>zig fmt</code> clean, and its file layout is 37.3 at scale: <code>src/domain/types.zig</code> begins with a <code>//!</code> comment, then <code>pub const CBills = i64;</code>, then typed IDs, then enums with their methods, then tests. The naming table is visible in one line from <code>src/domain/person.zig</code>: <code>types.applyBp(self.role.baseSalary(), self.experience().salaryMultBp())</code>, three camelCase methods on TitleCase types returning a snake_case-typed <code>Bp</code>. The game's <code>Date.daysInMonth</code> uses <code>else =&gt; unreachable</code> exactly as in 37.7, and its <code>commands.zig</code> has an <code>Error</code> set of a dozen names (<code>UnknownPerson</code>, <code>NotACompany</code>, <code>CompanyDeployed</code>) for everything a player could ask for and be refused. One project story from the original guide is worth keeping: a column binding was once lost when the formatter reflowed a long argument list and an edit missed the new shape. The round-trip test caught it. Formatting is not cosmetic; a diff you can read is a bug you can see.</div>
+
+<h3 id="ch37-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 37.1 · Fix six errors <span class="level">warm-up</span></h4>
+  <p>The starter contains all six errors from 37.5. Run it, read the first error, fix it, run again, until it prints the five expected lines. Name the file: <code>exercises/37-style/ex1_fix_errors.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 37, exercise 1: fix six compile errors.
+//! Run with:  zig run ex1_fix_errors.zig
+//! Goal: the starter has six errors (unused constant, shadowing, missing
+//! switch case, type mismatch, try in a non-error function, comptime
+//! overflow). Fix them one at a time, re-running after each. Expected
+//! output:
+//!   mekwarrior earns 1500
+//!   tech earns 800
+//!   medic earns 400
+//!   parsed 42
+//!   days in the year: 365
+
+const std = @import("std");
+
+const Role = enum { mekwarrior, tech, medic };
+
+fn salary(r: Role) i64 {
+    return switch (r) {
+        .mekwarrior =&gt; 1500,
+        .tech =&gt; 800,
+        .medic =&gt; 400, // was missing: "switch must handle all possibilities"
+    };
+}
+
+// was `fn parse(s: []const u8) i32`: try needs an error-union return type
+fn parse(s: []const u8) !i32 {
+    return try std.fmt.parseInt(i32, s, 10);
+}
+
+fn label(funds: i64) []const u8 {
+    // was `if (funds &gt; 0) "solvent" else 0`: both branches must agree
+    return if (funds &gt; 0) "solvent" else "broke";
+}
+
+pub fn main() !void {
+    // was `const unused = 5;` with nothing reading it
+    const roles = [_]Role{ .mekwarrior, .tech, .medic };
+    for (roles) |r| {
+        std.debug.print("{s} earns {d}\n", .{ @tagName(r), salary(r) });
+    }
+    // was `const n = ...; for (...) |n|`: the capture shadowed the constant
+    const n = try parse("42");
+    std.debug.print("parsed {d}\n", .{n});
+    _ = label(n);
+    // was `const days: u8 = 365;`: u8 cannot represent 365
+    const days: u16 = 365;
+    std.debug.print("days in the year: {d}\n", .{days});
+}</code></pre>
+  <p>Each comment marks what was there before. The order in which the compiler reports them can vary with what it analyses first, so always fix the top one and re-run rather than trying to fix all six from one output.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 37.2 · Rename to the conventions <span class="level">practice</span></h4>
+  <p>The starter is correct but named like C and Java: <code>c_bills_t</code>, <code>PERSON</code>, <code>GetBaseSalary</code>, <code>HiredDay</code>. Rename everything to Zig convention, add a <code>///</code> comment to each public declaration, and run <code>zig fmt</code>. The tests check behaviour only, so if they still pass you have not broken anything. Name the file: <code>exercises/37-style/ex2_naming.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 37, exercise 2: rename to the conventions.
+//! Run with:  zig test ex2_naming.zig
+//! Goal: the starter uses C-style and Java-style names. Rename every
+//! identifier to Zig convention (TitleCase types, camelCase functions,
+//! snake_case values) and add a doc comment to each public declaration.
+//! The tests only check behaviour, so the compiler is your reviewer.
+
+const std = @import("std");
+
+/// Money in C-bills. Integer, always.
+pub const CBills = i64;
+
+/// A person's job in the company.
+pub const Role = enum {
+    mekwarrior,
+    tech,
+
+    /// Monthly pay before any modifiers.
+    pub fn baseSalary(self: Role) CBills {
+        return switch (self) {
+            .mekwarrior =&gt; 1_500,
+            .tech =&gt; 800,
+        };
+    }
+};
+
+/// One hired person.
+pub const Person = struct {
+    name: []const u8,
+    role: Role,
+    hired_day: u32,
+
+    /// True once the person has served at least `min_days`.
+    pub fn isVeteran(self: Person, today: u32, min_days: u32) bool {
+        return today &gt;= self.hired_day and today - self.hired_day &gt;= min_days;
+    }
+};
+
+/// Total monthly payroll for a roster.
+pub fn monthlyPayroll(people: []const Person) CBills {
+    var total: CBills = 0;
+    for (people) |p| total += p.role.baseSalary();
+    return total;
+}
+
+test "payroll adds the roster" {
+    const roster = [_]Person{
+        .{ .name = "Grayson", .role = .mekwarrior, .hired_day = 0 },
+        .{ .name = "Clay", .role = .tech, .hired_day = 3 },
+    };
+    try std.testing.expectEqual(@as(CBills, 2_300), monthlyPayroll(&amp;roster));
+}
+
+test "veteran after enough days" {
+    const p: Person = .{ .name = "Lori", .role = .mekwarrior, .hired_day = 10 };
+    try std.testing.expect(!p.isVeteran(40, 90));
+    try std.testing.expect(p.isVeteran(100, 90));
+}</code></pre>
+  <p>Types became <code>CBills</code>, <code>Role</code>, <code>Person</code>; functions <code>baseSalary</code>, <code>isVeteran</code>, <code>monthlyPayroll</code>; fields <code>hired_day</code>. Nothing else changed, which is the point: convention is free once you know it.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 37.3 · Assert, unreachable, or error? <span class="level">practice</span></h4>
+  <p>Implement four small functions, choosing for each impossible case between <code>std.debug.assert</code>, <code>unreachable</code>, an error, or nothing at all because the type already excludes it: <code>daysInMonth(Month)</code>, <code>discount(amount, bp)</code> with <code>bp</code> promised to be 0 to 10000, <code>parseMonth(text)</code> from user input, and <code>digitValue(ch)</code> whose callers have already checked <code>isDigit</code>. Name the file: <code>exercises/37-style/ex3_assert.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 37, exercise 3: assert, unreachable, or error?
+//! Run with:  zig test ex3_assert.zig
+//! Goal: implement the three functions, choosing the right tool for each
+//! impossible case: `std.debug.assert` for a caller-side contract,
+//! `unreachable` for a case the type system already excludes, and an
+//! error for input that comes from the outside world.
+
+const std = @import("std");
+
+const Month = enum(u8) { jan = 1, feb, mar, apr, may, jun, jul, aug, sep, oct, nov, dec };
+
+/// Days in a month of a non-leap year. `month` is an enum, so every case
+/// is covered: no `else` and no `unreachable` needed at all.
+pub fn daysInMonth(month: Month) u8 {
+    return switch (month) {
+        .jan, .mar, .may, .jul, .aug, .oct, .dec =&gt; 31,
+        .apr, .jun, .sep, .nov =&gt; 30,
+        .feb =&gt; 28,
+    };
+}
+
+/// The caller promises `bp` is at most 100 percent. Breaking that promise
+/// is a bug in the caller, so we assert rather than return an error.
+pub fn discount(amount: i64, bp: i64) i64 {
+    std.debug.assert(bp &gt;= 0 and bp &lt;= 10_000);
+    return amount - @divTrunc(amount * bp, 10_000);
+}
+
+/// Text typed by a user is not a bug when it is wrong; it is an error.
+pub fn parseMonth(text: []const u8) error{UnknownMonth}!Month {
+    return std.meta.stringToEnum(Month, text) orelse error.UnknownMonth;
+}
+
+/// A digit character 0-9 to its value. Callers filter with isDigit
+/// first, so anything else is unreachable.
+pub fn digitValue(ch: u8) u8 {
+    return switch (ch) {
+        '0'...'9' =&gt; ch - '0',
+        else =&gt; unreachable,
+    };
+}
+
+test "days in month" {
+    try std.testing.expectEqual(@as(u8, 31), daysInMonth(.jan));
+    try std.testing.expectEqual(@as(u8, 28), daysInMonth(.feb));
+}
+
+test "discount within contract" {
+    try std.testing.expectEqual(@as(i64, 900), discount(1000, 1_000));
+    try std.testing.expectEqual(@as(i64, 0), discount(1000, 10_000));
+}
+
+test "parseMonth reports bad input as an error" {
+    try std.testing.expectEqual(Month.sep, try parseMonth("sep"));
+    try std.testing.expectError(error.UnknownMonth, parseMonth("Sept"));
+}
+
+test "digitValue" {
+    try std.testing.expectEqual(@as(u8, 7), digitValue('7'));
+}</code></pre>
+  <p><code>daysInMonth</code> takes an enum, so every case is an arm and no <code>else</code> exists. <code>discount</code> asserts its precondition. <code>parseMonth</code> returns an error because text from a user is not a bug. <code>digitValue</code> uses <code>unreachable</code> because its contract says callers filter first. Four impossible cases, four different answers.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 37.4 · Read the panic, fix the bug <span class="level">challenge</span></h4>
+  <p>The starter runs and panics. Read the trace, find the line, fix the logic (do not remove the check or switch to ReleaseFast). After the first fix it panics again with a different message. Name the file: <code>exercises/37-style/ex4_panic.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 37, exercise 4: read the panic, fix the bug.
+//! Run with:  zig run ex4_panic.zig
+//! Goal: the starter panics with "index out of bounds" and, after you fix
+//! that, with "integer overflow". Use the stack trace to find each line,
+//! then fix the logic (not the safety check). Expected output:
+//!   Grayson: 1500
+//!   Lori: 1500
+//!   Clay: 800
+//!   total 3800
+//!   average 1266
+
+const std = @import("std");
+
+const names = [_][]const u8{ "Grayson", "Lori", "Clay" };
+const pay = [_]u16{ 1500, 1500, 800 };
+
+pub fn main() void {
+    // was `i &lt;= names.len`: one past the end
+    var i: usize = 0;
+    while (i &lt; names.len) : (i += 1) {
+        std.debug.print("{s}: {d}\n", .{ names[i], pay[i] });
+    }
+    // was `var total: u16 = 0`: 1500 + 1500 + 800 overflows u16
+    var total: u32 = 0;
+    for (pay) |p| total += p;
+    std.debug.print("total {d}\n", .{total});
+    std.debug.print("average {d}\n", .{total / pay.len});
+}</code></pre>
+  <p>The first panic is <code>index out of bounds: index 3, len 3</code> from a <code>&lt;=</code> that should be <code>&lt;</code>. The second is <code>integer overflow</code> from summing three <code>u16</code>s into a <code>u16</code>; the fix is a wider accumulator, not <code>+%</code>, because wrapping would silently give the wrong total.</p></details>
+</div>
+
+<h3 id="ch37-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does the trailing comma do in <code>zig fmt</code>? <details class="answer"><summary>Answer</summary>A trailing comma in a list makes the formatter lay it out one element per line; without it the list is collapsed onto one line if it fits. It is the one formatting choice left to the author.</details></li>
+  <li>Which of these is misnamed: <code>fn ParseInt</code>, <code>const MaxSize = 5</code>, <code>const person_id: PersonId</code>, <code>error.notFound</code>? <details class="answer"><summary>Answer</summary>All but the third. Functions are camelCase (<code>parseInt</code>), values are snake_case (<code>max_size</code>), error names are TitleCase (<code>error.NotFound</code>).</details></li>
+  <li>The compiler says <code>expected type 'i32', found 'error{InvalidCharacter,Overflow}'</code> on a line with <code>try</code>. What is wrong? <details class="answer"><summary>Answer</summary>The enclosing function's return type is <code>i32</code>, not an error union, so <code>try</code> has nowhere to send the error. Change it to <code>!i32</code> or use <code>catch</code>.</details></li>
+  <li>In a stack trace, which frame do you look at first? <details class="answer"><summary>Answer</summary>The topmost frame that is in a file you wrote. Frames above it in the standard library (such as <code>callMain</code> in <code>start.zig</code>) are scaffolding.</details></li>
+  <li>What is the difference between a panic's stack trace and an error return trace? <details class="answer"><summary>Answer</summary>A stack trace shows the call chain at the moment the program stopped. An error return trace shows each <code>try</code> or <code>return error.X</code> the error passed through on its way out, from where it was created to where it went unhandled.</details></li>
+  <li>A user types a month name that does not exist. assert, unreachable, or error? <details class="answer"><summary>Answer</summary>An error. Bad input from outside the program is a normal condition to handle. assert and unreachable are for conditions that only a bug in your own code could produce.</details></li>
+  <li>What does <code>-O ReleaseFast</code> do to an out-of-bounds index, and which mode should you ship? <details class="answer"><summary>Answer</summary>It removes the check, so the program reads whatever memory is there: undefined behaviour with no message. Ship <code>ReleaseSafe</code>, which is fully optimised and keeps the checks.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>zig fmt</code> is the only style; <code>--check</code> for CI; the trailing comma controls one-per-line layout.</li>
+<li>Names: TitleCase types and errors, camelCase functions, snake_case everything else, snake_case files. <code>//!</code> documents a file, <code>///</code> a declaration.</li>
+<li>Idioms: <code>init</code>/<code>deinit</code>, allocator first, <code>.empty</code>/<code>.init</code>, <code>Self</code>, <code>defer</code> after acquire, <code>errdefer</code> for partial construction, <code>try</code> by default, pure core with I/O at the edges.</li>
+<li>Compile errors have a location, a caret and notes; fix the first one. The six common ones: unused value, shadowing, missing switch case, branch type mismatch, <code>try</code> without an error-union return type, comptime overflow.</li>
+<li>A panic prints a message and a stack trace; look at the first frame in your own file. An error return trace shows the path an unhandled error travelled.</li>
+<li><code>@panic</code> for unrecoverable states, <code>assert</code> for caller contracts, <code>unreachable</code> for cases the code has already excluded, errors for anything from outside.</li>
+<li>Debug and ReleaseSafe keep safety checks; ReleaseFast removes them and turns bugs into undefined behaviour. Ship ReleaseSafe; benchmark with ReleaseFast; <code>zig build-exe -O ReleaseFast file.zig</code> makes a binary.</li>
+</ul></div>
+</section>

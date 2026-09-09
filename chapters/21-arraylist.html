@@ -1,0 +1,639 @@
+<section id="ch21">
+<h2>21. Growable lists: ArrayList</h2>
+<p class="goals"><strong>In this chapter</strong> you will meet <code>std.ArrayList</code>, the standard library's growable array, and learn its 0.16 shape: an unmanaged struct that starts as <code>.empty</code> and takes an allocator on every call that might grow it. You will append, insert, remove, iterate by pointer, build strings with it, hand its buffer to a caller with <code>toOwnedSlice</code>, and learn the one trap that bites everyone: a pointer into the list that goes stale when the list regrows.</p>
+
+<h3 id="ch21-1">21.1 Why arrays are not enough</h3>
+<p>An array in Zig has a length that is part of its type. <code>[4]u32</code> is four integers, always, forever. A slice is a view of memory somebody else owns. Neither can grow. But most real programs collect things whose count they do not know in advance: lines of a file, units in a hangar, people who answered a recruiting ad. For that you need a buffer on the heap that can be replaced with a bigger one when it fills up. That is exactly what <code>std.ArrayList(T)</code> is: a slice called <code>items</code>, a <code>capacity</code> that says how big the underlying buffer really is, and a handful of methods that keep the two in step.</p>
+<p>If you come from Python this is a <code>list</code>; from JavaScript, an array; from C++, a <code>std::vector</code>. The difference is that Zig's version will not allocate behind your back. Every method that might need more room takes the allocator as its first argument, so the call site shows you where memory can be requested and where it can fail.</p>
+
+<h3 id="ch21-2">21.2 The smallest list</h3>
+<p class="file">a_basic.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(gpa);
+
+    try list.append(gpa, 10);
+    try list.append(gpa, 20);
+    try list.append(gpa, 30);
+
+    std.debug.print("items: {any}\n", .{list.items});
+    std.debug.print("len: {d}, capacity: {d}\n", .{ list.items.len, list.capacity });
+    std.debug.print("second: {d}\n", .{list.items[1]});
+}</code></pre>
+<pre class="term">items: { 10, 20, 30 }
+len: 3, capacity: 33
+second: 20</pre>
+<p>Four things to notice. First, the type is <code>std.ArrayList(u32)</code>: a function that takes a type and returns a struct type, which is how all generic containers work in Zig (you will write your own in <a href="#ch26">Chapter 26</a>). Second, the starting value is <code>.empty</code>, a constant on the type meaning "no buffer, length zero, capacity zero". No allocator is stored in the list. Third, <code>append</code> takes <code>gpa</code> because it might need to grow, and it returns an error union because growing can fail, hence <code>try</code>. Fourth, <code>deinit</code> takes the allocator too, since it has to know whom to give the buffer back to, and we put it in a <code>defer</code> right after the declaration so it cannot be forgotten.</p>
+<p><code>list.items</code> is an ordinary slice, <code>[]u32</code>. Anything you learned about slices in <a href="#ch10">Chapter 10</a> works on it: index it, take its <code>.len</code>, loop over it, pass it to a function that wants a slice. The capacity (33 here, on this platform and this element size) is larger than the length because the list grows in jumps so that appending is cheap on average. The exact number is an implementation detail and you should never rely on it.</p>
+
+<div class="note">In Zig 0.16 there is only one <code>ArrayList</code> and it is unmanaged. Older tutorials show <code>std.ArrayList(u32).init(allocator)</code> and calls like <code>list.append(5)</code> with no allocator. Those forms no longer exist. The name <code>std.ArrayListUnmanaged</code> still works as an alias and IRON LEDGER uses it throughout, but it means exactly the same type as <code>std.ArrayList</code>.</div>
+
+<h3 id="ch21-3">21.3 Watching it grow</h3>
+<p>Let's print the capacity every time it changes while we append two hundred bytes.</p>
+<p class="file">b_growth.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+
+    var last_cap: usize = 0;
+    for (0..200) |i| {
+        try list.append(gpa, @intCast(i));
+        if (list.capacity != last_cap) {
+            std.debug.print("len {d: &gt;3} -&gt; capacity {d}\n", .{ list.items.len, list.capacity });
+            last_cap = list.capacity;
+        }
+    }
+}</code></pre>
+<pre class="term">len   1 -&gt; capacity 129
+len 130 -&gt; capacity 323</pre>
+<p>Two hundred appends, two allocations. When the buffer is full, the list asks the allocator for a bigger one (here about two and a half times the size), copies the old contents across, frees the old buffer and carries on. Most appends therefore touch no allocator at all; they just write one element and bump <code>items.len</code>. This is why <code>append</code> is described as "amortised constant time": expensive once in a while, free the rest of the time.</p>
+<p>If you already know how many elements you will add, say so with <code>ensureTotalCapacity</code> and then use <code>appendAssumeCapacity</code>, which cannot fail and takes no allocator. You will see that in 21.8.</p>
+
+<h3 id="ch21-4">21.4 Adding and removing</h3>
+<p>Here is the full toolkit for changing a list, on a list of strings so the effect is easy to see. The <code>show</code> helper exists because <code>{s}</code> prints one string, not a slice of strings.</p>
+<p class="file">c_remove.zig</p>
+<pre><code>const std = @import("std");
+
+fn show(label: []const u8, items: []const []const u8) void {
+    std.debug.print("{s: &lt;22}", .{label});
+    for (items) |s| std.debug.print("{s} ", .{s});
+    std.debug.print("\n", .{});
+}
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(gpa);
+    try list.appendSlice(gpa, &amp;.{ "alpha", "bravo", "charlie", "delta", "echo" });
+    show("start:", list.items);
+
+    try list.insert(gpa, 1, "NEW");
+    show("insert(1, NEW):", list.items);
+
+    const gone = list.orderedRemove(1);
+    show("orderedRemove(1):", list.items);
+    std.debug.print("  (removed {s})\n", .{gone});
+
+    const swapped = list.swapRemove(0);
+    show("swapRemove(0):", list.items);
+    std.debug.print("  (removed {s})\n", .{swapped});
+
+    const top = list.pop();
+    show("pop():", list.items);
+    std.debug.print("  (popped {?s})\n", .{top});
+
+    list.clearRetainingCapacity();
+    std.debug.print("cleared: len {d}, capacity {d}\n", .{ list.items.len, list.capacity });
+    std.debug.print("pop on empty: {?s}\n", .{list.pop()});
+}</code></pre>
+<pre class="term">start:                alpha bravo charlie delta echo 
+insert(1, NEW):       alpha NEW bravo charlie delta echo 
+orderedRemove(1):     alpha bravo charlie delta echo 
+  (removed NEW)
+swapRemove(0):        echo bravo charlie delta 
+  (removed alpha)
+pop():                echo bravo charlie 
+  (popped delta)
+cleared: len 0, capacity 15
+pop on empty: null</pre>
+<p>Read the transcript against the calls:</p>
+<ul>
+<li><code>appendSlice(gpa, slice)</code> appends many at once. The argument <code>&amp;.{ ... }</code> is a pointer to an anonymous array, which coerces to a slice.</li>
+<li><code>insert(gpa, i, item)</code> shifts everything from <code>i</code> onward one place right. It takes the allocator because it may grow.</li>
+<li><code>orderedRemove(i)</code> removes element <code>i</code> and shifts the rest left, preserving order. It returns the removed element. No allocator: removing never allocates.</li>
+<li><code>swapRemove(i)</code> removes element <code>i</code> by moving the <em>last</em> element into its slot. It is constant time, but the order changes: <code>echo</code> jumped to the front.</li>
+<li><code>pop()</code> removes and returns the last element as an optional. On an empty list it returns <code>null</code> instead of crashing, which is why the last line prints <code>null</code>.</li>
+<li><code>clearRetainingCapacity()</code> sets the length to zero but keeps the buffer, so refilling the list will not allocate again. Its sibling <code>clearAndFree(gpa)</code> gives the buffer back too.</li>
+</ul>
+<p>Choose <code>swapRemove</code> when you do not care about order and the list is long; choose <code>orderedRemove</code> when order matters. Removing from the front of a long list with <code>orderedRemove</code> in a loop is quadratic, so if you find yourself doing that, ask whether you want a different data structure.</p>
+
+<h3 id="ch21-5">21.5 Iterating: by value or by pointer</h3>
+<p>A <code>for</code> loop over <code>list.items</code> gives you each element by value, which means a copy. If the element is a struct and you want to change it in place, you need a pointer, and the syntax is the same one you met for arrays and slices in <a href="#ch18">Chapter 18</a>: put a <code>*</code> in front of the capture name.</p>
+<p class="file">d_pointers.zig</p>
+<pre><code>const std = @import("std");
+
+const Merc = struct { name: []const u8, wounds: u8 };
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var roster: std.ArrayList(Merc) = .empty;
+    defer roster.deinit(gpa);
+    try roster.append(gpa, .{ .name = "Kell", .wounds = 0 });
+    try roster.append(gpa, .{ .name = "Natasha", .wounds = 1 });
+
+    // By value: `m` is a copy. Changing it changes nothing in the list.
+    for (roster.items) |m| {
+        var copy = m;
+        copy.wounds += 10;
+    }
+    std.debug.print("after by-value loop: {d} {d}\n", .{ roster.items[0].wounds, roster.items[1].wounds });
+
+    // By pointer: `m` points into the list's buffer.
+    for (roster.items) |*m| m.wounds += 1;
+    std.debug.print("after by-pointer loop: {d} {d}\n", .{ roster.items[0].wounds, roster.items[1].wounds });
+
+    // Or index straight in.
+    roster.items[0].name = "Morgan Kell";
+    std.debug.print("{s}\n", .{roster.items[0].name});
+}</code></pre>
+<pre class="term">after by-value loop: 0 1
+after by-pointer loop: 1 2
+Morgan Kell</pre>
+<p>The first loop copies each <code>Merc</code> into <code>m</code>, then into <code>copy</code>, and adds ten to the copy. The list is untouched. (The extra <code>copy</code> variable is there because the compiler rejects assigning to a by-value capture; it knows that would be a silent no-op.) The second loop captures <code>*m</code>, a <code>*Merc</code> pointing into the list's buffer, and <code>m.wounds += 1</code> writes through it. Zig auto-dereferences field access on pointers, so you write <code>m.wounds</code>, not <code>m.*.wounds</code>.</p>
+
+<h3 id="ch21-6">21.6 The stale-pointer trap</h3>
+<p>Now the trap. Because the list's buffer can move when it grows, a pointer into <code>items</code> is only valid until the next call that might grow the list.</p>
+<p class="file">e_stale.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(gpa);
+    try list.append(gpa, 10);
+
+    const first = &amp;list.items[0]; // a pointer into the buffer
+    std.debug.print("capacity {d}, first lives at {*}\n", .{ list.capacity, first });
+
+    for (0..100) |i| try list.append(gpa, @intCast(i)); // forces a regrow
+    std.debug.print("capacity {d}, first now at {*}\n", .{ list.capacity, &amp;list.items[0] });
+
+    std.debug.print("through the old pointer: {d}\n", .{first.*}); // BUG
+}</code></pre>
+<pre class="term">capacity 33, first lives at u32@1074a0000
+capacity 158, first now at u32@1074e0000
+Segmentation fault at address 0x1074a0000
+e_stale.zig:18:20: 0x102a19bd0 in main (e_stale)
+    std.debug.print("through the old pointer: {d}\n", .{first.*}); // BUG</pre>
+<p>The list started with room for 33 elements. The 101 appends forced a regrow, the buffer moved to a new address, and the old one was returned to the allocator. <code>first</code> still points at the old address. In Debug mode the <code>DebugAllocator</code> unmaps freed pages, so reading through <code>first</code> crashes immediately with a stack trace. That is the good outcome. In ReleaseFast, the same read might silently return stale data, or whatever the allocator has since put there.</p>
+<div class="warn"><strong>Rule.</strong> Never keep a pointer (or a slice) into <code>list.items</code> across a call to <code>append</code>, <code>appendSlice</code>, <code>insert</code>, <code>ensureTotalCapacity</code>, or anything else that takes the allocator. Keep the <em>index</em> instead and re-derive the pointer when you need it: <code>&amp;list.items[i]</code>. The same rule applies to every growable container in this Part, including the hash maps of <a href="#ch22">Chapter 22</a>.</div>
+<p>This is also why <code>for (list.items) |*m|</code> is safe: the loop does not append. If you ever need to append while iterating, iterate by index and expect the loop bound to change.</p>
+
+<h3 id="ch21-7">21.7 A string builder</h3>
+<p>A string is bytes, so <code>std.ArrayList(u8)</code> is a growable string. It even has a <code>print</code> method that formats straight into the buffer, so you do not need <code>allocPrint</code> and a temporary.</p>
+<p class="file">f_builder.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var sb: std.ArrayList(u8) = .empty;
+    defer sb.deinit(gpa);
+
+    try sb.appendSlice(gpa, "Lance: ");
+    const pilots = [_][]const u8{ "Kell", "Natasha", "Grayson" };
+    for (pilots, 0..) |p, i| {
+        if (i &gt; 0) try sb.appendSlice(gpa, ", ");
+        try sb.appendSlice(gpa, p);
+    }
+    try sb.append(gpa, '\n');
+    try sb.print(gpa, "{d} pilots, {d} bytes so far", .{ pilots.len, sb.items.len });
+
+    std.debug.print("{s}\n", .{sb.items});
+
+    const owned = try sb.toOwnedSlice(gpa); // sb is now empty; we own `owned`
+    defer gpa.free(owned);
+    std.debug.print("owned len {d}, list len {d}\n", .{ owned.len, sb.items.len });
+}</code></pre>
+<pre class="term">Lance: Kell, Natasha, Grayson
+3 pilots, 30 bytes so far
+owned len 55, list len 0</pre>
+<p><code>toOwnedSlice(gpa)</code> is the handshake at the end. It shrinks the buffer to exactly the length used, returns it as a plain <code>[]u8</code>, and resets the list to <code>.empty</code>. The caller now owns that slice and must <code>free</code> it with the same allocator; the list owns nothing, so its <code>deinit</code> in the <code>defer</code> is harmless. This is how functions return "a list of things" in Zig: build with an <code>ArrayList</code>, return a slice.</p>
+<p>Sometimes you want a real <code>*std.Io.Writer</code> (the thing <code>print</code> and <code>writeAll</code> live on, which you met when printing to stdout in <a href="#ch02">Chapter 2</a>) that grows a heap buffer. That is <code>std.Io.Writer.Allocating</code>. It is the right choice when you want to pass "somewhere to write" to a function that should not know or care whether it is writing to a file, a fixed buffer or memory.</p>
+<p class="file">g_allocating.zig</p>
+<pre><code>const std = @import("std");
+
+fn describe(w: *std.Io.Writer, name: []const u8, tons: u32) !void {
+    try w.print("{s} ({d} tons)", .{ name, tons });
+}
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try describe(&amp;aw.writer, "Atlas", 100);
+    try aw.writer.writeAll(" / ");
+    try describe(&amp;aw.writer, "Locust", 20);
+
+    std.debug.print("{s}\n", .{aw.written()});
+
+    const text = try aw.toOwnedSlice();
+    defer gpa.free(text);
+    std.debug.print("{d} bytes\n", .{text.len});
+}</code></pre>
+<pre class="term">Atlas (100 tons) / Locust (20 tons)
+35 bytes</pre>
+<p><code>aw.writer</code> is the generic writer, <code>aw.written()</code> is the bytes so far, and <code>aw.toOwnedSlice()</code> hands you the buffer exactly like the list did. Under the hood it is an <code>ArrayList(u8)</code> with a writer interface on top.</p>
+
+<h3 id="ch21-8">21.8 A list of structs, returned as a slice</h3>
+<p>The pattern IRON LEDGER uses in every query: build a list of small structs inside a function, hand the buffer to the caller.</p>
+<p class="file">h_structs.zig</p>
+<pre><code>const std = @import("std");
+
+const Unit = struct { name: []const u8, tons: u32, bv: u32 };
+
+fn heaviest(units: []const Unit) ?Unit {
+    if (units.len == 0) return null;
+    var best = units[0];
+    for (units[1..]) |u| if (u.tons &gt; best.tons) {
+        best = u;
+    };
+    return best;
+}
+
+fn buildLance(gpa: std.mem.Allocator) ![]Unit {
+    var list: std.ArrayList(Unit) = .empty;
+    errdefer list.deinit(gpa);
+    try list.ensureTotalCapacity(gpa, 4); // one allocation, not four
+    list.appendAssumeCapacity(.{ .name = "Atlas", .tons = 100, .bv = 1897 });
+    list.appendAssumeCapacity(.{ .name = "Marauder", .tons = 75, .bv = 1363 });
+    list.appendAssumeCapacity(.{ .name = "Locust", .tons = 20, .bv = 432 });
+    return list.toOwnedSlice(gpa);
+}
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    const lance = try buildLance(gpa);
+    defer gpa.free(lance);
+
+    var total: u32 = 0;
+    for (lance) |u| total += u.tons;
+    std.debug.print("{d} units, {d} tons\n", .{ lance.len, total });
+    if (heaviest(lance)) |h| std.debug.print("heaviest: {s}\n", .{h.name});
+}</code></pre>
+<pre class="term">3 units, 195 tons
+heaviest: Atlas</pre>
+<p>Three details worth copying. <code>errdefer list.deinit(gpa)</code> rather than <code>defer</code>: if <code>toOwnedSlice</code> succeeds, the list is empty and the caller owns the buffer, so we only want to clean up on the error path. <code>ensureTotalCapacity</code> followed by <code>appendAssumeCapacity</code> turns three possible allocations into one. And <code>heaviest</code> takes a plain <code>[]const Unit</code>, not the list: functions that only read should accept slices, so they work on arrays, lists and anything else.</p>
+
+<h3 id="ch21-9">21.9 Method reference</h3>
+<table>
+<tr><th>Call</th><th>Allocator?</th><th>What it does</th></tr>
+<tr><td><code>.empty</code></td><td>no</td><td>Starting value: no buffer.</td></tr>
+<tr><td><code>append(gpa, x)</code></td><td>yes</td><td>Add one to the end.</td></tr>
+<tr><td><code>appendSlice(gpa, xs)</code></td><td>yes</td><td>Add many to the end.</td></tr>
+<tr><td><code>appendNTimes(gpa, x, n)</code></td><td>yes</td><td>Add <code>x</code> repeated <code>n</code> times.</td></tr>
+<tr><td><code>insert(gpa, i, x)</code></td><td>yes</td><td>Insert at index, shifting right.</td></tr>
+<tr><td><code>print(gpa, fmt, args)</code></td><td>yes</td><td>Format into the list (<code>u8</code> only).</td></tr>
+<tr><td><code>ensureTotalCapacity(gpa, n)</code></td><td>yes</td><td>Grow the buffer once, ahead of time.</td></tr>
+<tr><td><code>appendAssumeCapacity(x)</code></td><td>no</td><td>Append into reserved room; cannot fail.</td></tr>
+<tr><td><code>pop()</code></td><td>no</td><td>Remove and return last as <code>?T</code>.</td></tr>
+<tr><td><code>getLast()</code></td><td>no</td><td>Last element; panics if empty.</td></tr>
+<tr><td><code>orderedRemove(i)</code></td><td>no</td><td>Remove keeping order; returns it.</td></tr>
+<tr><td><code>swapRemove(i)</code></td><td>no</td><td>Remove by swapping in the last; returns it.</td></tr>
+<tr><td><code>clearRetainingCapacity()</code></td><td>no</td><td>Length to zero, keep buffer.</td></tr>
+<tr><td><code>toOwnedSlice(gpa)</code></td><td>yes</td><td>Hand the buffer to the caller; list becomes empty.</td></tr>
+<tr><td><code>deinit(gpa)</code></td><td>yes</td><td>Free the buffer.</td></tr>
+</table>
+<p>There is one more form worth knowing: <code>std.ArrayList(T).initBuffer(&amp;array)</code> makes a list that lives inside a fixed array you provide and never allocates; use <code>appendBounded</code> on it, which returns <code>error.OutOfMemory</code> when the array is full. This replaced the old <code>std.BoundedArray</code>, which no longer exists in 0.16. <a href="#ch24">Chapter 24</a> shows it.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The pattern of 21.8 is the skeleton of every query in <code>game/src/sim/queries.zig</code>. The People screen builds its rows like this (trimmed):
+<pre><code>pub fn people(alloc: Alloc, gs: *GameState, filter: HallFilter) !People {
+    var rows: std.ArrayListUnmanaged(PersonRow) = .empty;
+    var it = gs.people.iterator();
+    while (it.next()) |e| {
+        const p = e.value_ptr;
+        // ... filter ...
+        try rows.append(alloc, .{ .id = p.id, .text = try std.fmt.allocPrint(alloc, "...", .{ ... }) });
+    }
+    return .{ .header = "id   name ...", .rows = try rows.toOwnedSlice(alloc), .total = total };
+}</code></pre>
+The allocator passed in is a per-frame arena, so nobody ever frees the rows or the strings; the whole arena is reset after the screen is drawn. And <code>money</code>, the c-bill formatter in the same file, is a string builder exactly like 21.7: it prints the digits with <code>bufPrint</code>, walks them appending a comma every third digit into an <code>ArrayListUnmanaged(u8)</code>, and returns <code>out.toOwnedSlice(alloc)</code>.</div>
+
+<h3 id="ch21-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 21.1 · Squares <span class="level">warm-up</span></h4>
+  <p>Write <code>fn squaresUpTo(gpa: std.mem.Allocator, n: u32) ![]u32</code> that returns the squares of <code>0</code> to <code>n-1</code> as a slice the caller owns. Reserve the capacity up front so there is exactly one allocation. Name the file: <code>exercises/21-arraylist/ex1_squares.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 21, exercise 1: build a list, hand it back as a slice.
+//! Run with:  zig test ex1_squares.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Return the squares 0*0, 1*1, ... (n-1)*(n-1) as a slice the caller owns.
+fn squaresUpTo(gpa: std.mem.Allocator, n: u32) ![]u32 {
+    var list: std.ArrayList(u32) = .empty;
+    errdefer list.deinit(gpa);
+    try list.ensureTotalCapacity(gpa, n);
+    for (0..n) |i| {
+        const v: u32 = @intCast(i);
+        list.appendAssumeCapacity(v * v);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+test "five squares" {
+    const s = try squaresUpTo(std.testing.allocator, 5);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualSlices(u32, &amp;.{ 0, 1, 4, 9, 16 }, s);
+}
+
+test "zero squares is an empty slice, not an error" {
+    const s = try squaresUpTo(std.testing.allocator, 0);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqual(@as(usize, 0), s.len);
+}</code></pre>
+  <p><code>errdefer list.deinit(gpa)</code> covers the case where <code>ensureTotalCapacity</code> succeeds and <code>toOwnedSlice</code> fails; on success the list is already empty. For <code>n = 0</code> the result is an empty slice and <code>free</code> on it is fine.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 21.2 · Remove all, two ways <span class="level">practice</span></h4>
+  <p>Write <code>removeAllOrdered</code>, which removes every element equal to a value and keeps order, and <code>removeAllFast</code>, which may reorder. Both return the count removed. Think carefully about what happens to your loop index after each removal. Name the file: <code>exercises/21-arraylist/ex2_remove_all.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 21, exercise 2: remove every matching element, two ways.
+//! Run with:  zig test ex2_remove_all.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Remove every element equal to `value`, keeping the order of the rest.
+/// Returns how many were removed.
+fn removeAllOrdered(list: *std.ArrayList(i32), value: i32) usize {
+    var removed: usize = 0;
+    var i: usize = 0;
+    while (i &lt; list.items.len) {
+        if (list.items[i] == value) {
+            _ = list.orderedRemove(i);
+            removed += 1;
+        } else {
+            i += 1;
+        }
+    }
+    return removed;
+}
+
+/// Same, but order does not matter, so use the cheaper swapRemove.
+/// Walking backwards means a swap never moves an element we still need to look at.
+fn removeAllFast(list: *std.ArrayList(i32), value: i32) usize {
+    var removed: usize = 0;
+    var i = list.items.len;
+    while (i &gt; 0) {
+        i -= 1;
+        if (list.items[i] == value) {
+            _ = list.swapRemove(i);
+            removed += 1;
+        }
+    }
+    return removed;
+}
+
+test "ordered removal keeps order" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(i32) = .empty;
+    defer list.deinit(a);
+    try list.appendSlice(a, &amp;.{ 7, 1, 7, 2, 7, 3, 7 });
+    try std.testing.expectEqual(@as(usize, 4), removeAllOrdered(&amp;list, 7));
+    try std.testing.expectEqualSlices(i32, &amp;.{ 1, 2, 3 }, list.items);
+}
+
+test "fast removal keeps the right elements" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(i32) = .empty;
+    defer list.deinit(a);
+    try list.appendSlice(a, &amp;.{ 7, 1, 7, 2, 7, 3, 7 });
+    try std.testing.expectEqual(@as(usize, 4), removeAllFast(&amp;list, 7));
+    std.mem.sort(i32, list.items, {}, std.sort.asc(i32));
+    try std.testing.expectEqualSlices(i32, &amp;.{ 1, 2, 3 }, list.items);
+}
+
+test "nothing to remove" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(i32) = .empty;
+    defer list.deinit(a);
+    try list.appendSlice(a, &amp;.{ 1, 2 });
+    try std.testing.expectEqual(@as(usize, 0), removeAllFast(&amp;list, 9));
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}</code></pre>
+  <p>In the ordered version, after removing at <code>i</code> the next element has slid into slot <code>i</code>, so do not increment. The fast version walks backwards: <code>swapRemove(i)</code> moves the last element into <code>i</code>, and since everything after <code>i</code> has already been examined, nothing is skipped.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 21.3 · Join <span class="level">practice</span></h4>
+  <p>Write <code>joinWith(gpa, parts, sep)</code> using an <code>ArrayList(u8)</code> as a string builder, then <code>describeLance</code> which produces <code>"2 units: Atlas, Locust"</code> (and <code>"1 unit: Atlas"</code> for one). Use the list's <code>print</code> method for the count. Name the file: <code>exercises/21-arraylist/ex3_join.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 21, exercise 3: a string builder.
+//! Run with:  zig test ex3_join.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Join `parts` with `sep` between them. The caller owns the result.
+fn joinWith(gpa: std.mem.Allocator, parts: []const []const u8, sep: []const u8) ![]u8 {
+    var sb: std.ArrayList(u8) = .empty;
+    errdefer sb.deinit(gpa);
+    for (parts, 0..) |p, i| {
+        if (i &gt; 0) try sb.appendSlice(gpa, sep);
+        try sb.appendSlice(gpa, p);
+    }
+    return sb.toOwnedSlice(gpa);
+}
+
+/// "3 units: Atlas, Locust, Marauder"
+fn describeLance(gpa: std.mem.Allocator, names: []const []const u8) ![]u8 {
+    var sb: std.ArrayList(u8) = .empty;
+    errdefer sb.deinit(gpa);
+    try sb.print(gpa, "{d} unit{s}: ", .{ names.len, if (names.len == 1) "" else "s" });
+    const joined = try joinWith(gpa, names, ", ");
+    defer gpa.free(joined);
+    try sb.appendSlice(gpa, joined);
+    return sb.toOwnedSlice(gpa);
+}
+
+test "join three" {
+    const s = try joinWith(std.testing.allocator, &amp;.{ "a", "b", "c" }, ", ");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("a, b, c", s);
+}
+
+test "join one and none" {
+    const one = try joinWith(std.testing.allocator, &amp;.{"solo"}, "-");
+    defer std.testing.allocator.free(one);
+    try std.testing.expectEqualStrings("solo", one);
+    const none = try joinWith(std.testing.allocator, &amp;.{}, "-");
+    defer std.testing.allocator.free(none);
+    try std.testing.expectEqualStrings("", none);
+}
+
+test "describe" {
+    const s = try describeLance(std.testing.allocator, &amp;.{ "Atlas", "Locust" });
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("2 units: Atlas, Locust", s);
+    const t = try describeLance(std.testing.allocator, &amp;.{"Atlas"});
+    defer std.testing.allocator.free(t);
+    try std.testing.expectEqualStrings("1 unit: Atlas", t);
+}</code></pre>
+  <p>The standard library has <code>std.mem.join</code> that does the first function for you; writing it once by hand is the point. Notice the <code>defer gpa.free(joined)</code> for the temporary: <code>describeLance</code> owns it until it has been copied into the builder.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 21.4 · Roster <span class="level">challenge</span></h4>
+  <p>Build a <code>Roster</code> struct wrapping an <code>ArrayList(Merc)</code> with <code>hire</code>, <code>battle</code> (every merc takes one wound, in place), <code>releaseWorseThan(limit)</code> (ordered removal, returns count) and <code>best()</code> which returns a <em>pointer</em> to the merc with the lowest gunnery, or null. The tests write through that pointer. Name the file: <code>exercises/21-arraylist/ex4_roster.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 21, exercise 4: a roster of structs.
+//! Run with:  zig test ex4_roster.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Merc = struct { name: []const u8, gunnery: u8, wounds: u8 };
+
+const Roster = struct {
+    mercs: std.ArrayList(Merc) = .empty,
+
+    fn deinit(self: *Roster, gpa: std.mem.Allocator) void {
+        self.mercs.deinit(gpa);
+    }
+
+    fn hire(self: *Roster, gpa: std.mem.Allocator, name: []const u8, gunnery: u8) !void {
+        try self.mercs.append(gpa, .{ .name = name, .gunnery = gunnery, .wounds = 0 });
+    }
+
+    /// Every merc takes one wound. Must mutate in place.
+    fn battle(self: *Roster) void {
+        for (self.mercs.items) |*m| m.wounds += 1;
+    }
+
+    /// Release every merc whose gunnery is worse (higher) than `limit`, keeping order.
+    fn releaseWorseThan(self: *Roster, limit: u8) usize {
+        var released: usize = 0;
+        var i: usize = 0;
+        while (i &lt; self.mercs.items.len) {
+            if (self.mercs.items[i].gunnery &gt; limit) {
+                _ = self.mercs.orderedRemove(i);
+                released += 1;
+            } else i += 1;
+        }
+        return released;
+    }
+
+    /// Pointer to the best shot (lowest gunnery), or null if empty.
+    fn best(self: *Roster) ?*Merc {
+        if (self.mercs.items.len == 0) return null;
+        var b = &amp;self.mercs.items[0];
+        for (self.mercs.items[1..]) |*m| if (m.gunnery &lt; b.gunnery) {
+            b = m;
+        };
+        return b;
+    }
+};
+
+test "hire, fight, release" {
+    const a = std.testing.allocator;
+    var r: Roster = .{};
+    defer r.deinit(a);
+    try r.hire(a, "Kell", 2);
+    try r.hire(a, "Rookie", 6);
+    try r.hire(a, "Natasha", 1);
+    r.battle();
+    try std.testing.expectEqual(@as(u8, 1), r.mercs.items[1].wounds);
+    try std.testing.expectEqual(@as(usize, 1), r.releaseWorseThan(4));
+    try std.testing.expectEqualStrings("Kell", r.mercs.items[0].name);
+    try std.testing.expectEqualStrings("Natasha", r.mercs.items[1].name);
+}
+
+test "best is a live pointer" {
+    const a = std.testing.allocator;
+    var r: Roster = .{};
+    defer r.deinit(a);
+    try std.testing.expect(r.best() == null);
+    try r.hire(a, "Kell", 2);
+    try r.hire(a, "Natasha", 1);
+    r.best().?.wounds = 9; // writes through to the list
+    try std.testing.expectEqual(@as(u8, 9), r.mercs.items[1].wounds);
+}</code></pre>
+  <p><code>best</code> returns a pointer into the list, which is fine as long as the caller uses it before the next <code>hire</code>. The test does exactly that. If you wanted a safer API you would return the index instead.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 21.5 · Run-length encoding <span class="level">challenge</span></h4>
+  <p>Write <code>encode(gpa, bytes) ![]Run</code> where <code>Run</code> is <code>struct { byte: u8, count: u32 }</code>, and <code>decode(gpa, runs) ![]u8</code> that reverses it (look at <code>appendNTimes</code>). Name the file: <code>exercises/21-arraylist/ex5_rle.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 21, exercise 5: run-length encoding into a list of structs.
+//! Run with:  zig test ex5_rle.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Run = struct { byte: u8, count: u32 };
+
+fn encode(gpa: std.mem.Allocator, input: []const u8) ![]Run {
+    var runs: std.ArrayList(Run) = .empty;
+    errdefer runs.deinit(gpa);
+    for (input) |c| {
+        if (runs.items.len &gt; 0 and runs.items[runs.items.len - 1].byte == c) {
+            runs.items[runs.items.len - 1].count += 1;
+        } else {
+            try runs.append(gpa, .{ .byte = c, .count = 1 });
+        }
+    }
+    return runs.toOwnedSlice(gpa);
+}
+
+fn decode(gpa: std.mem.Allocator, runs: []const Run) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (runs) |r| try out.appendNTimes(gpa, r.byte, r.count);
+    return out.toOwnedSlice(gpa);
+}
+
+test "encode" {
+    const runs = try encode(std.testing.allocator, "aaabccdddd");
+    defer std.testing.allocator.free(runs);
+    try std.testing.expectEqual(@as(usize, 4), runs.len);
+    try std.testing.expectEqual(Run{ .byte = 'a', .count = 3 }, runs[0]);
+    try std.testing.expectEqual(Run{ .byte = 'd', .count = 4 }, runs[3]);
+}
+
+test "round trip" {
+    const text = "mmmmeeeeccchhh warrior";
+    const runs = try encode(std.testing.allocator, text);
+    defer std.testing.allocator.free(runs);
+    const back = try decode(std.testing.allocator, runs);
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqualStrings(text, back);
+}
+
+test "empty" {
+    const runs = try encode(std.testing.allocator, "");
+    defer std.testing.allocator.free(runs);
+    try std.testing.expectEqual(@as(usize, 0), runs.len);
+}</code></pre>
+  <p>The encoder peeks at the last run through <code>runs.items[runs.items.len - 1]</code> and mutates it in place; that expression is re-evaluated each time, so it is never stale even though <code>append</code> happens between iterations.</p></details>
+</div>
+
+<h3 id="ch21-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Why does <code>append</code> take an allocator but <code>pop</code> does not? <details class="answer"><summary>Answer</summary><code>append</code> may need to grow the buffer, which means asking an allocator for memory (and possibly failing). <code>pop</code> only decrements the length; it never allocates, so it needs neither the allocator nor an error return.</details></li>
+  <li>What is the difference between <code>items.len</code> and <code>capacity</code>? <details class="answer"><summary>Answer</summary><code>items.len</code> is how many elements are in use; <code>capacity</code> is how many the underlying buffer could hold before the next regrow. Capacity is always at least the length.</details></li>
+  <li>After <code>const p = &amp;list.items[2]; try list.append(gpa, x);</code>, is <code>p</code> safe to use? <details class="answer"><summary>Answer</summary>No. The append may have moved the buffer, leaving <code>p</code> pointing at freed memory. Keep the index and take the pointer again afterwards.</details></li>
+  <li>What does <code>swapRemove(0)</code> do to a list <code>[a, b, c, d]</code>? <details class="answer"><summary>Answer</summary>It returns <code>a</code> and moves the last element into slot 0: the list becomes <code>[d, b, c]</code>. Order is not preserved.</details></li>
+  <li>After <code>const s = try list.toOwnedSlice(gpa);</code>, who must free what? <details class="answer"><summary>Answer</summary>The caller must <code>gpa.free(s)</code>. The list is now <code>.empty</code>, so its <code>deinit</code> frees nothing (but is still harmless to call).</details></li>
+  <li>How do you change a struct element inside a list during a <code>for</code> loop? <details class="answer"><summary>Answer</summary>Capture by pointer: <code>for (list.items) |*item| item.field = ...;</code>. A plain capture gives you a copy.</details></li>
+  <li>You want to build a string by calling a function that takes a <code>*std.Io.Writer</code>. Which type do you use? <details class="answer"><summary>Answer</summary><code>std.Io.Writer.Allocating</code>, initialised with <code>.init(gpa)</code>; pass <code>&amp;aw.writer</code> and read back <code>aw.written()</code> or <code>toOwnedSlice()</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>std.ArrayList(T)</code> is unmanaged in 0.16: start it as <code>.empty</code>, pass the allocator to every growing call, and <code>deinit(gpa)</code> it.</li>
+<li><code>items</code> is a normal slice; <code>capacity</code> is the buffer size; growth happens in jumps so appends are cheap on average.</li>
+<li><code>append</code>, <code>appendSlice</code>, <code>insert</code> grow; <code>pop</code> (optional), <code>orderedRemove</code>, <code>swapRemove</code>, <code>clearRetainingCapacity</code> do not.</li>
+<li>Iterate with <code>|*item|</code> to mutate in place; never hold a pointer into the list across a growing call.</li>
+<li><code>ArrayList(u8)</code> plus <code>print</code> is a string builder; <code>std.Io.Writer.Allocating</code> is the same idea behind a writer interface.</li>
+<li>Build inside a function, return <code>toOwnedSlice(gpa)</code>, use <code>errdefer</code> for cleanup on the failure path.</li>
+</ul></div>
+</section>

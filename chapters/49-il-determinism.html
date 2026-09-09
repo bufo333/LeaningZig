@@ -1,0 +1,144 @@
+<section id="ch49">
+<h2>49. Determinism and the test suite</h2>
+<p class="goals"><strong>In this chapter</strong> you read the test that the whole architecture exists to make possible, then break it in the smallest way you can to see what it catches. You will also learn how the suite of 246 tests is organised, what each kind of test is for, and what "a change is done" means in this project.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch08">Chapter 8</a> (test blocks, <code>expectEqual</code>, the testing allocator and leak detection, <code>refAllDecls</code>), <a href="#ch09">Chapter 9</a> (an array of struct values and iterating an array by pointer to fill it), <a href="#ch41">Chapter 41</a> (what <code>gs.hash()</code> covers), <a href="#ch42">Chapter 42</a> (a script of <code>Command</code> values), <a href="#ch34">Chapter 34</a> (why a seed makes randomness repeatable) and <a href="#ch30">Chapter 30</a> (why a file-level <code>var</code> is global mutable state).</div>
+
+<h3 id="ch49-1">49.1 The golden master</h3>
+<p>Here is the test, unabridged:</p>
+<div class="file">src/sim/commands.zig</div>
+<pre><code>test "golden master: same seed + same script = same state hash" {
+    const script = [_]Command{
+        .{ .hire = .{ .first = "Grayson", .last = "Carlyle", .role = .mekwarrior } },
+        .{ .hire = .{ .first = "Lori", .last = "Kalmar", .role = .mekwarrior } },
+        .{ .hire = .{ .first = "Clay", .last = "Cluny", .role = .tech_mek } },
+        .{ .advance_days = 45 },
+        .{ .fire = @enumFromInt(2) },
+        .{ .advance_days = 45 },
+    };
+
+    var hashes: [2]u64 = undefined;
+    for (&amp;hashes) |*out| {
+        var gs = GameState.init(std.testing.allocator, .{ .seed = 42 });
+        defer gs.deinit();
+        for (script) |cmd| _ = try execute(&amp;gs, cmd);
+        out.* = gs.hash();
+    }
+    try std.testing.expectEqual(hashes[0], hashes[1]);
+
+    // A different seed must not accidentally replay the same campaign.
+    var other = GameState.init(std.testing.allocator, .{ .seed = 43 });
+    defer other.deinit();
+    for (script) |cmd| _ = try execute(&amp;other, cmd);
+    // Note: with RNG unused in Stage 1 phases the state can legitimately
+    // match across seeds; day/funds/roster still must match the script.
+    try std.testing.expectEqual(@as(u32, 90), other.clock.day_index);
+}</code></pre>
+<p>Two campaigns, same seed, same six commands, ninety days each, and their hashes must be equal. The script is an array of union values (<a href="#ch42">Chapter 42</a>) and the two runs are a <code>for</code> over an array of two <code>u64</code> by pointer (<a href="#ch09">Chapter 9</a>), each run creating and destroying its own state inside the loop body so that the two never share anything. The test is cheap, a fraction of a second inside a suite that finishes in a few seconds, and it runs on every <code>zig build test</code>.</p>
+<p>What can make it fail? Anything that lets the two runs diverge: a wall-clock read (impossible, no <code>io</code>), a global counter, a hash map iterated in hash order, a PRNG created outside the dice bag, a pointer left dangling by a reallocation and read as garbage. The property it guards, "the simulation is a pure function of seed and commands", is what makes every other test trustworthy: a test that pins <code>998_350</code> C-bills after a payday (<a href="#ch43">Chapter 43</a>) is only meaningful if the number cannot vary.</p>
+<p>The second half of the test is a guard against a degenerate way of passing the first half: if <code>init</code> ignored its seed, two runs would trivially agree. The comment records an early limitation honestly (in Stage 1 few phases rolled dice, so different seeds could produce identical states) and settles for checking that the script ran to day 90.</p>
+
+<h3 id="ch49-2">49.2 Breaking it</h3>
+<p>Claims about what a test catches deserve the same treatment as claims about the compiler: try it. Add a file-level variable to <code>tick.zig</code> and use it in the finance phase:</p>
+<pre><code>var paydays_seen: u32 = 0;
+
+fn runFinances(gs: *GameState) !void {
+    if (!gs.clock.date.isPayday()) return;
+    paydays_seen += 1;
+    gs.funds -= paydays_seen;
+    // …</code></pre>
+<p>This is the kind of thing a hurried programmer writes to count something. Run the suite:</p>
+<pre class="term">error: 'sim.commands.test.golden master: same seed + same script = same state hash' failed:
+       expected 2051892614612272315, found 12687838616412443031
+error: 'persist.store.test.save → load → identical hash, and the loaded campaign keeps playing' failed:
+       expected 7076991405417063463, found 807982363495903619
+error: 'sim.tick.test.payday fires on the 1st and only on the 1st' failed:
+       expected 998350, found 998349
+error: 'sim.commands.test.payroll drains funds over three months, resignations stop costing' failed:
+       expected 997910, found 997887</pre>
+<p>Four failures. The golden master fails because the counter persists across the two runs inside one test process: the first campaign sees paydays 1 to 3, the second sees 4 to 6, and their treasuries differ by a few C-bills. The round-trip test fails for the same reason (the loaded campaign continues counting where the original left off). And two payday tests fail because their pinned numbers are now off by the count. The message the suite sends is unambiguous: something outside <code>GameState</code> is influencing the state. Zig let you write the global (a file-level <code>var</code> is ordinary, <a href="#ch30">Chapter 30</a>); the rule against it is a house rule, and the golden master is its enforcement.</p>
+<p>Contrast this with Exercise 43.2, where you added a phase that read only the state and a seeded clock: the golden master did not flinch. The test does not object to new behaviour; it objects to behaviour that is not a function of the inputs.</p>
+
+<h3 id="ch49-3">49.3 How the suite is organised</h3>
+<p>The 246 test blocks live next to the code they check, by house rule: every module carries its own. They fall into kinds, and each kind has a characteristic shape.</p>
+<ul>
+<li><strong>Domain tests</strong> check rule tables and formulas against known values from the sourcebooks: a 300-rated engine weighs 19 tons, a Shadow Hawk is a medium mek and an Atlas an assault one, a green pilot earns 0.6 of base pay. They are <code>expectEqual</code> on a function of constants, and they run in microseconds.</li>
+<li><strong>Data tests</strong> cross-check the ZON files: every loadout part exists, every RAT entry is a mek of the stated class, every world's faction is in the factions table (<a href="#ch40">Chapter 40</a>). They loop over constant slices and print the offending row.</li>
+<li><strong>Sim tests</strong> build a small state, run one command or one phase, and assert on state (<a href="#ch42">Chapter 42</a>, <a href="#ch43">Chapter 43</a>). Their names are sentences that state the rule. Dice-driven ones assert bounds over many seeded rolls (<a href="#ch46">Chapter 46</a>).</li>
+<li><strong>Persistence tests</strong> round-trip a campaign through an in-memory SQLite database and open a hand-written old-schema fixture (<a href="#ch47">Chapter 47</a>).</li>
+<li><strong>Client tests</strong> check the parts of <code>src/tui</code> that need no terminal: cell grids, size tiers, PNG decoding.</li>
+<li><strong>One reflective test</strong> in <code>root.zig</code>, <code>std.testing.refAllDecls(@This())</code>, forces every public declaration in the module tree to be compiled. Zig compiles lazily (<a href="#ch30">Chapter 30</a>), so an unreferenced function with a type error would otherwise stay invisible until someone called it. This test makes "it compiles" mean all of it.</li>
+</ul>
+<p>Outside Zig are the two smoke scripts (<a href="#ch48">Chapter 48</a>): <code>docs/tui_smoke.py</code> drives the terminal client through every screen under a pseudo-terminal, and <code>docs/repl_smoke.sh</code> feeds a list of verbs to the REPL and greps for landmarks. They are slow (a couple of minutes) and they are the only tests that exercise the frontends as a user does.</p>
+<p><code>CLAUDE.md</code> states when a change is done: <code>zig build test --summary all</code> is green, and both smokes pass. The comment in <code>build.zig</code> above the test step records a day when that was not enough: the executable had a compile error that the tests did not see, because the tests compile the client as tests, not as the executable. The fix was to make the test step depend on the install step too, so a green run also means <code>zig-out/bin/game</code> is current. That is the kind of fact you only learn by reading the build script, which is why <a href="#ch39">Chapter 39</a> sent you there first.</p>
+
+<h3 id="ch49-4">49.4 What a seeded test can and cannot pin</h3>
+<p>Because every roll is seeded, every test number is exact: the turnover test's "between 6 and 30 percent" is in fact one specific percentage for seed 1220. Why write a bound, then? Because the test is about the rule (exhausted and unhappy people leave at roughly one in six a month), not about that seed's particular dice, and a re-tuning of the table should not break it. The choice of exact number versus bound is a statement about what the test means. The payday test uses an exact number because payroll is arithmetic, not dice; the turnover test uses a bound because it is dice.</p>
+<p>The same seed discipline is what makes a bug reproducible. When the game misbehaves, the seed and the command history (the REPL prints the verbs; the client's <code>:</code> line uses the same parser) are enough to replay it in a test. Several tests in <code>commands.zig</code> with names beginning "play feedback:" are exactly that: a session that went wrong, reduced to a script and a seed and pinned.</p>
+
+<h3 id="ch49-reading">Guided reading</h3>
+<ol>
+<li>The golden-master test above, in <code>src/sim/commands.zig</code>.</li>
+<li><code>src/root.zig</code>'s final test block, and the paragraph in <a href="#ch08">Chapter 8</a> on <code>refAllDecls</code>.</li>
+<li><code>build.zig</code>: the <code>test</code> step and the comment above <code>test_step.dependOn(b.getInstallStep())</code>.</li>
+<li>One test of each kind: <code>domain/meklab.zig</code> "12.17: TechManual tables", <code>domain/rat.zig</code>'s cross-check, <code>sim/commands.zig</code> "insolvency holds the turn; bankruptcy ends the campaign", <code>persist/store.zig</code> "12.17: a v5 store upgrades in place", <code>tui/app.zig</code> "size tiers follow the documented thresholds".</li>
+<li><code>docs/repl_smoke.sh</code>, all of it (it is short), and the first fifty lines of <code>docs/tui_smoke.py</code>.</li>
+</ol>
+
+<h3 id="ch49-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 49.1 · Break the golden master <span class="level">practice</span></h4>
+<p>Do what 49.2 describes: add a file-level <code>var</code> to <code>tick.zig</code>, use it to change <code>funds</code> in <code>runFinances</code>, and run the suite. Record which tests fail. Then change the global so that it affects something the hash does not read (a log line's text, say) and run again. What do you conclude about the hash's coverage?</p>
+<details class="answer"><summary>Solution</summary>
+<p>With <code>gs.funds -= paydays_seen</code>, four tests fail: the golden master, the store round trip, and the two payday tests, all with numbers off by a few C-bills. With the global only appended to a log line (<code>try gs.log(.finance, .{}, "payday {d}", .{paydays_seen})</code>), nothing fails, because <code>hash()</code> does not read log text and no test pins that line. Conclusion: the hash is a coarse instrument by design; it guards gameplay state, not every byte. A global that only affected presentation would slip past it, which is acceptable, and a global that affected the dice or the money would not, which is what matters. Remove the global when you are done.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 49.2 · A second golden master <span class="level">practice</span></h4>
+<p>The original test's script never creates a commander, so no HQ, no market and no contract is exercised. Write a second golden-master test whose script is <code>create_commander</code>, <code>new_company</code> and sixty days, and confirm it passes. Why is it worth having both?</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "golden master with a commander and a company" {
+    const script = [_]Command{
+        .{ .create_commander = .{ .name = "Erik Kalmar", .origin = .CC, .profession = .quartermaster } },
+        .{ .new_company = "Alpha" },
+        .{ .advance_days = 60 },
+    };
+    var hashes: [2]u64 = undefined;
+    for (&amp;hashes) |*out| {
+        var gs = GameState.init(std.testing.allocator, .{ .seed = 7 });
+        defer gs.deinit();
+        for (script) |cmd| _ = try execute(&amp;gs, cmd);
+        out.* = gs.hash();
+    }
+    try std.testing.expectEqual(hashes[0], hashes[1]);
+}</code></pre>
+<p>It passes. The original script exercises hiring, the tick and firing; this one exercises company generation (hundreds of dice from the <code>.generation</code> stream), the starter HQ, market refreshes and two paydays with a real payroll. A global or an unordered iteration in any of those would show up here and not in the original. Golden masters are cheap; the more of the code a script reaches, the more the property is worth. (The store round-trip test, which plays forty days with a contract, is in effect a third one.)</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 49.3 · Pin the dice <span class="level">warm-up</span></h4>
+<p>Write a test in <code>rng.zig</code> that pins the first two <code>.battle</code> rolls for seed 42 to their literal values. Find the values by printing them once. What would cause this test to fail, and would that be a bug?</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "the first battle rolls for seed 42 are pinned" {
+    var r = Rng.init(42);
+    try std.testing.expectEqual(@as(u8, 4), r.roll2d6(.battle));
+    try std.testing.expectEqual(@as(u8, 9), r.roll2d6(.battle));
+}</code></pre>
+<p>It fails if the seed derivation in <code>Rng.init</code> changes, if the stream order in the <code>Stream</code> enum changes (the index feeds the seed), or if a future Zig release changes <code>DefaultPrng</code>'s algorithm. None of those is a bug in the game's logic, but all of them silently change every campaign's dice and make old seeds unreplayable, which is worth knowing about the moment it happens. A pinned-dice test is the cheapest possible alarm for "the random stream moved".</p></details>
+</div>
+
+<h3 id="ch49-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>What does the golden-master test assert, and how long does it take? <details class="answer"><summary>Answer</summary>Two campaigns with seed 42 and the same six-command script produce equal <code>hash()</code> values after ninety days each; a fraction of a second.</details></li>
+<li>Name three faults it catches. <details class="answer"><summary>Answer</summary>A global mutable counter, a PRNG created outside the dice bag, iteration over an unordered hash map; also a wall-clock read (structurally impossible) and reads of stale memory.</details></li>
+<li>Why did adding a global counter also break the payday tests? <details class="answer"><summary>Answer</summary>The counter changed the funds those tests pin to exact numbers; they fail on the arithmetic, not on determinism.</details></li>
+<li>What is <code>refAllDecls</code> for? <details class="answer"><summary>Answer</summary>Zig compiles only what is referenced; the test references every public declaration so that dead or unreferenced code with a type error still fails the build.</details></li>
+<li>When does a test use an exact number and when a bound? <details class="answer"><summary>Answer</summary>Exact for arithmetic (payroll), bounds for dice-driven behaviour (turnover, battles), even though the seed makes both deterministic; the choice states what the test means.</details></li>
+<li>What does "a change is done" mean in this project? <details class="answer"><summary>Answer</summary><code>zig build test --summary all</code> is green (which also builds the client), and both smoke scripts pass.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>The golden-master test runs the same script twice from the same seed and compares hashes; it is the enforcement of the purity rule.</li>
+<li>A file-level <code>var</code> that touches state breaks it and several pinned-number tests at once; a change that reads only state and seeded dice does not.</li>
+<li>The 246 tests are grouped by kind (domain, data, sim, persistence, client, reflective) and live next to their code; two smoke scripts cover the frontends.</li>
+<li>Seeded dice make every number exact; tests choose exact values for arithmetic and bounds for dice to say what they mean.</li>
+<li>A bug is reproducible from a seed and a script, and several tests are exactly that.</li>
+</ul></div>
+</section>

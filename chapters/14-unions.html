@@ -1,0 +1,874 @@
+<section id="ch14">
+<h2>14. Unions and tagged unions</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn the type that IRON LEDGER is built around: the tagged union, a value that is exactly one of several alternatives, each with its own data, and always knows which. You will build them, switch over them with payload captures, modify payloads in place, give them methods, and use them as commands, messages and machine states, ending with a small interpreter. If you know Rust enums, Swift enums with associated values, or Haskell sum types, this is Zig's version.</p>
+
+<h3 id="ch14-1">14.1 Bare unions, briefly</h3>
+<p>A plain <code>union</code> is a piece of memory that can hold one of several fields, one at a time. It is as big as its largest field, and it does not remember which field you stored.</p>
+<p class="file">bare.zig</p>
+<pre><code>const std = @import("std");
+
+const Number = union {
+    int: i64,
+    float: f64,
+};
+
+pub fn main() void {
+    const n = Number{ .int = 42 };
+    std.debug.print("{d}\n", .{n.int});
+    std.debug.print("{d} bytes\n", .{@sizeOf(Number)});
+}</code></pre>
+<pre class="term">42
+16 bytes</pre>
+<p>Sixteen bytes, not eight, because safe builds quietly add a hidden tag so they can catch the following mistake:</p>
+<pre><code>const std = @import("std");
+
+const Number = union {
+    int: i64,
+    float: f64,
+};
+
+pub fn main() void {
+    const n = Number{ .int = 42 };
+    std.debug.print("{d}\n", .{n.float});
+}</code></pre>
+<pre class="term">bare_wrong.zig:10:33: error: access of union field 'float' while field 'int' is active
+    std.debug.print("{d}\n", .{n.float});
+                               ~^~~~~~
+bare_wrong.zig:3:16: note: union declared here
+const Number = union {
+               ^~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>Here the compiler could see the active field; when it cannot, Debug builds panic at runtime instead. Bare unions are for the rare cases where you are reinterpreting memory on purpose, usually at a C boundary (<a href="#ch35">Chapter 35</a>). For everything else, you want the union to <em>carry</em> its tag, so you can ask it which field is active. That is the tagged union.</p>
+
+<h3 id="ch14-2">14.2 <code>union(enum)</code></h3>
+<p>Write <code>union(enum)</code> and Zig generates an enum with one member per field, stores its value alongside the data, and keeps it in sync. Here is IRON LEDGER's terminal key type, trimmed:</p>
+<p class="file">tagged.zig</p>
+<pre><code>const std = @import("std");
+
+const Key = union(enum) {
+    char: u21, // a typed character, with its code point
+    f: u8, // F1..F12, with the number
+    ctrl: u8, // ctrl + a letter
+    enter, // no payload: like an enum member
+    escape,
+    none,
+};
+
+pub fn main() void {
+    const keys = [_]Key{
+        .{ .char = 'q' },
+        .{ .f = 3 },
+        .{ .ctrl = 'c' },
+        .enter,
+        .none,
+    };
+    for (keys) |k| {
+        std.debug.print("{any}\n", .{k});
+    }
+    std.debug.print("{d} bytes\n", .{@sizeOf(Key)});
+}</code></pre>
+<pre class="term">.{ .char = 113 }
+.{ .f = 3 }
+.{ .ctrl = 99 }
+.{ .enter = void }
+.{ .none = void }
+8 bytes</pre>
+<p>Three things to read off this. First, the fields: <code>char: u21</code> has a payload (which character), <code>f: u8</code> has a payload (which function key), and <code>enter</code> has none, which makes it behave like a plain enum member. A union can mix both freely; <code>void</code> is the implied payload type of a bare name.</p>
+<p>Second, the literals. A field with a payload is built as <code>.{ .char = 'q' }</code>, the same anonymous-literal shape as a struct with one field. A field without one is written like an enum value: <code>.enter</code>. Both coerce to <code>Key</code> from context.</p>
+<p>Third, the size: eight bytes, which is a <code>u21</code> rounded up to four bytes, plus the tag, plus padding. Compared with the bare union's hidden tag, this one is yours to inspect.</p>
+<div class="warn"><strong><code>Key.enter</code> is not a <code>Key</code>.</strong> Writing the type name and a payload-less field, <code>Shape.point</code>, gives you the <em>tag enum's</em> value, not a union value. It looks right and then fails with <code>no field or member function named 'scale' in '@typeInfo(Shape).@"union".tag_type.?'</code> the first time you call a method on it.
+<pre><code>const std = @import("std");
+
+const Shape = union(enum) { circle: f64, point };
+
+pub fn main() void {
+    const a = Shape.point; // careful: this is the TAG enum value, not a Shape
+    const b: Shape = .point; // this is a Shape
+    std.debug.print("{any}\n{any}\n", .{ @TypeOf(a), @TypeOf(b) });
+}</code></pre>
+<pre class="term">@typeInfo(tagenum.Shape).@"union".tag_type.?
+tagenum.Shape</pre>
+<p>Always write union values with an expected type in view: <code>const p: Shape = .point;</code>, or <code>.point</code> directly in an argument or array literal.</p></div>
+
+<h3 id="ch14-3">14.3 Switching with payload captures</h3>
+<p>The tag makes <code>switch</code> possible, and the payload comes along in a capture:</p>
+<p class="file">switch.zig</p>
+<pre><code>const std = @import("std");
+
+const Key = union(enum) {
+    char: u21,
+    f: u8,
+    ctrl: u8,
+    enter,
+    escape,
+    none,
+};
+
+fn describe(k: Key) void {
+    switch (k) {
+        .char =&gt; |c| std.debug.print("typed '{u}'\n", .{c}),
+        .f =&gt; |n| std.debug.print("function key F{d}\n", .{n}),
+        .ctrl =&gt; |c| std.debug.print("ctrl-{c}\n", .{c}),
+        .enter =&gt; std.debug.print("enter\n", .{}),
+        .escape, .none =&gt; std.debug.print("nothing useful\n", .{}),
+    }
+}
+
+pub fn main() void {
+    describe(.{ .char = 'q' });
+    describe(.{ .f = 3 });
+    describe(.{ .ctrl = 'c' });
+    describe(.enter);
+    describe(.escape);
+}</code></pre>
+<pre class="term">typed 'q'
+function key F3
+ctrl-c
+enter
+nothing useful</pre>
+<p>Each arm names a tag with the leading dot, and <code>|c|</code> binds the payload of that field, typed correctly: <code>c</code> is a <code>u21</code> in the <code>.char</code> arm and a <code>u8</code> in the <code>.ctrl</code> arm. Payload-less arms have no capture. Arms can be grouped with commas as long as they do not try to capture different payload types. (<code>{u}</code> prints a code point as its UTF-8 character.)</p>
+<p>Exhaustiveness works exactly as it does for enums, and it is the reason the game uses this type for its commands:</p>
+<pre><code>const std = @import("std");
+
+const Key = union(enum) { char: u21, f: u8, enter, escape };
+
+fn describe(k: Key) void {
+    switch (k) {
+        .char =&gt; |c| std.debug.print("typed '{u}'\n", .{c}),
+        .enter =&gt; std.debug.print("enter\n", .{}),
+        .escape =&gt; std.debug.print("escape\n", .{}),
+    }
+}
+
+pub fn main() void {
+    describe(.enter);
+}</code></pre>
+<pre class="term">missing.zig:6:5: error: switch must handle all possibilities
+    switch (k) {
+    ^~~~~~
+missing.zig:3:38: note: unhandled enumeration value: 'f'
+const Key = union(enum) { char: u21, f: u8, enter, escape };
+                                     ^
+missing.zig:3:13: note: enum '@typeInfo(missing.Key).@"union".tag_type.?' declared here
+const Key = union(enum) { char: u21, f: u8, enter, escape };
+            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    main: missing.zig:14:13
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=5' to see all references</pre>
+<p>Add a variant, and every switch that forgot it stops compiling. The compiler even tells you it is checking the union's tag type, that <code>tag_type.?</code> in the note.</p>
+<p>Direct field access is allowed, and checked:</p>
+<pre><code>const std = @import("std");
+
+const Key = union(enum) { char: u21, f: u8, enter };
+
+pub fn main() void {
+    const k = Key{ .char = 'q' };
+    std.debug.print("{d}\n", .{k.f});
+}</code></pre>
+<pre class="term">wrongfield.zig:7:33: error: access of union field 'f' while field 'char' is active
+    std.debug.print("{d}\n", .{k.f});
+                               ~^~
+wrongfield.zig:3:13: note: union declared here
+const Key = union(enum) { char: u21, f: u8, enter };
+            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    callMain [inlined]: &lt;zig&gt;/lib/std/start.zig:698:59
+    callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
+    main: &lt;zig&gt;/lib/std/start.zig:663:28
+    1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
+<p>Reading <code>k.f</code> when <code>k</code> holds a <code>.char</code> is a compile error here and a panic at runtime when the compiler cannot see which is active. That is why the normal way to read a payload is a switch or an <code>if</code> on the tag, never a bare field access on a value you have not checked.</p>
+
+<h3 id="ch14-4">14.4 Asking for the tag</h3>
+<p>Sometimes you only need to know which alternative is active, not what it holds:</p>
+<p class="file">tagquery.zig</p>
+<pre><code>const std = @import("std");
+
+const Key = union(enum) { char: u21, f: u8, enter };
+
+pub fn main() void {
+    const k = Key{ .f = 5 };
+    std.debug.print("{any}\n", .{std.meta.activeTag(k)});
+    std.debug.print("{s}\n", .{@tagName(k)});
+    std.debug.print("{}\n", .{k == .f}); // compare the tag only
+    std.debug.print("{}\n", .{std.meta.activeTag(k) == .char});
+    if (k == .f) std.debug.print("F{d}\n", .{k.f}); // safe: we checked
+    const Tag = std.meta.Tag(Key); // the enum behind the union
+    std.debug.print("{any}\n", .{@typeInfo(Tag).@"enum".fields.len});
+}</code></pre>
+<pre class="term">.f
+f
+true
+false
+F5
+3</pre>
+<p><code>std.meta.activeTag(k)</code> returns the tag as an enum value. <code>@tagName</code> works directly on the union. And most conveniently, a tagged union compares with <code>==</code> against an enum literal, comparing only the tag: <code>k == .f</code> is true whatever the F-number is. That is the idiom for a quick check before touching a payload, as the <code>if (k == .f)</code> line does. <code>std.meta.Tag(Key)</code> names the generated enum type when you need to store or pass tags around.</p>
+
+<h3 id="ch14-5">14.5 Modifying a payload in place</h3>
+<p>A capture with <code>|v|</code> is a copy of the payload. To change the payload inside the union, switch on a pointer to the union and capture with <code>|*v|</code>:</p>
+<p class="file">mutate.zig</p>
+<pre><code>const std = @import("std");
+
+const Damage = union(enum) {
+    armor: u16, // points of armor left
+    internal: u16, // structure points left
+    destroyed,
+};
+
+fn hit(d: *Damage, amount: u16) void {
+    switch (d.*) {
+        .armor =&gt; |*left| {
+            if (amount &lt; left.*) {
+                left.* -= amount; // modify the payload in place
+            } else {
+                d.* = .{ .internal = 10 }; // replace the whole value
+            }
+        },
+        .internal =&gt; |*left| {
+            if (amount &lt; left.*) left.* -= amount else d.* = .destroyed;
+        },
+        .destroyed =&gt; {},
+    }
+}
+
+pub fn main() void {
+    var d = Damage{ .armor = 12 };
+    for ([_]u16{ 5, 5, 5, 5, 20 }) |amt| {
+        hit(&amp;d, amt);
+        std.debug.print("{any}\n", .{d});
+    }
+}</code></pre>
+<pre class="term">.{ .armor = 7 }
+.{ .armor = 2 }
+.{ .internal = 10 }
+.{ .internal = 5 }
+.{ .destroyed = void }</pre>
+<p>Two kinds of change appear here. <code>left.* -= amount</code> changes the number stored in the active field without changing which field is active. <code>d.* = .{ .internal = 10 }</code> replaces the whole union, tag and all, which is how a value moves from one state to the next. Note that the switch is on <code>d.*</code>, the union itself, and the pointer capture then refers into it; the same shape works on <code>self.*</code> inside a method.</p>
+
+<h3 id="ch14-6">14.6 Methods on unions</h3>
+<p>Like structs and enums, unions can hold functions. A method that only reads takes the union by value and switches on it; one that modifies takes a pointer:</p>
+<p class="file">methods.zig</p>
+<pre><code>const std = @import("std");
+
+const Shape = union(enum) {
+    circle: f64, // radius
+    rect: struct { w: f64, h: f64 },
+    point,
+
+    pub fn area(self: Shape) f64 {
+        return switch (self) {
+            .circle =&gt; |r| std.math.pi * r * r,
+            .rect =&gt; |r| r.w * r.h,
+            .point =&gt; 0,
+        };
+    }
+
+    pub fn scale(self: *Shape, k: f64) void {
+        switch (self.*) {
+            .circle =&gt; |*r| r.* *= k,
+            .rect =&gt; |*r| {
+                r.w *= k;
+                r.h *= k;
+            },
+            .point =&gt; {},
+        }
+    }
+};
+
+pub fn main() void {
+    var shapes = [_]Shape{ .{ .circle = 1 }, .{ .rect = .{ .w = 2, .h = 3 } }, .point };
+    for (&amp;shapes) |*s| {
+        s.scale(2);
+        std.debug.print("{s}: {d:.2}\n", .{ @tagName(s.*), s.area() });
+    }
+}</code></pre>
+<pre class="term">circle: 12.57
+rect: 24.00
+point: 0.00</pre>
+<p><code>rect</code> carries an inline struct as its payload, so <code>|r|</code> gives you something with <code>.w</code> and <code>.h</code>. A union with methods that switch on <code>self</code> is Zig's answer to a class hierarchy with a virtual method: one type, every alternative listed, every case handled in one place, no allocation and no pointers. The trade-off is the same one enums make: adding an alternative touches every switch, and the compiler tells you where.</p>
+<p>A union may also name an existing enum as its tag, <code>union(Kind)</code>, when you want control over the tag's integer values or want to share the enum elsewhere. A tagged union then coerces to that enum:</p>
+<p class="file">explicit_tag.zig</p>
+<pre><code>const std = @import("std");
+
+const Kind = enum(u8) { text = 1, number = 2, nothing = 3 };
+
+const Value = union(Kind) {
+    text: []const u8,
+    number: i64,
+    nothing,
+};
+
+pub fn main() void {
+    const v = Value{ .number = 7 };
+    std.debug.print("{d}\n", .{@intFromEnum(std.meta.activeTag(v))});
+    const k: Kind = v; // a tagged union coerces to its tag enum
+    std.debug.print("{any}\n", .{k});
+}</code></pre>
+<pre class="term">2
+.number</pre>
+
+<h3 id="ch14-7">14.7 Commands, messages and state machines</h3>
+<p>The most useful thing to do with a tagged union is to make the set of things that can happen into a type. Here is a tiny version of IRON LEDGER's command loop:</p>
+<p class="file">commands.zig</p>
+<pre><code>const std = @import("std");
+
+const Command = union(enum) {
+    advance_day,
+    advance_days: u32,
+    hire: struct { name: []const u8, salary: i64 },
+    fire: u32,
+    rename: []const u8,
+};
+
+const State = struct {
+    day: u32 = 1,
+    name: []const u8 = "Unnamed Company",
+    staff: u32 = 0,
+    funds: i64 = 1_000_000,
+};
+
+fn execute(s: *State, cmd: Command) void {
+    switch (cmd) {
+        .advance_day =&gt; s.day += 1,
+        .advance_days =&gt; |n| s.day += n,
+        .hire =&gt; |h| {
+            s.staff += 1;
+            s.funds -= h.salary;
+            std.debug.print("hired {s}\n", .{h.name});
+        },
+        .fire =&gt; |id| {
+            s.staff -= 1;
+            std.debug.print("fired #{d}\n", .{id});
+        },
+        .rename =&gt; |new_name| s.name = new_name,
+    }
+}
+
+pub fn main() void {
+    var s = State{};
+    const script = [_]Command{
+        .{ .rename = "Grey Death Legion" },
+        .{ .hire = .{ .name = "Kai", .salary = 1_500 } },
+        .{ .hire = .{ .name = "Nat", .salary = 800 } },
+        .advance_day,
+        .{ .advance_days = 30 },
+        .{ .fire = 2 },
+    };
+    for (script) |cmd| execute(&amp;s, cmd);
+    std.debug.print("{s}: day {d}, {d} staff, {d} C-bills\n", .{
+        s.name, s.day, s.staff, s.funds,
+    });
+}</code></pre>
+<pre class="term">hired Kai
+hired Nat
+fired #2
+Grey Death Legion: day 32, 1 staff, 997700 C-bills</pre>
+<p>Every possible request is a <code>Command</code>; the state is only ever changed inside <code>execute</code>; and the script is plain data, an array of commands, that can be built by a parser, read from a file, or written by a test. That separation, where the union is the only way in, is the architecture of the whole game (<a href="#ch42">Chapter 42</a>), and you have now seen all of the language it takes.</p>
+<p>The same trick describes a value that changes state over time. <code>Damage</code> in 14.5 was a state machine: <code>armor</code>, then <code>internal</code>, then <code>destroyed</code>, each state carrying only the data that state needs. Compare that with a struct holding an <code>armor</code> field, an <code>internal</code> field and a <code>destroyed</code> flag, where nothing stops <code>destroyed = true</code> alongside <code>armor = 12</code>.</p>
+<p>Unions can also refer to themselves through pointers, which is how tree-shaped data is built. An arithmetic expression is a number, or a negation of an expression, or a sum or product of two:</p>
+<p class="file">expr.zig</p>
+<pre><code>const std = @import("std");
+
+const Expr = union(enum) {
+    num: i64,
+    neg: *const Expr,
+    add: struct { l: *const Expr, r: *const Expr },
+    mul: struct { l: *const Expr, r: *const Expr },
+
+    pub fn eval(self: Expr) i64 {
+        return switch (self) {
+            .num =&gt; |n| n,
+            .neg =&gt; |e| -e.eval(),
+            .add =&gt; |p| p.l.eval() + p.r.eval(),
+            .mul =&gt; |p| p.l.eval() * p.r.eval(),
+        };
+    }
+};
+
+pub fn main() void {
+    // (2 + 3) * -4
+    const two = Expr{ .num = 2 };
+    const three = Expr{ .num = 3 };
+    const four = Expr{ .num = 4 };
+    const sum = Expr{ .add = .{ .l = &amp;two, .r = &amp;three } };
+    const neg4 = Expr{ .neg = &amp;four };
+    const prod = Expr{ .mul = .{ .l = &amp;sum, .r = &amp;neg4 } };
+    std.debug.print("{d}\n", .{prod.eval()});
+}</code></pre>
+<pre class="term">-20</pre>
+<p>The payloads hold <code>*const Expr</code>, pointers to other expressions, because a union cannot contain itself by value (it would be infinitely large). The nodes here are locals whose addresses are taken; a real interpreter would allocate them (<a href="#ch19">Chapter 19</a>). <code>eval</code> is a method that recurses through the switch, four lines for a whole evaluator.</p>
+
+<h3 id="ch14-8">14.8 Coming from other languages</h3>
+<table class="compare">
+<tr><th>You know</th><th>In Zig</th></tr>
+<tr><td>Rust <code>enum Key { Char(char), F(u8), Enter }</code></td><td><code>union(enum) { char: u21, f: u8, enter }</code>; <code>match</code> is <code>switch</code> with <code>|v|</code> captures</td></tr>
+<tr><td>Swift enum with associated values</td><td>same idea; <code>if case</code> becomes <code>if (k == .f)</code> then <code>k.f</code>, or a switch</td></tr>
+<tr><td>C <code>struct { int tag; union { ... } u; }</code></td><td>the tag is generated and kept in sync for you; wrong-field reads are caught</td></tr>
+<tr><td>TypeScript discriminated union <code>{ kind: "f", n: number } | ...</code></td><td>same shape, but checked at compile time and stored in a fixed number of bytes</td></tr>
+<tr><td>Java/Python class hierarchy with a virtual method</td><td>one union with a method that switches on <code>self</code>; no heap, all cases visible in one place</td></tr>
+</table>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game is driven by a single tagged union. Every action a player or a script can take is a variant, and the only function that changes a <code>GameState</code> is the switch over it:
+<pre><code>// src/sim/commands.zig
+pub const Command = union(enum) {
+    /// End the turn: advance one day.
+    advance_day,
+    advance_days: u32,
+    hire: struct {
+        first: []const u8,
+        last: []const u8,
+        role: person_mod.Role,
+    },
+    /// Hire a randomly generated candidate (experience rolled on 2d6).
+    recruit: person_mod.Role,
+    fire: types.PersonId,
+    new_company: []const u8,
+    rename_force: struct { force: types.ForceId, name: []const u8 },
+    // ... about forty more
+};
+
+pub fn execute(gs: *GameState, cmd: Command) Error!Result {
+    switch (cmd) {
+        .advance_day =&gt; return advance(gs, 1),
+        .advance_days =&gt; |n| return advance(gs, n),
+        .hire =&gt; |h| {
+            const id = try gs.hirePerson(h.first, h.last, h.role);
+            return .{ .hired = id };
+        },
+        .recruit =&gt; |role| {
+            const id = try gs.recruitGenerated(role);
+            return .{ .hired = id };
+        },
+        // ...
+    }
+}</code></pre>
+<p><code>|n|</code> binds the <code>u32</code> of <code>advance_days</code>; <code>|h|</code> binds the inline struct so <code>h.first</code> works. Add a variant to <code>Command</code> and this switch fails to compile until you handle it. The same shape at a smaller scale is <code>Key</code> in <code>src/tui/term.zig</code>, whose <code>readKey</code> turns raw bytes into <code>.enter</code>, <code>.{ .ctrl = 'a' + b - 1 }</code> and <code>.{ .f = 3 }</code> with a switch over integer ranges, which exercise 14.2 has you rebuild.</p></div>
+
+<h3 id="ch14-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 14.1 · Shapes with methods <span class="level">warm-up</span></h4>
+  <p>Give <code>Shape</code> four methods: <code>area</code>, <code>perimeter</code>, an in-place <code>scale</code> using <code>|*v|</code> captures, and <code>simplify</code>, which turns an equal-sided <code>rect</code> into a <code>square</code>. Name the file: <code>exercises/14-unions/ex1_shapes.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 14, exercise 1: a tagged union with methods.
+//! Run with:  zig test ex1_shapes.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Shape = union(enum) {
+    circle: f64, // radius
+    rect: struct { w: f64, h: f64 },
+    square: f64, // side
+    point,
+
+    pub fn area(self: Shape) f64 {
+        return switch (self) {
+            .circle =&gt; |r| std.math.pi * r * r,
+            .rect =&gt; |r| r.w * r.h,
+            .square =&gt; |s| s * s,
+            .point =&gt; 0,
+        };
+    }
+
+    pub fn perimeter(self: Shape) f64 {
+        return switch (self) {
+            .circle =&gt; |r| 2 * std.math.pi * r,
+            .rect =&gt; |r| 2 * (r.w + r.h),
+            .square =&gt; |s| 4 * s,
+            .point =&gt; 0,
+        };
+    }
+
+    /// Scale every dimension by k, in place.
+    pub fn scale(self: *Shape, k: f64) void {
+        switch (self.*) {
+            .circle =&gt; |*r| r.* *= k,
+            .rect =&gt; |*r| {
+                r.w *= k;
+                r.h *= k;
+            },
+            .square =&gt; |*s| s.* *= k,
+            .point =&gt; {},
+        }
+    }
+
+    /// A rect whose sides are equal is really a square; normalise it.
+    pub fn simplify(self: Shape) Shape {
+        return switch (self) {
+            .rect =&gt; |r| if (r.w == r.h) Shape{ .square = r.w } else self,
+            else =&gt; self,
+        };
+    }
+};
+
+test "area and perimeter" {
+    try std.testing.expectEqual(@as(f64, 6), (Shape{ .rect = .{ .w = 2, .h = 3 } }).area());
+    try std.testing.expectEqual(@as(f64, 10), (Shape{ .rect = .{ .w = 2, .h = 3 } }).perimeter());
+    try std.testing.expectEqual(@as(f64, 9), (Shape{ .square = 3 }).area());
+    try std.testing.expectEqual(@as(f64, 0), (Shape{ .point = {} }).area());
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14159), (Shape{ .circle = 1 }).area(), 0.001);
+}
+
+test "scale in place" {
+    var s = Shape{ .rect = .{ .w = 2, .h = 3 } };
+    s.scale(2);
+    try std.testing.expectEqual(@as(f64, 24), s.area());
+    var p: Shape = .point;
+    p.scale(100);
+    try std.testing.expect(p == .point);
+}
+
+test "simplify" {
+    const sq = (Shape{ .rect = .{ .w = 2, .h = 2 } }).simplify();
+    try std.testing.expect(sq == .square);
+    try std.testing.expectEqual(@as(f64, 2), sq.square);
+    const r = (Shape{ .rect = .{ .w = 2, .h = 3 } }).simplify();
+    try std.testing.expect(r == .rect);
+}</code></pre>
+  <p><code>scale</code> switches on <code>self.*</code> and captures pointers so the multiplication lands inside the union. <code>simplify</code> uses <code>else =&gt; self</code>: only <code>rect</code> needs thought, and returning the value unchanged is the correct default for every future variant. Note <code>var p: Shape = .point;</code> in the test, not <code>Shape.point</code>, for the reason in 14.2.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 14.2 · Decoding keys <span class="level">practice</span></h4>
+  <p>Rebuild the byte-to-key decoder from <code>src/tui/term.zig</code>: a switch over a <code>u8</code> with ranges and lists producing <code>Key</code> values; a <code>describe</code> that prints a key into a buffer; and <code>countChars</code>, which compares tags. Name the file: <code>exercises/14-unions/ex2_keys.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 14, exercise 2: decoding bytes into keys.
+//! Run with:  zig test ex2_keys.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// IRON LEDGER's terminal key type, trimmed.
+const Key = union(enum) {
+    char: u21,
+    enter,
+    escape,
+    tab,
+    backspace,
+    ctrl: u8, // 'a'..'z'
+    none,
+};
+
+/// Decode one raw byte the way src/tui/term.zig does.
+fn decode(b: u8) Key {
+    return switch (b) {
+        0x1b =&gt; .escape,
+        '\r', '\n' =&gt; .enter,
+        '\t' =&gt; .tab,
+        0x7f, 0x08 =&gt; .backspace,
+        1...7, 11, 12, 14...26 =&gt; .{ .ctrl = 'a' + b - 1 },
+        else =&gt; .{ .char = b },
+    };
+}
+
+/// A short human name for a key, into buf.
+fn describe(k: Key, buf: []u8) ![]const u8 {
+    return switch (k) {
+        .char =&gt; |c| std.fmt.bufPrint(buf, "'{u}'", .{c}),
+        .ctrl =&gt; |c| std.fmt.bufPrint(buf, "ctrl-{c}", .{c}),
+        .enter, .escape, .tab, .backspace, .none =&gt; @tagName(k),
+    };
+}
+
+/// Count how many of the keys are printable characters.
+fn countChars(keys: []const Key) usize {
+    var n: usize = 0;
+    for (keys) |k| {
+        if (k == .char) n += 1;
+    }
+    return n;
+}
+
+test "decode" {
+    try std.testing.expectEqual(Key.escape, decode(0x1b));
+    try std.testing.expectEqual(Key.enter, decode('\n'));
+    try std.testing.expectEqual(Key.backspace, decode(0x7f));
+    try std.testing.expectEqual(Key{ .ctrl = 'c' }, decode(3));
+    try std.testing.expectEqual(Key{ .ctrl = 'z' }, decode(26));
+    try std.testing.expectEqual(Key{ .char = 'q' }, decode('q'));
+}
+
+test "describe" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("'q'", try describe(.{ .char = 'q' }, &amp;buf));
+    try std.testing.expectEqualStrings("ctrl-c", try describe(.{ .ctrl = 'c' }, &amp;buf));
+    try std.testing.expectEqualStrings("escape", try describe(.escape, &amp;buf));
+}
+
+test "countChars" {
+    const keys = [_]Key{ .{ .char = 'a' }, .enter, .{ .char = 'b' }, .{ .ctrl = 'c' }, .none };
+    try std.testing.expectEqual(@as(usize, 2), countChars(&amp;keys));
+}</code></pre>
+  <p><code>1...7, 11, 12, 14...26</code> is the game's own arm: the control characters that are not tab, newline or carriage return. The <code>describe</code> switch mixes arms that return a formatted slice with arms that return <code>@tagName(k)</code>; both are <code>[]const u8</code>, so the switch has one type.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 14.3 · Commands <span class="level">practice</span></h4>
+  <p>A <code>Command</code> union drives a small <code>State</code>. Implement <code>execute</code> (one exhaustive switch, returning errors for impossible requests) and <code>parse</code>, which turns a line of text into a command or <code>null</code>. The last test runs a script of six lines through both. Name the file: <code>exercises/14-unions/ex3_commands.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 14, exercise 3: commands as a tagged union.
+//! Run with:  zig test ex3_commands.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Command = union(enum) {
+    advance_day,
+    advance_days: u32,
+    hire: struct { name: []const u8, salary: i64 },
+    fire: u32, // staff index
+    deposit: i64,
+};
+
+const Error = error{ NoSuchPerson, InsufficientFunds, TooManyStaff };
+
+const State = struct {
+    day: u32 = 1,
+    funds: i64 = 10_000,
+    staff: [4]?[]const u8 = .{ null, null, null, null },
+
+    fn headcount(self: State) usize {
+        var n: usize = 0;
+        for (self.staff) |s| {
+            if (s != null) n += 1;
+        }
+        return n;
+    }
+};
+
+fn execute(s: *State, cmd: Command) Error!void {
+    switch (cmd) {
+        .advance_day =&gt; s.day += 1,
+        .advance_days =&gt; |n| s.day += n,
+        .hire =&gt; |h| {
+            if (h.salary &gt; s.funds) return error.InsufficientFunds;
+            for (&amp;s.staff) |*slot| {
+                if (slot.* == null) {
+                    slot.* = h.name;
+                    s.funds -= h.salary;
+                    return;
+                }
+            }
+            return error.TooManyStaff;
+        },
+        .fire =&gt; |i| {
+            if (i &gt;= s.staff.len or s.staff[i] == null) return error.NoSuchPerson;
+            s.staff[i] = null;
+        },
+        .deposit =&gt; |amt| s.funds += amt,
+    }
+}
+
+/// Parse an optional token as a number; a missing token is an error too.
+fn num(comptime T: type, tok: ?[]const u8) !T {
+    return std.fmt.parseInt(T, tok orelse "", 10);
+}
+
+/// Parse one line of text into a command, or null for an unknown verb.
+fn parse(line: []const u8) !?Command {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const verb = it.next() orelse return null;
+    const eq = std.mem.eql;
+    if (eq(u8, verb, "day")) return .advance_day;
+    if (eq(u8, verb, "days")) return .{ .advance_days = try num(u32, it.next()) };
+    if (eq(u8, verb, "fire")) return .{ .fire = try num(u32, it.next()) };
+    if (eq(u8, verb, "deposit")) return .{ .deposit = try num(i64, it.next()) };
+    if (eq(u8, verb, "hire")) {
+        const name = it.next() orelse return error.InvalidCharacter;
+        const salary = try num(i64, it.next());
+        return .{ .hire = .{ .name = name, .salary = salary } };
+    }
+    return null;
+}
+
+test "execute" {
+    var s = State{};
+    try execute(&amp;s, .{ .hire = .{ .name = "Kai", .salary = 1_500 } });
+    try execute(&amp;s, .{ .advance_days = 10 });
+    try std.testing.expectEqual(@as(u32, 11), s.day);
+    try std.testing.expectEqual(@as(i64, 8_500), s.funds);
+    try std.testing.expectEqual(@as(usize, 1), s.headcount());
+    try execute(&amp;s, .{ .fire = 0 });
+    try std.testing.expectEqual(@as(usize, 0), s.headcount());
+}
+
+test "errors" {
+    var s = State{ .funds = 100 };
+    const kai: Command = .{ .hire = .{ .name = "Kai", .salary = 1_500 } };
+    try std.testing.expectError(error.InsufficientFunds, execute(&amp;s, kai));
+    try std.testing.expectError(error.NoSuchPerson, execute(&amp;s, .{ .fire = 2 }));
+    s.funds = 1_000_000;
+    for ([_][]const u8{ "a", "b", "c", "d" }) |n| {
+        try execute(&amp;s, .{ .hire = .{ .name = n, .salary = 1 } });
+    }
+    const one_more: Command = .{ .hire = .{ .name = "e", .salary = 1 } };
+    try std.testing.expectError(error.TooManyStaff, execute(&amp;s, one_more));
+}
+
+test "parse" {
+    try std.testing.expectEqual(@as(?Command, .advance_day), try parse("day"));
+    try std.testing.expectEqual(@as(?Command, .{ .advance_days = 30 }), try parse("days 30"));
+    try std.testing.expectEqual(@as(?Command, null), try parse("dance"));
+    try std.testing.expectError(error.InvalidCharacter, parse("days thirty"));
+    const h = (try parse("hire Kai 1500")).?;
+    try std.testing.expectEqualStrings("Kai", h.hire.name);
+    try std.testing.expectEqual(@as(i64, 1500), h.hire.salary);
+}
+
+test "a script" {
+    var s = State{};
+    const lines = [_][]const u8{
+        "hire Kai 1500", "hire Nat 800", "deposit 5000", "days 30", "fire 1", "day",
+    };
+    for (lines) |l| {
+        const cmd = (try parse(l)) orelse continue;
+        try execute(&amp;s, cmd);
+    }
+    try std.testing.expectEqual(@as(u32, 32), s.day);
+    try std.testing.expectEqual(@as(i64, 12_700), s.funds);
+    try std.testing.expectEqual(@as(usize, 1), s.headcount());
+}</code></pre>
+  <p>This is the guide's <code>parseCommand</code> in miniature, down to the <code>const eq = std.mem.eql;</code> shortcut and the <code>!?Command</code> return type: an error for a malformed number, <code>null</code> for an unknown verb, a command otherwise. <code>expectEqual</code> compares tagged unions by tag and payload, so <code>.{ .advance_days = 30 }</code> can be checked directly.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 14.4 · A stack-machine interpreter <span class="level">challenge</span></h4>
+  <p><code>Op</code> is an instruction set: push, arithmetic, dup, swap, a conditional jump and halt. Write the switch inside <code>Machine.run</code>. The tests include a countdown loop, so the jump must work, and a step limit turns an endless program into <code>error.NoHalt</code>. Name the file: <code>exercises/14-unions/ex4_interpreter.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 14, exercise 4: a tiny stack-machine interpreter (challenge).
+//! Run with:  zig test ex4_interpreter.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// One instruction for a stack machine.
+const Op = union(enum) {
+    push: i64,
+    add,
+    sub,
+    mul,
+    dup,
+    swap,
+    jump_if_zero: usize, // pop; if zero, jump to this instruction index
+    halt,
+};
+
+const Error = error{ StackUnderflow, StackOverflow, BadJump, NoHalt };
+
+const Machine = struct {
+    stack: [16]i64 = undefined,
+    sp: usize = 0, // number of values on the stack
+    pc: usize = 0, // index of the next instruction
+    steps: usize = 0,
+
+    fn push(self: *Machine, v: i64) Error!void {
+        if (self.sp == self.stack.len) return error.StackOverflow;
+        self.stack[self.sp] = v;
+        self.sp += 1;
+    }
+
+    fn pop(self: *Machine) Error!i64 {
+        if (self.sp == 0) return error.StackUnderflow;
+        self.sp -= 1;
+        return self.stack[self.sp];
+    }
+
+    /// Run until halt. Returns the top of the stack (or 0 if empty).
+    fn run(self: *Machine, program: []const Op) Error!i64 {
+        while (self.pc &lt; program.len) {
+            const op = program[self.pc];
+            self.pc += 1;
+            self.steps += 1;
+            if (self.steps &gt; 10_000) return error.NoHalt;
+            switch (op) {
+                .push =&gt; |v| try self.push(v),
+                .add =&gt; try self.push(try self.pop() + try self.pop()),
+                .mul =&gt; try self.push(try self.pop() * try self.pop()),
+                .sub =&gt; {
+                    const b = try self.pop();
+                    const a = try self.pop();
+                    try self.push(a - b);
+                },
+                .dup =&gt; {
+                    const a = try self.pop();
+                    try self.push(a);
+                    try self.push(a);
+                },
+                .swap =&gt; {
+                    const b = try self.pop();
+                    const a = try self.pop();
+                    try self.push(b);
+                    try self.push(a);
+                },
+                .jump_if_zero =&gt; |target| {
+                    if (target &gt; program.len) return error.BadJump;
+                    if ((try self.pop()) == 0) self.pc = target;
+                },
+                .halt =&gt; return if (self.sp == 0) 0 else self.stack[self.sp - 1],
+            }
+        }
+        return error.NoHalt;
+    }
+};
+
+fn runProgram(program: []const Op) Error!i64 {
+    var m = Machine{};
+    return m.run(program);
+}
+
+test "arithmetic" {
+    // (2 + 3) * 4 - 1
+    const prog = [_]Op{
+        .{ .push = 2 }, .{ .push = 3 }, .add, .{ .push = 4 }, .mul, .{ .push = 1 }, .sub, .halt,
+    };
+    try std.testing.expectEqual(@as(i64, 19), try runProgram(&amp;prog));
+}
+
+test "dup and swap" {
+    const prog = [_]Op{ .{ .push = 7 }, .dup, .mul, .{ .push = 100 }, .swap, .sub, .halt };
+    // swap turns [49, 100] into [100, 49], so sub computes 100 - 49
+    try std.testing.expectEqual(@as(i64, 100 - 49), try runProgram(&amp;prog));
+}
+
+test "errors" {
+    try std.testing.expectError(error.StackUnderflow, runProgram(&amp;[_]Op{ .add, .halt }));
+    try std.testing.expectError(error.NoHalt, runProgram(&amp;[_]Op{.{ .push = 1 }}));
+    const bad = [_]Op{ .{ .push = 0 }, .{ .jump_if_zero = 99 }, .halt };
+    try std.testing.expectError(error.BadJump, runProgram(&amp;bad));
+}
+
+test "countdown loop" {
+    // n = 5; while (n != 0) n -= 1; leaves 0 on the stack.
+    const prog = [_]Op{
+        .{ .push = 5 }, // 0
+        .dup, // 1: copy n so the test does not consume it
+        .{ .jump_if_zero = 7 }, // 2: if n == 0 go to halt
+        .{ .push = 1 }, // 3
+        .sub, // 4: n = n - 1
+        .{ .push = 0 }, // 5
+        .{ .jump_if_zero = 1 }, // 6: always jumps (0 is zero)
+        .halt, // 7
+    };
+    var m = Machine{};
+    try std.testing.expectEqual(@as(i64, 0), try m.run(&amp;prog));
+    try std.testing.expect(m.steps &lt; 100);
+}</code></pre>
+  <p>Every instruction is one arm. <code>sub</code> and <code>swap</code> pop in the right order (<code>b</code> first, since it was pushed last), which the <code>dup and swap</code> test checks: <code>100 - 49</code>, not <code>49 - 100</code>. <code>halt</code> is the only arm that returns a value; every other path returns an error, so the function's result type is <code>Error!i64</code> and the tests use <code>try</code> and <code>expectError</code> as usual.</p></details>
+</div>
+
+<h3 id="ch14-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does a tagged union store that a bare union does not? <details class="answer"><summary>Answer</summary>An enum tag saying which field is active, kept in sync automatically and available to <code>switch</code>, <code>==</code> against a literal, <code>@tagName</code> and <code>std.meta.activeTag</code>.</details></li>
+  <li>How do you build a <code>Key</code> holding <code>ctrl-c</code>, and one holding <code>enter</code>? <details class="answer"><summary>Answer</summary><code>.{ .ctrl = 'c' }</code> and <code>.enter</code>, both with a <code>Key</code> expected from context (a typed variable, a parameter, an array element).</details></li>
+  <li>What is the difference between <code>|v|</code> and <code>|*v|</code> in a switch arm? <details class="answer"><summary>Answer</summary><code>|v|</code> copies the payload; <code>|*v|</code> gives a pointer to it, which requires switching on a pointer's target (<code>switch (p.*)</code>) and lets you modify the payload in place.</details></li>
+  <li>What does <code>k == .f</code> compare? <details class="answer"><summary>Answer</summary>Only the tag. It is true for any <code>Key</code> whose active field is <code>f</code>, regardless of payload.</details></li>
+  <li>Why does reading <code>k.f</code> when <code>k</code> holds <code>.char</code> not silently return garbage? <details class="answer"><summary>Answer</summary>Safe builds check the tag on every field access: a compile error when the active field is known, a panic otherwise.</details></li>
+  <li>Why is <code>Shape.point</code> a trap? <details class="answer"><summary>Answer</summary>It names the generated tag enum's value, not a <code>Shape</code>. Use <code>const p: Shape = .point;</code> so the union type is expected.</details></li>
+  <li>Why must a self-referential union hold <code>*const Expr</code> rather than <code>Expr</code>? <details class="answer"><summary>Answer</summary>A value containing itself would have infinite size. A pointer has a fixed size and can refer to another node stored elsewhere.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A bare <code>union</code> is one-of-several without a remembered tag; use it only for deliberate memory reinterpretation.</li>
+<li><code>union(enum) { a: T, b: U, c }</code> generates and stores a tag; payload-less fields act like enum members.</li>
+<li>Build with <code>.{ .a = value }</code> or <code>.c</code> where the union type is expected; <code>Type.c</code> is the tag enum, not the union.</li>
+<li><code>switch</code> is exhaustive and captures payloads with <code>|v|</code>; <code>|*v|</code> on <code>switch (p.*)</code> modifies in place; assigning a new literal changes state.</li>
+<li><code>k == .tag</code>, <code>@tagName(k)</code>, <code>std.meta.activeTag(k)</code> and <code>std.meta.Tag(T)</code> work with the tag alone.</li>
+<li>Unions take methods like structs; <code>union(SomeEnum)</code> uses an explicit tag type and coerces to it.</li>
+<li>Commands, messages, states and expression trees are all tagged unions; IRON LEDGER's <code>Command</code> is the only way into its game state.</li>
+</ul></div>
+</section>

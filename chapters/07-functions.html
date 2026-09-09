@@ -1,0 +1,627 @@
+<section id="ch07">
+<h2>7. Functions</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn how to declare and call functions, why parameters cannot be changed inside a function and what to do instead, how return types including <code>void</code> work, how early return keeps code flat, how recursion looks in Zig, what <code>pub</code> does, and how a function can be passed around as a value. You will also get a preview of functions living inside a struct, which is where methods come from.</p>
+
+<h3 id="ch07-1">7.1 Declaring and calling</h3>
+<p>A function is declared with <code>fn</code>, a name, a parameter list where every parameter has a type, a return type, and a body.</p>
+<div class="file">basic.zig</div>
+<pre><code>const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+fn greet(name: []const u8) void {
+    std.debug.print("Welcome aboard, {s}.\n", .{name});
+}
+
+pub fn main() void {
+    const total = add(2, 3);
+    std.debug.print("2 + 3 = {d}\n", .{total});
+    greet("Commander");
+}</code></pre>
+<pre class="term">$ zig run basic.zig
+2 + 3 = 5
+Welcome aboard, Commander.</pre>
+<p><code>fn add(a: i32, b: i32) i32</code> reads: a function named <code>add</code> taking two <code>i32</code> values and returning an <code>i32</code>. There is no arrow or colon before the return type; it simply follows the parentheses. <code>return</code> ends the function with a value. Calling it is <code>add(2, 3)</code>, and the result can be bound to a <code>const</code> or used directly inside another expression.</p>
+<p><code>greet</code> takes a <code>[]const u8</code>, which is the type of a string (<a href="#ch11">Chapter 11</a> explains the name; read it as "text" for now), and returns <code>void</code>, meaning nothing. A <code>void</code> function has no <code>return</code> value; it just runs off the end of its body, or uses a bare <code>return;</code> to leave early.</p>
+<p>Order does not matter. <code>main</code> can call a function declared below it, because all top-level declarations in a file are visible to each other, as <a href="#ch03">Chapter 3</a> noted:</p>
+<div class="file">order.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{later(4)});
+}
+
+fn later(x: u32) u32 {
+    return x + 1;
+}</code></pre>
+<pre class="term">$ zig run order.zig
+5</pre>
+<p>Zig has no default arguments, no keyword arguments, and no overloading (two functions with the same name and different parameters). Each of these has a Zig idiom that arrives later: an options struct with default fields for the first two (<a href="#ch12">Chapter 12</a>), and <code>comptime</code> or <code>anytype</code> parameters for the third (<a href="#ch26">Chapter 26</a>).</p>
+
+<h3 id="ch07-2">7.2 Types are checked, and unused parameters are errors</h3>
+<p>Arguments must match the parameter types under the same coercion rules as assignment. Widening is free; anything else is refused:</p>
+<div class="file">wrong_type.zig</div>
+<pre><code>const std = @import("std");
+
+fn half(x: u32) u32 {
+    return x / 2;
+}
+
+pub fn main() void {
+    var tons: i64 = 55;
+    tons += 0;
+    std.debug.print("{d}\n", .{half(tons)});
+}</code></pre>
+<pre class="term">$ zig run wrong_type.zig
+wrong_type.zig:10:37: error: expected type 'u32', found 'i64'
+    std.debug.print("{d}\n", .{half(tons)});
+                                    ^~~~
+wrong_type.zig:10:37: note: unsigned 32-bit int cannot represent all possible signed 64-bit values
+wrong_type.zig:3:12: note: parameter type declared here
+fn half(x: u32) u32 {
+           ^~~</pre>
+<p>The note points at the parameter declaration, and the fix is an explicit <code>@intCast</code> at the call, or a different parameter type. As with locals, a parameter you declare and never use is an error:</p>
+<div class="file">unused_param.zig</div>
+<pre><code>const std = @import("std");
+
+fn cost(tonnage: u32, days: u32) u32 {
+    return tonnage * 100;
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{cost(55, 3)});
+}</code></pre>
+<pre class="term">$ zig run unused_param.zig
+unused_param.zig:3:23: error: unused function parameter
+fn cost(tonnage: u32, days: u32) u32 {
+                      ^~~~</pre>
+<p>Delete the parameter if it is really unnecessary, or write <code>_ = days;</code> as the first line of the body while the function is unfinished. The exercise starters do the latter.</p>
+
+<h3 id="ch07-3">7.3 Parameters are immutable</h3>
+<p>Inside a function, a parameter is a <code>const</code>. You cannot assign to it:</p>
+<div class="file">immutable.zig</div>
+<pre><code>const std = @import("std");
+
+fn addBonus(pay: i64) i64 {
+    pay += 1000;
+    return pay;
+}</code></pre>
+<pre class="term">$ zig run immutable.zig
+immutable.zig:4:5: error: cannot assign to constant
+    pay += 1000;
+    ^~~</pre>
+<p>This surprises people coming from C or JavaScript, where a parameter is a local variable you may scribble on. Zig's reason is the same as for <code>const</code> everywhere: a reader who sees <code>pay</code> in the body knows it means what the caller passed, all the way down. When you need a changeable copy, make one:</p>
+<div class="file">immutable_fix.zig</div>
+<pre><code>const std = @import("std");
+
+fn addBonus(pay: i64) i64 {
+    var result = pay;
+    result += 1000;
+    return result;
+}
+
+pub fn main() void {
+    const base: i64 = 5000;
+    std.debug.print("{d} -&gt; {d}\n", .{ base, addBonus(base) });
+}</code></pre>
+<pre class="term">$ zig run immutable_fix.zig
+5000 -&gt; 6000</pre>
+<p>The caller's <code>base</code> is untouched, because <code>addBonus</code> received a copy of the value. Zig passes arguments by value: the function gets its own copy, and nothing it does can affect the caller's variables. When a function <em>should</em> change something belonging to the caller, the caller passes a pointer, and the function changes what the pointer points at:</p>
+<div class="file">ptr_param.zig</div>
+<pre><code>const std = @import("std");
+
+fn addBonus(pay: *i64) void {
+    pay.* += 1000;
+}
+
+pub fn main() void {
+    var salary: i64 = 5000;
+    addBonus(&amp;salary);
+    std.debug.print("{d}\n", .{salary});
+}</code></pre>
+<pre class="term">$ zig run ptr_param.zig
+6000</pre>
+<p><code>*i64</code> is "a pointer to an <code>i64</code>", <code>&amp;salary</code> is the address of the caller's variable, and <code>pay.*</code> is the value at that address. The pointer itself is still immutable, but the thing it points to is not. <a href="#ch18">Chapter 18</a> covers pointers properly; the point here is that a function with a plain value parameter cannot surprise its caller, and one that takes a pointer announces in its signature that it intends to.</p>
+
+<h3 id="ch07-4">7.4 Return types</h3>
+<p>A function with a non-<code>void</code> return type must return a value on every path. Leave one out and the compiler shows you where control falls off the end:</p>
+<div class="file">missing_return.zig</div>
+<pre><code>const std = @import("std");
+
+fn sign(x: i32) i32 {
+    if (x &gt; 0) return 1;
+    if (x &lt; 0) return -1;
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{sign(5)});
+}</code></pre>
+<pre class="term">$ zig run missing_return.zig
+missing_return.zig:3:17: error: function with non-void return type 'i32' implicitly returns
+fn sign(x: i32) i32 {
+                ^~~
+missing_return.zig:6:1: note: control flow reaches end of body here
+}
+^</pre>
+<p>The fix is a final <code>return 0;</code> for the case where neither <code>if</code> fired. Zig does not let you rely on "it never happens"; if it truly cannot happen, say <code>unreachable</code>.</p>
+<p>A function can return only one value, but that value can be a struct, which is how you return several things at once:</p>
+<div class="file">multi_return.zig</div>
+<pre><code>const std = @import("std");
+
+fn divmod(a: u32, b: u32) struct { q: u32, r: u32 } {
+    return .{ .q = a / b, .r = a % b };
+}
+
+pub fn main() void {
+    const result = divmod(17, 5);
+    std.debug.print("q = {d}, r = {d}\n", .{ result.q, result.r });
+}</code></pre>
+<pre class="term">$ zig run multi_return.zig
+q = 3, r = 2</pre>
+<p>The return type <code>struct { q: u32, r: u32 }</code> is declared inline, and <code>.{ .q = …, .r = … }</code> builds one. <a href="#ch12">Chapter 12</a> gives structs their own chapter; this is just to show there is no tuple-unpacking ceremony to learn.</p>
+<p><code>void</code> is a real type, with exactly one value, and a call to a <code>void</code> function is an expression of that type. You can even bind it, though there is no reason to:</p>
+<pre class="term">$ zig run void_used.zig
+hi
+void</pre>
+<p>The practical consequence is the rule you met in <a href="#ch06">Chapter 6</a>: every non-<code>void</code> value must be used. Calling a function that returns a number and ignoring the result is an error, and the fix is to discard it explicitly with <code>_ = f();</code>. That way, a return value never gets dropped by accident.</p>
+<p>Two other return types will fill later chapters. <code>!T</code> is an error union, "a <code>T</code> or an error", which is how a function says it can fail (<a href="#ch16">Chapter 16</a>). <code>?T</code> is an optional, "a <code>T</code> or nothing", which is how it says it might have no answer (<a href="#ch15">Chapter 15</a>). You saw <code>!void</code> on <code>main</code> in <a href="#ch01">Chapter 1</a>, and <code>?usize</code> from a search loop in <a href="#ch06">Chapter 6</a>.</p>
+
+<h3 id="ch07-5">7.5 Early return</h3>
+<p><code>return</code> can appear anywhere in the body, and the usual Zig style is to deal with the simple or exceptional cases first and leave, so that the main logic is not indented inside a stack of <code>else</code> blocks.</p>
+<div class="file">early.zig</div>
+<pre><code>const std = @import("std");
+
+fn weightClass(tonnage: u32) []const u8 {
+    if (tonnage == 0) return "none";
+    if (tonnage &lt;= 35) return "light";
+    if (tonnage &lt;= 55) return "medium";
+    if (tonnage &lt;= 75) return "heavy";
+    return "assault";
+}
+
+pub fn main() void {
+    const tests = [_]u32{ 0, 20, 55, 70, 100 };
+    for (tests) |t| std.debug.print("{d}: {s}\n", .{ t, weightClass(t) });
+}</code></pre>
+<pre class="term">$ zig run early.zig
+0: none
+20: light
+55: medium
+70: heavy
+100: assault</pre>
+<p>Each line checks one boundary and returns; whatever survives all of them is an assault Mech. Written with nested <code>if … else</code> the same function is five levels deep. The <code>for</code> in <code>main</code> shows a function being called inside a loop body that is a single statement, no braces needed.</p>
+<p>A <code>void</code> function uses a bare <code>return;</code> for the same purpose:</p>
+<div class="file">void_fn.zig</div>
+<pre><code>const std = @import("std");
+
+fn report(day: u32, funds: i64) void {
+    if (funds &lt; 0) {
+        std.debug.print("day {d}: IN DEBT ({d})\n", .{ day, funds });
+        return; // leave early; nothing to return
+    }
+    std.debug.print("day {d}: {d} C-bills\n", .{ day, funds });
+}
+
+pub fn main() void {
+    report(1, 50_000);
+    report(2, -3_000);
+}</code></pre>
+<pre class="term">$ zig run void_fn.zig
+day 1: 50000 C-bills
+day 2: IN DEBT (-3000)</pre>
+
+<h3 id="ch07-6">7.6 Recursion</h3>
+<p>A function may call itself. Zig places no special restrictions on this beyond the obvious one, that each call uses some stack space, so a recursion a million levels deep will crash.</p>
+<div class="file">recursion.zig</div>
+<pre><code>const std = @import("std");
+
+fn factorial(n: u64) u64 {
+    if (n &lt;= 1) return 1;
+    return n * factorial(n - 1);
+}
+
+fn fib(n: u32) u32 {
+    if (n &lt; 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+pub fn main() void {
+    std.debug.print("10! = {d}\n", .{factorial(10)});
+    for (0..10) |i| std.debug.print("{d} ", .{fib(@intCast(i))});
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">$ zig run recursion.zig
+10! = 3628800
+0 1 1 2 3 5 8 13 21 34</pre>
+<p>Both functions have the classic shape: a base case that returns without recursing, and a recursive case that makes the problem smaller. The <code>@intCast(i)</code> in <code>main</code> is there because the range capture is a <code>usize</code> and <code>fib</code> takes a <code>u32</code>. Note that <code>factorial</code> returns <code>u64</code>; with <code>u32</code>, <code>factorial(13)</code> would overflow and panic, which is exactly the kind of thing <a href="#ch04">Chapter 4</a>'s checks exist to catch.</p>
+
+<h3 id="ch07-7">7.7 pub</h3>
+<p>By default a function is private to the file it is declared in. <code>pub</code> makes it visible to other files that <code>@import</code> this one. Within a single file the keyword changes nothing:</p>
+<div class="file">pub_test.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn visible() u32 {
+    return 1;
+}
+
+fn hidden() u32 {
+    return 2;
+}
+
+pub fn main() void {
+    std.debug.print("{d} {d}\n", .{ visible(), hidden() });
+}</code></pre>
+<pre class="term">$ zig run pub_test.zig
+1 2</pre>
+<p>That is the entire visibility system. There are no classes, no <code>private</code>/<code>protected</code>, no friend declarations. A file is a namespace, <code>pub</code> is its export list, and everything else is an implementation detail. <code>main</code> needs <code>pub</code> because the standard library imports your root file to find it. <a href="#ch30">Chapter 30</a> shows multi-file programs, where <code>pub</code> starts to matter.</p>
+
+<h3 id="ch07-8">7.8 Functions as values</h3>
+<p>A function name is a value, and a value needs a type. The type of a function taking an <code>i32</code> and returning an <code>i32</code> is written <code>fn (i32) i32</code>, and when you pass one around you normally pass a pointer to it: <code>*const fn (i32) i32</code>.</p>
+<div class="file">fn_value.zig</div>
+<pre><code>const std = @import("std");
+
+fn double(x: i32) i32 {
+    return x * 2;
+}
+
+fn square(x: i32) i32 {
+    return x * x;
+}
+
+fn applyTwice(f: *const fn (i32) i32, x: i32) i32 {
+    return f(f(x));
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{applyTwice(double, 3)});
+    std.debug.print("{d}\n", .{applyTwice(square, 3)});
+    const op = square;
+    std.debug.print("{d} {s}\n", .{ op(5), @typeName(@TypeOf(op)) });
+    const ops = [_]*const fn (i32) i32{ double, square };
+    for (ops) |f| std.debug.print("{d} ", .{f(7)});
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">$ zig run fn_value.zig
+12
+81
+25 fn (i32) i32
+14 49</pre>
+<p><code>applyTwice</code> takes a function pointer and calls it through the parameter name, exactly as if <code>f</code> were a function. Passing <code>double</code> or <code>square</code> works because a function name coerces to a pointer to that function. The <code>const op = square;</code> line shows the raw type, <code>fn (i32) i32</code>, and the array at the end holds two function pointers of the same type and calls each in a loop.</p>
+<p>This is the whole mechanism behind callbacks, sorting with a custom comparison (<code>std.mem.sort</code> takes one), and tables that map a command to its handler. It is less common in Zig than in JavaScript, because <code>comptime</code> parameters (<a href="#ch25">Chapter 25</a>) often do the same job with no pointer at all, but the plain form is the one to understand first.</p>
+
+<h3 id="ch07-9">7.9 inline and noinline</h3>
+<p>Two keywords tell the compiler how to generate a call. <code>inline fn</code> asks for the body to be copied into every caller instead of being called, and <code>noinline fn</code> forbids that.</p>
+<div class="file">inline_fn.zig</div>
+<pre><code>const std = @import("std");
+
+inline fn square(x: u32) u32 {
+    return x * x;
+}
+
+noinline fn cube(x: u32) u32 {
+    return x * x * x;
+}
+
+pub fn main() void {
+    std.debug.print("{d} {d}\n", .{ square(4), cube(4) });
+}</code></pre>
+<pre class="term">$ zig run inline_fn.zig
+16 64</pre>
+<p>The output is the same either way; the difference is in the machine code. You will almost never need either. The optimiser inlines small functions by itself in release builds, and <code>inline</code> is mostly used in the standard library for tiny wrappers and for functions that need to be evaluated at compile time. It is here so that you recognise it when you see it.</p>
+
+<h3 id="ch07-10">7.10 Preview: functions inside a struct</h3>
+<p>Functions can be declared inside a <code>struct</code>, and then they are reached through the struct's name with a dot. Even a struct with no fields is useful for this: it is a namespace.</p>
+<div class="file">ns_preview.zig</div>
+<pre><code>const std = @import("std");
+
+const Money = struct {
+    pub fn applyPercent(amount: i64, percent: i64) i64 {
+        return @divTrunc(amount * percent, 100);
+    }
+};
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{Money.applyPercent(10_000, 15)});
+}</code></pre>
+<pre class="term">$ zig run ns_preview.zig
+1500</pre>
+<p><code>Money.applyPercent</code> is just a function that happens to live inside <code>Money</code>; nothing about it is different from a top-level function. The <code>pub</code> makes it reachable from outside the struct. When a struct has fields and a function takes the struct as its first parameter, Zig lets you call it with dot syntax on a value, <code>date.next()</code>, and that is what a method is. <a href="#ch12">Chapter 12</a> builds up to it. For now, notice that <code>std.debug.print</code> has had this shape all along: <code>std</code> is a struct, <code>debug</code> is a struct inside it, and <code>print</code> is a function inside that.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The calendar type in <code>game/src/sim/clock.zig</code> shows every idea in this chapter in about twenty lines. A <code>pub fn</code> with two parameters and a <code>bool</code> return that is a single boolean expression; another that returns through a <code>switch</code>; and a third that takes the struct itself by value, copies it into a <code>var</code> because the parameter is immutable, and returns the changed copy:
+<pre><code>pub fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+}
+
+pub fn next(self: Date) Date {
+    var d = self;
+    d.day += 1;
+    if (d.day &gt; daysInMonth(d.year, d.month)) {
+        d.day = 1;
+        d.month += 1;
+        if (d.month &gt; 12) {
+            d.month = 1;
+            d.year += 1;
+        }
+    }
+    return d;
+}</code></pre>
+<code>var d = self;</code> is section 7.3's pattern exactly: the function wants to modify its input, so it makes a copy. Because <code>next</code> takes <code>self: Date</code> as its first parameter, callers write <code>date.next()</code>, and that is a method. The money function from <a href="#ch04">Chapter 4</a>, <code>applyBp</code>, is a plain <code>pub fn</code> in <code>game/src/domain/types.zig</code> that other files call as <code>types.applyBp</code>; that is <code>pub</code> at work across files.</div>
+
+<h3 id="ch07-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 7.1 · Four helpers <span class="level">warm-up</span></h4>
+  <p>Write <code>max2</code>, <code>clamp</code>, <code>isLeapYear</code> and <code>sumTo</code>. Each body is a TODO; remember that parameters cannot be reassigned. Name the file: <code>exercises/07-functions/ex1_helpers.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 07, exercise 1: small pure functions.
+//! Run with:  zig test ex1_helpers.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// The larger of two i32 values.
+fn max2(a: i32, b: i32) i32 {
+    return if (a &gt; b) a else b;
+}
+
+/// Clamp x into the range lo..hi inclusive.
+fn clamp(x: i32, lo: i32, hi: i32) i32 {
+    if (x &lt; lo) return lo;
+    if (x &gt; hi) return hi;
+    return x;
+}
+
+/// True when the year is a leap year (divisible by 4, except centuries
+/// unless divisible by 400).
+fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+}
+
+/// Sum of the integers 1..n.
+fn sumTo(n: u32) u32 {
+    var total: u32 = 0;
+    for (1..n + 1) |i| total += @intCast(i);
+    return total;
+}
+
+test "max2" {
+    try std.testing.expectEqual(@as(i32, 7), max2(3, 7));
+    try std.testing.expectEqual(@as(i32, 3), max2(3, -7));
+}
+
+test "clamp" {
+    try std.testing.expectEqual(@as(i32, 0), clamp(-5, 0, 10));
+    try std.testing.expectEqual(@as(i32, 10), clamp(50, 0, 10));
+    try std.testing.expectEqual(@as(i32, 4), clamp(4, 0, 10));
+}
+
+test "isLeapYear" {
+    try std.testing.expect(isLeapYear(2024));
+    try std.testing.expect(!isLeapYear(2023));
+    try std.testing.expect(!isLeapYear(1900));
+    try std.testing.expect(isLeapYear(2000));
+}
+
+test "sumTo" {
+    try std.testing.expectEqual(@as(u32, 0), sumTo(0));
+    try std.testing.expectEqual(@as(u32, 55), sumTo(10));
+}</code></pre>
+  <p><code>max2</code> is an <code>if</code> expression, <code>clamp</code> is two early returns, <code>isLeapYear</code> is the game's own line, and <code>sumTo</code> accumulates in a local <code>var</code> since neither <code>n</code> nor the loop capture can be modified. The <code>@intCast</code> converts the <code>usize</code> capture to <code>u32</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 7.2 · Recursion <span class="level">practice</span></h4>
+  <p>Write <code>gcd</code> by Euclid's algorithm, <code>pow</code> by repeated squaring, and <code>digitCount</code>, each as a recursive function with no loops. The doc comments spell out the recurrences. Name the file: <code>exercises/07-functions/ex2_recursion.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 07, exercise 2: recursion.
+//! Run with:  zig test ex2_recursion.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Greatest common divisor by Euclid's algorithm: gcd(a, 0) = a,
+/// otherwise gcd(b, a mod b).
+fn gcd(a: u64, b: u64) u64 {
+    if (b == 0) return a;
+    return gcd(b, a % b);
+}
+
+/// base to the power exp, by repeated squaring:
+/// pow(b, 0) = 1; even exp: pow(b*b, exp/2); odd exp: b * pow(b, exp-1).
+fn pow(base: u64, exp: u32) u64 {
+    if (exp == 0) return 1;
+    if (exp % 2 == 0) return pow(base * base, exp / 2);
+    return base * pow(base, exp - 1);
+}
+
+/// Number of decimal digits in n (0 has one digit).
+fn digitCount(n: u64) u32 {
+    if (n &lt; 10) return 1;
+    return 1 + digitCount(n / 10);
+}
+
+test "gcd" {
+    try std.testing.expectEqual(@as(u64, 6), gcd(48, 18));
+    try std.testing.expectEqual(@as(u64, 1), gcd(17, 5));
+    try std.testing.expectEqual(@as(u64, 12), gcd(12, 0));
+}
+
+test "pow" {
+    try std.testing.expectEqual(@as(u64, 1), pow(7, 0));
+    try std.testing.expectEqual(@as(u64, 1024), pow(2, 10));
+    try std.testing.expectEqual(@as(u64, 243), pow(3, 5));
+}
+
+test "digitCount" {
+    try std.testing.expectEqual(@as(u32, 1), digitCount(0));
+    try std.testing.expectEqual(@as(u32, 1), digitCount(9));
+    try std.testing.expectEqual(@as(u32, 7), digitCount(9_626_000));
+}</code></pre>
+  <p>Each function's first line is its base case. <code>pow</code> halves the exponent on even steps, so <code>pow(2, 1000)</code> takes about ten calls rather than a thousand, though its result would overflow a <code>u64</code> long before that.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 7.3 · Functions as values <span class="level">practice</span></h4>
+  <p><code>Op</code> is the type <code>*const fn (i64, i64) i64</code>. Write <code>fold</code>, which combines a list of values with an <code>Op</code> starting from a seed, and <code>opFor</code>, which maps a symbol character to one of three operations or <code>null</code>. Name the file: <code>exercises/07-functions/ex3_fn_values.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 07, exercise 3: functions as values.
+//! Run with:  zig test ex3_fn_values.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Op = *const fn (i64, i64) i64;
+
+fn add(a: i64, b: i64) i64 {
+    return a + b;
+}
+
+fn mul(a: i64, b: i64) i64 {
+    return a * b;
+}
+
+fn maxOf(a: i64, b: i64) i64 {
+    return @max(a, b);
+}
+
+/// Fold `items` with `op`, starting from `start`: op(op(op(start, a), b), c).
+fn fold(items: []const i64, start: i64, op: Op) i64 {
+    var acc = start;
+    for (items) |x| acc = op(acc, x);
+    return acc;
+}
+
+/// Pick the operation for a one-character symbol: '+' add, '*' mul, 'M' maxOf.
+fn opFor(symbol: u8) ?Op {
+    return switch (symbol) {
+        '+' =&gt; add,
+        '*' =&gt; mul,
+        'M' =&gt; maxOf,
+        else =&gt; null,
+    };
+}
+
+test "fold" {
+    const xs = [_]i64{ 2, 3, 4 };
+    try std.testing.expectEqual(@as(i64, 9), fold(&amp;xs, 0, add));
+    try std.testing.expectEqual(@as(i64, 24), fold(&amp;xs, 1, mul));
+    try std.testing.expectEqual(@as(i64, 4), fold(&amp;xs, -100, maxOf));
+    try std.testing.expectEqual(@as(i64, 5), fold(&amp;.{}, 5, add));
+}
+
+test "opFor" {
+    const xs = [_]i64{ 10, 20 };
+    const plus = opFor('+') orelse return error.NoOp;
+    try std.testing.expectEqual(@as(i64, 30), fold(&amp;xs, 0, plus));
+    const times = opFor('*') orelse return error.NoOp;
+    try std.testing.expectEqual(@as(i64, 200), fold(&amp;xs, 1, times));
+    try std.testing.expect(opFor('?') == null);
+}</code></pre>
+  <p>The <code>switch</code> in <code>opFor</code> has arms of type function-pointer and one of <code>null</code>; peer type resolution makes the whole expression a <code>?Op</code>. The test unwraps it with <code>orelse</code>, which <a href="#ch15">Chapter 15</a> introduces. <code>fold</code> is <code>reduce</code> from other languages, written with a mutable local because the parameter cannot change.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 7.4 · Early returns <span class="level">practice</span></h4>
+  <p>Write <code>contractPay</code> and <code>condition</code> using early returns and no <code>else</code> branches, following the rules in their doc comments. Name the file: <code>exercises/07-functions/ex4_early_return.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 07, exercise 4: early returns instead of nested ifs.
+//! Run with:  zig test ex4_early_return.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Contract pay after adjustments, in C-bills:
+///   - a base of 1000 per ton of the force
+///   - zero if tonnage is zero (nothing to hire)
+///   - doubled when the contract is a raid
+///   - then a 10 percent bonus if reputation is 8 or more
+/// Write it with early returns and no else branches.
+fn contractPay(tonnage: u32, is_raid: bool, reputation: u8) u32 {
+    if (tonnage == 0) return 0;
+    var pay: u32 = tonnage * 1000;
+    if (is_raid) pay *= 2;
+    if (reputation &lt; 8) return pay;
+    return pay + pay / 10;
+}
+
+/// Describe a pilot's condition from wounds and fatigue:
+/// "dead" when wounds &gt;= 6, "hospitalised" when wounds &gt;= 3,
+/// "exhausted" when fatigue &gt;= 80, otherwise "fit".
+fn condition(wounds: u8, fatigue: u8) []const u8 {
+    if (wounds &gt;= 6) return "dead";
+    if (wounds &gt;= 3) return "hospitalised";
+    if (fatigue &gt;= 80) return "exhausted";
+    return "fit";
+}
+
+test "contractPay" {
+    try std.testing.expectEqual(@as(u32, 0), contractPay(0, true, 10));
+    try std.testing.expectEqual(@as(u32, 100_000), contractPay(100, false, 5));
+    try std.testing.expectEqual(@as(u32, 200_000), contractPay(100, true, 5));
+    try std.testing.expectEqual(@as(u32, 220_000), contractPay(100, true, 8));
+}
+
+test "condition" {
+    try std.testing.expectEqualStrings("dead", condition(6, 0));
+    try std.testing.expectEqualStrings("hospitalised", condition(3, 100));
+    try std.testing.expectEqualStrings("exhausted", condition(2, 80));
+    try std.testing.expectEqualStrings("fit", condition(2, 79));
+}</code></pre>
+  <p>The order of the checks is part of the specification: a pilot with six wounds is dead even at zero fatigue, so the wound checks come first. In <code>contractPay</code>, the tonnage check leaves before any arithmetic, and the reputation check returns the undecorated pay so that the bonus line only runs for the case that earns it.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 7.5 · A namespace of functions <span class="level">challenge</span></h4>
+  <p>Add three functions inside the <code>Money</code> struct so that the tests can call <code>Money.applyBp</code>, <code>Money.markup</code> and <code>Money.share</code>. <code>markup</code> must call <code>applyBp</code>. The struct already holds a constant, <code>bp_one</code>, that you should use. Name the file: <code>exercises/07-functions/ex5_namespace.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 07, exercise 5: functions grouped in a struct namespace.
+//! Run with:  zig test ex5_namespace.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Money helpers, grouped under one name. Chapter 12 covers structs fully;
+/// here the struct has no fields and only holds functions.
+const Money = struct {
+    pub const bp_one: i64 = 10_000;
+
+    /// Scale by basis points, rounding toward zero.
+    pub fn applyBp(amount: i64, bp: i64) i64 {
+        return @divTrunc(amount * bp, bp_one);
+    }
+
+    /// Ten percent markup.
+    pub fn markup(amount: i64) i64 {
+        return applyBp(amount, 11_000);
+    }
+
+    /// Split evenly between `shares` people; the remainder is lost.
+    pub fn share(amount: i64, shares: i64) i64 {
+        return @divTrunc(amount, shares);
+    }
+};
+
+test "Money.applyBp" {
+    try std.testing.expectEqual(@as(i64, 1_500), Money.applyBp(1_000, 15_000));
+    try std.testing.expectEqual(@as(i64, -15), Money.applyBp(-100, 1_500));
+}
+
+test "Money.markup" {
+    try std.testing.expectEqual(@as(i64, 1_100), Money.markup(1_000));
+}
+
+test "Money.share" {
+    try std.testing.expectEqual(@as(i64, 333), Money.share(1_000, 3));
+    try std.testing.expectEqual(@as(i64, 250), Money.share(1_000, 4));
+}</code></pre>
+  <p>Inside the struct, <code>markup</code> can call <code>applyBp</code> by its bare name, because they share a namespace; outside, both are reached as <code>Money.something</code>. <code>@divTrunc</code> is required because the values are signed; plain <code>/</code> would be a compile error here, as <a href="#ch04">Chapter 4</a> showed.</p></details>
+</div>
+
+<h3 id="ch07-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Can a function change the value of its parameter? <details class="answer"><summary>Answer</summary>No; parameters are immutable. Copy it into a local <code>var</code>, or take a pointer if the caller's variable should change.</details></li>
+  <li>What happens if a function with return type <code>i32</code> has a path that reaches the end of its body without <code>return</code>? <details class="answer"><summary>Answer</summary>A compile error: "function with non-void return type 'i32' implicitly returns", with a note showing where control reaches the end.</details></li>
+  <li>How do you call a function that returns a value when you do not care about the value? <details class="answer"><summary>Answer</summary>Discard it explicitly: <code>_ = f();</code>. Ignoring a non-void value is an error.</details></li>
+  <li>What is the type of a pointer to a function that takes two <code>i64</code>s and returns an <code>i64</code>? <details class="answer"><summary>Answer</summary><code>*const fn (i64, i64) i64</code>.</details></li>
+  <li>What does <code>pub</code> do on a function, and when does it matter? <details class="answer"><summary>Answer</summary>It makes the function visible to files that import this one. Within a single file it changes nothing; <code>main</code> needs it because the standard library imports your file.</details></li>
+  <li>Does Zig have default arguments or function overloading? <details class="answer"><summary>Answer</summary>No. Options structs with default fields replace default arguments; <code>comptime</code> and <code>anytype</code> parameters replace overloading.</details></li>
+  <li>Why does <code>main</code> get to call a function declared below it in the file? <details class="answer"><summary>Answer</summary>Top-level declarations in a file are all visible to each other regardless of order.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>fn name(params) ReturnType { }</code>; every parameter is typed; arguments are copied; the call site must match types under coercion rules.</li>
+<li>Parameters are immutable: copy into a <code>var</code>, or take a pointer when the caller's value should change. Unused parameters are errors.</li>
+<li>Non-<code>void</code> functions must return on every path; non-<code>void</code> results must be used or discarded with <code>_ =</code>; several values come back as a struct.</li>
+<li>Early return keeps functions flat; recursion needs a base case and enough stack.</li>
+<li><code>pub</code> exports a function to importing files; that is the whole visibility system.</li>
+<li>A function name is a value of type <code>fn (…) T</code>, passed as <code>*const fn (…) T</code>; <code>inline</code> and <code>noinline</code> are hints you rarely need.</li>
+<li>Functions inside a struct are reached as <code>Struct.fn</code>; with a <code>self</code> parameter they become methods (<a href="#ch12">Chapter 12</a>).</li>
+</ul></div>
+</section>

@@ -1,0 +1,160 @@
+<section id="ch50">
+<h2>50. One keypress, end to end</h2>
+<p class="goals"><strong>In this chapter</strong> you follow a single keypress through every layer you have read: from a byte on a file descriptor, through the client's dispatch, into a command, through validation and mutation, back out as a result, onto the screen through a query, and (not yet) into the save file. Nothing new is introduced; the point is to see the parts you know as one motion, and then to test each layer alone.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> This chapter is a synthesis of <a href="#ch42">Chapter 42</a> (the <code>crew_company</code> arm), <a href="#ch44">Chapter 44</a> (the <code>manning</code> query), <a href="#ch45">Chapter 45</a> (a signing bonus through <code>postTreasury</code>) and <a href="#ch48">Chapter 48</a> (<code>readKey</code>, <code>handleKey</code>, <code>draw</code>). If any of those is hazy, this chapter will show you which.</div>
+
+<h3 id="ch50-1">50.1 The setup</h3>
+<p>Start the client (<code>zig build run -- --tui</code>), load or create a campaign, press <code>F3</code> for the Forces screen, and put the cursor on a company row. The manning pane on the right (cycle to it with <code>r</code> if it shows damage) lists fourteen roles with <code>have</code>, <code>need</code> and <code>open</code> columns. Some lines are red: the company is short of astechs, or medics, or a mechanic. Press <code>c</code>.</p>
+<p>Here is everything that happens, layer by layer, with the source for each.</p>
+
+<h3 id="ch50-2">50.2 Bytes</h3>
+<p>The loop in <code>App.run</code> is waiting in <code>self.term.readKey(500)</code>. The terminal is in raw mode, so the byte <code>0x63</code> arrives immediately rather than after Enter. <code>fill</code> polls the file descriptor, reads into the 64-byte pending buffer, and <code>take</code> hands over the first byte:</p>
+<pre><code>        return switch (b) {
+            0x1b =&gt; self.readEscape(),
+            '\r', '\n' =&gt; .enter,
+            '\t' =&gt; .tab,
+            0x7f, 0x08 =&gt; .backspace,
+            1...7, 11, 12, 14...26 =&gt; .{ .ctrl = 'a' + b - 1 },
+            else =&gt; self.readUtf8(b),
+        };</code></pre>
+<p><code>0x63</code> is not an escape, not a control byte; <code>readUtf8</code> sees a one-byte sequence and returns <code>.{ .char = 'c' }</code>. The <code>Key</code> union value goes back to the loop, which resets the frame arena and calls <code>self.handleKey(key)</code>.</p>
+
+<h3 id="ch50-3">50.3 Dispatch</h3>
+<p>Four switches deep. <code>handleKey</code>: no modal is open, so it switches on mode and finds <code>.game</code>. <code>handleGameKey</code>: the key is <code>.char</code>, and <code>'c'</code> is not one of the global keys (<code>:</code>, <code>n</code>, <code>q</code>, <code>?</code>, digits), so it falls to <code>screenKey(ch)</code>. <code>screenKey</code> switches on <code>self.tab</code> and finds <code>.forces</code>. The Forces arm has already fetched the screen's rows for this frame and computed <code>row</code>, the <code>ToeRow</code> under the cursor, with its <code>force</code> ID:</p>
+<pre><code>                    'c' =&gt; if (row) |r| {
+                        const co = g.companyOf(r.force);
+                        if (co != .none) {
+                            const res = game.commands.execute(g, .{ .crew_company = co }) catch |err| {
+                                self.say(.crit, "{s}", .{game.cli.errorText(err)});
+                                return;
+                            };
+                            self.say(if (res.still_open == 0) .good else .amber, "{s}: {d} hired to fill the manning table · {d} lines still open (no candidates on the boards yet)", .{ q.forceName(g, co), res.hired_count, res.still_open });
+                        }
+                    },</code></pre>
+<p><code>g.companyOf(r.force)</code> resolves whatever the cursor is on (a lance, a hull inside a lance, the company itself) to its company; a row outside any company yields <code>.none</code> and the key does nothing. Then the client builds the command value <code>.{ .crew_company = co }</code> and calls <code>execute</code>. This arm calls <code>execute</code> directly rather than through <code>self.exec</code> because it wants the <code>Result</code>; the shape of the error handling is the same.</p>
+
+<h3 id="ch50-4">50.4 Validate</h3>
+<p>Inside <code>execute</code>, the <code>.crew_company</code> arm (<a href="#ch42">Chapter 42</a>) checks three things before touching anything:</p>
+<pre><code>            const f = gs.force(company) orelse return Error.UnknownForce;
+            if (f.echelon != .company) return Error.NotACompany;
+            if (gs.deploymentContract(company) != null) return Error.CompanyDeployed;</code></pre>
+<p>The force must exist, must be a company (not a lance or a battalion), and must not be deployed on a contract, because hiring happens at an HQ's hall and a company in the field is light-years away. Any refusal returns a named error, and the client's <code>catch</code> turns it into a red sentence from <code>cli.errorText</code>: "that company is deployed — hire at an HQ hall and <code>xfer person &lt;id&gt; co:N</code> to send people out to it".</p>
+
+<h3 id="ch50-5">50.5 Mutate</h3>
+<p>With the checks passed, the arm asks <code>personnel.manningNeeds(gs, company)</code> for the fourteen-row table: a role, a need and a reason for each, derived from the company's hulls (a mek wants a mekwarrior and a share of a tech and astechs; a MASH truck wants a doctor and medics). For each row it compares <code>need</code> against <code>manningHave</code> and fills the gap:</p>
+<pre><code>            for (personnel.manningNeeds(gs, company)) |n| {
+                var have = personnel.manningHave(gs, company, n.role);
+                while (have &lt; n.need) : (have += 1) {
+                    if (personnel.isPooledRole(n.role)) {
+                        // MekHQ hires astechs and medics to complement on
+                        // demand: no market, no signing bonus, salary only.
+                        const spec = person_gen.generateWithBonus(&amp;gs.rng, n.role, gs.recruitBonus());
+                        const id = try gs.hireFromSpec(spec);
+                        gs.person(id).?.assigned_force = company;
+                        hired += 1;
+                    } else if (try hireRoleFromHall(gs, n.role, company)) {
+                        hired += 1;
+                    } else {
+                        still_open += n.need - have;
+                        break;
+                    }
+                }
+            }
+            _ = try gs.autoAssign(company);
+            try gs.log(.decision, .{ .company = company }, "[raise] {s}: {d} hired to fill the manning table ({d} still open — the halls had nobody)", .{ f.name, hired, still_open });</code></pre>
+<p>Two paths. Astechs and medics are <em>pooled roles</em>: generated on the spot from the <code>.generation</code> stream (so the same seed produces the same people) and hired by <code>hireFromSpec</code>, which mints a <code>PersonId</code>, builds the <code>Person</code> on the arena and inserts it into the ordered map. Every other role comes from the hiring hall's candidates via <code>hireRoleFromHall</code>, which finds the first candidate of that role and runs the <code>.hire_candidate</code> command, and <em>that</em> arm debits the signing bonus through <code>postTreasury</code> (<a href="#ch45">Chapter 45</a>), one ledger entry and one balance change. When the hall has nobody of a role, the gap is counted in <code>still_open</code> and the loop moves to the next row. Finally <code>autoAssign</code> seats pilots and techs on the company's hulls, and a log line is written with the company tag so the Desk's log can filter it.</p>
+<p>Notice what the arm never does: it never allocates from anything but the campaign arena, never reads the clock except through <code>gs.clock</code>, never rolls a die except through <code>gs.rng</code>, and never touches the terminal. It is a pure function of the state and the command, which is the property <a href="#ch49">Chapter 49</a> tests.</p>
+
+<h3 id="ch50-6">50.6 Report</h3>
+<pre><code>            return .{ .hired_count = hired, .still_open = still_open };</code></pre>
+<p>Two numbers in a <code>Result</code> whose other fields keep their defaults. Back in the client, <code>self.say</code> formats them into one sentence with a style chosen by whether anything is still open: green for "5 hired to fill the manning table · 0 lines still open", amber if the hall could not supply everyone. <code>say</code> writes into a fixed 128-byte buffer with <code>bufPrint</code> (<a href="#ch23">Chapter 23</a>) and stores the style; the status strip draws it on the next frame.</p>
+
+<h3 id="ch50-7">50.7 Redraw</h3>
+<p>The loop comes round. <code>draw</code> resets the frame arena, clears the grid, and <code>drawForces</code> calls <code>queries.toeFiltered</code> for the tree and <code>queries.manning</code> for the pane:</p>
+<pre><code>    for (needs) |n| {
+        const have = personnel.manningHave(gs, company, n.role);
+        const open = n.need -| have;
+        // …
+        try out.append(alloc, .{ .role = n.role, .have = have, .need = n.need, .text = try std.fmt.allocPrint(alloc,
+            "{s: &lt;16} {d: &gt;5} {d: &gt;5} {s}{d: &gt;5}{{/}}   {{d}}{s}{{/}}",
+            .{ @tagName(n.role), have, n.need, if (open &gt; 0) "{c}" else "{g}", open, why }) });
+    }</code></pre>
+<p>The rows that were red are green, because <code>manningHave</code> recomputed from the people map that now has new entries in it. Nothing was cached and nothing was told to update: the query reads state, the screen draws the query. The tech-hours line above the table changed too, because the new astechs add hours. <code>screen.flush</code> emits the frame, and the terminal shows it.</p>
+
+<h3 id="ch50-8">50.8 Persist</h3>
+<p>Nothing yet. Saving is its own action (<code>:save</code>, or the save-and-return choice on <code>q</code>), and when it runs, the new people are rows in the <code>person</code> table like any other: one <code>bindAll</code> each, in map order, with <code>ord</code> recording their place (<a href="#ch47">Chapter 47</a>). If the player quits without saving, the arena is freed by <code>gs.deinit()</code> and the hires never happened.</p>
+
+<h3 id="ch50-9">50.9 Every layer alone</h3>
+<p>The reason to trace a keypress is to see that each layer can be exercised without the others, and the project does:</p>
+<ul>
+<li>The <strong>command</strong> has a test with a seeded hall ("12: a raised company is an empty skeleton; hulls bought for it land in a lance …; halls crew it" in <code>commands.zig</code>), which runs <code>.crew_company</code> and asserts on the roster.</li>
+<li>The <strong>query</strong> has a test on a generated company ("manning matches the starter generator's ratios" in <code>queries.zig</code>), which checks the fourteen rows against the generator's own numbers.</li>
+<li>The <strong>parser</strong> has a test that <code>crew co:1</code> becomes <code>.{ .crew_company = 1 }</code>, since the same command is reachable by typing.</li>
+<li>The <strong>client</strong> is covered by <code>docs/tui_smoke.py</code>, which presses <code>c</code> on the Forces screen and looks for "hired to fill the manning table" in the output.</li>
+<li>The <strong>persistence</strong> of the result is covered by the round-trip test, which hires people and compares hashes across a save.</li>
+</ul>
+<p>Every layer is visible in the text, and none of them needs the others to be tested. That is what the architecture buys, and it is why the whole program can be read the way you have just read it.</p>
+
+<h3 id="ch50-reading">Guided reading</h3>
+<ol>
+<li><code>src/tui/term.zig</code>: <code>readKey</code> and <code>readUtf8</code> once more, with the byte <code>0x63</code> in mind.</li>
+<li><code>src/tui/app.zig</code>: <code>run</code>, <code>handleKey</code>, <code>handleGameKey</code>, then the Forces arm of <code>screenKey</code> from where <code>row</code> is computed to the <code>'c'</code> case. Then <code>say</code> and <code>drawForces</code>.</li>
+<li><code>src/sim/commands.zig</code>: the <code>.crew_company</code> arm, <code>hireRoleFromHall</code>, and the <code>.hire_candidate</code> arm it calls.</li>
+<li><code>src/sim/personnel.zig</code>: <code>Need</code>, <code>isPooledRole</code>, <code>manningNeeds</code>, <code>manningHave</code>.</li>
+<li><code>src/sim/state.zig</code>: <code>hireFromSpec</code> and <code>autoAssign</code>.</li>
+<li><code>src/sim/queries.zig</code>: <code>manning</code> and <code>toeFiltered</code>.</li>
+</ol>
+
+<h3 id="ch50-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 50.1 · The command alone <span class="level">practice</span></h4>
+<p>Write a test in <code>commands.zig</code> that creates a commander and a company, runs <code>crew_company</code> twice, and asserts that the second run hires nobody and reports the same number of open lines as the first. Then assert that crewing <code>ForceId.none</code> is refused, and say which error.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "crewing a company twice hires nobody the second time" {
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 11 });
+    defer gs.deinit();
+    _ = try execute(&amp;gs, .{ .create_commander = .{ .name = "T", .origin = .LC, .profession = .paymaster } });
+    const co = (try execute(&amp;gs, .{ .new_company = "Alpha" })).created_force;
+    const first = try execute(&amp;gs, .{ .crew_company = co });
+    const second = try execute(&amp;gs, .{ .crew_company = co });
+    try std.testing.expectEqual(@as(u32, 0), second.hired_count);
+    try std.testing.expectEqual(first.still_open, second.still_open);
+    try std.testing.expectError(Error.UnknownForce, execute(&amp;gs, .{ .crew_company = .none }));
+}</code></pre>
+<p>The second run finds <code>have >= need</code> on every row the first run filled, and the same halls empty for the rows it could not, so the counts match. <code>.none</code> fails the first check, <code>gs.force(company) orelse return Error.UnknownForce</code>, before the echelon check can say <code>NotACompany</code>; the order of validations decides which error a caller sees, which is worth knowing when you write <code>errorText</code> entries.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 50.2 · The parser alone <span class="level">warm-up</span></h4>
+<p>Write a test in <code>cli.zig</code> that parses <code>crew co:1</code> and checks the resulting command's payload is force 1. (If you did Exercise 42.1, add a line for your <code>morale</code> verb.)</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "crew parses to the company it names" {
+    var it = std.mem.tokenizeScalar(u8, "co:1", ' ');
+    const cmd = (try parseCommand("crew", &amp;it)).?;
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(cmd.crew_company));
+}</code></pre>
+<p><code>parseSite</code> turns <code>co:1</code> into a <code>Site</code> union and the <code>crew</code> branch takes its company. The <code>.?</code> unwraps the optional (a known verb never returns null) and <code>cmd.crew_company</code> reads the payload, which is a compile error if the tag were something else, since the tag is only checked at runtime; in a test that is fine because a wrong tag panics and fails the test.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 50.3 · Trace a different key <span class="level">practice</span></h4>
+<p>Repeat the seven steps for the <code>A</code> key on the same screen (auto-assign). Which steps are identical, which differ, and which query redraws differently afterwards?</p>
+<details class="answer"><summary>Solution</summary>
+<p>Bytes (<code>0x41</code> becomes <code>.{ .char = 'A' }</code>) and dispatch are identical down to the Forces arm. The command is <code>.{ .auto_assign = co }</code>, sent through <code>self.exec</code> because the handler does not need the result. Validation is the arm's own (the force must exist and be a company). Mutation is <code>gs.autoAssign(company)</code> alone: no hiring, no money, so nothing goes through <code>postTreasury</code>. Report is a plain "auto-assigned Alpha" in green. Redraw: the TO&amp;E tree (<code>toeFiltered</code>) changes, because seats now show pilots and techs, while the manning pane's <code>have</code> counts do not change, since assignment moves people between seats rather than onto the payroll. Persist: nothing, as before.</p></details>
+</div>
+
+<h3 id="ch50-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>Why does the byte <code>0x63</code> become a key immediately, without Enter? <details class="answer"><summary>Answer</summary>The terminal is in raw mode (<code>ICANON</code> off), so bytes are delivered as typed rather than line by line.</details></li>
+<li>Where does the client learn which company the cursor is on? <details class="answer"><summary>Answer</summary>From the <code>ToeRow</code> the Forces query returned for this frame; its <code>force</code> field is resolved to a company with <code>companyOf</code>. It never counts rows.</details></li>
+<li>Which of the three validations would a deployed company fail, and what does the user see? <details class="answer"><summary>Answer</summary><code>gs.deploymentContract(company) != null</code>, returning <code>Error.CompanyDeployed</code>; the status line shows the sentence <code>errorText</code> maps it to.</details></li>
+<li>Where does the signing bonus for a hall hire get debited? <details class="answer"><summary>Answer</summary>Not in the <code>crew_company</code> arm: <code>hireRoleFromHall</code> runs the <code>.hire_candidate</code> command, whose arm posts the bonus through <code>postTreasury</code>.</details></li>
+<li>Why do the manning rows turn green on the next frame? <details class="answer"><summary>Answer</summary>Because <code>queries.manning</code> recomputes <code>have</code> from the people map every frame; there is no cache to invalidate.</details></li>
+<li>Is anything written to disk by this keypress? <details class="answer"><summary>Answer</summary>No. Saving is a separate action; until then the hires exist only in the campaign arena.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A keypress is: a byte decoded to a <code>Key</code>, four switches of dispatch, a <code>Command</code> value, validate-mutate-report inside <code>execute</code>, a sentence in the status line, and a redraw that recomputes everything from state.</li>
+<li>Pooled roles are generated from the seeded stream; other roles come from the hall via the <code>hire_candidate</code> command, which is where money moves.</li>
+<li>Nothing is cached and nothing is written to disk until the player saves.</li>
+<li>Each layer has its own test: the command, the query, the parser, the client under a pseudo-terminal, and the round trip.</li>
+</ul></div>
+</section>

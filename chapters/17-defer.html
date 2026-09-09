@@ -1,0 +1,509 @@
+<section id="ch17">
+<h2>17. defer, errdefer and cleanup</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn Zig's answer to "make sure this gets cleaned up": the <code>defer</code> statement, which runs when the enclosing block ends, and its sibling <code>errdefer</code>, which runs only when the block ends with an error. You will see the exact order they run in, the classic resource pairs they protect, and the two things a <code>defer</code> is not allowed to do.</p>
+
+<h3 id="ch17-1">17.1 The cleanup problem</h3>
+<p>Almost every resource comes in a pair. You open a file and must close it. You allocate memory and must free it. You lock a mutex and must unlock it. You begin a database transaction and must commit or roll it back. The first half is easy: it happens where you need the resource. The second half is where bugs live, because a function can leave in more ways than one. An early <code>return</code>, a <code>try</code> that fails, a <code>break</code> out of a loop: each is a path that has to remember the cleanup.</p>
+<p>Languages solve this differently. Python has <code>with</code>, Java has try-with-resources, C++ runs destructors when a variable goes out of scope, Go has <code>defer</code>. Zig has <code>defer</code> too, but scoped to the block rather than the function, and it comes with a variant that only fires on failure. Together they let you write the cleanup on the line right after the setup, where you cannot forget it, and then stop thinking about it.</p>
+
+<h3 id="ch17-2">17.2 <code>defer</code> runs at the end of the block</h3>
+<p class="file">def1.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    std.debug.print(&quot;open the hangar\n&quot;, .{});
+    defer std.debug.print(&quot;close the hangar\n&quot;, .{});
+
+    std.debug.print(&quot;power up the mech\n&quot;, .{});
+    defer std.debug.print(&quot;power down the mech\n&quot;, .{});
+
+    std.debug.print(&quot;run the mission\n&quot;, .{});
+}</code></pre>
+<pre class="term">open the hangar
+power up the mech
+run the mission
+power down the mech
+close the hangar</pre>
+<p><code>defer statement;</code> means "do not run this now; run it when the surrounding block is about to end". The block here is <code>main</code>'s body, so both deferred prints run after "run the mission". Notice the order: the mech powers down before the hangar closes. Deferred statements run in <em>reverse</em> order of registration, last in, first out. That is not an accident. If setup happens in the order A then B, cleanup should happen B then A, because B may depend on A still being there. The mech needs the hangar around it to power down inside; the file needs the directory open to be closed. You get the right order for free by writing each cleanup directly after its setup.</p>
+<p class="file">def2.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    defer std.debug.print(&quot;1st defer registered, runs last\n&quot;, .{});
+    defer std.debug.print(&quot;2nd defer registered, runs second\n&quot;, .{});
+    defer std.debug.print(&quot;3rd defer registered, runs first\n&quot;, .{});
+    std.debug.print(&quot;body done\n&quot;, .{});
+}</code></pre>
+<pre class="term">body done
+3rd defer registered, runs first
+2nd defer registered, runs second
+1st defer registered, runs last</pre>
+<p>One more detail worth seeing once: a deferred statement is evaluated when it <em>runs</em>, not when it is registered. If it mentions a variable, it sees the variable's final value.</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var x: u32 = 1;
+    defer std.debug.print(&quot;defer sees x = {d}\n&quot;, .{x});
+    x = 2;
+    std.debug.print(&quot;body sets x = {d}\n&quot;, .{x});
+}</code></pre>
+<pre class="term">body sets x = 2
+defer sees x = 2</pre>
+
+<h3 id="ch17-3">17.3 The scope is the block, not the function</h3>
+<p>This is the point where Zig differs from Go, and the one to get right early. A <code>defer</code> belongs to the innermost block it appears in: a function body, but also a bare <code>{ … }</code> block, an <code>if</code> body, or a loop body. It runs when <em>that</em> block exits.</p>
+<p class="file">def3.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    std.debug.print(&quot;start of main\n&quot;, .{});
+    {
+        defer std.debug.print(&quot;  leaving the inner block\n&quot;, .{});
+        std.debug.print(&quot;  inside the inner block\n&quot;, .{});
+    }
+    std.debug.print(&quot;back in main, block already cleaned up\n&quot;, .{});
+
+    var i: u32 = 0;
+    while (i &lt; 3) : (i += 1) {
+        defer std.debug.print(&quot;  end of iteration {d}\n&quot;, .{i});
+        std.debug.print(&quot;  iteration {d}\n&quot;, .{i});
+    }
+    std.debug.print(&quot;end of main\n&quot;, .{});
+}</code></pre>
+<pre class="term">start of main
+  inside the inner block
+  leaving the inner block
+back in main, block already cleaned up
+  iteration 0
+  end of iteration 0
+  iteration 1
+  end of iteration 1
+  iteration 2
+  end of iteration 2
+end of main</pre>
+<p>The defer inside the bare block ran before "back in main". The defer inside the loop body ran at the end of <em>every</em> iteration, not once at the end of <code>main</code>. This is nearly always what you want: if you open a file per iteration, you want it closed per iteration. It is also the source of the one real trap with <code>defer</code>, in section 17.7.</p>
+
+<h3 id="ch17-4">17.4 <code>errdefer</code>: only on the failure path</h3>
+<p>Sometimes cleanup should happen only if things went wrong. You began a transaction: on success you commit and keep the changes; on failure you roll back. You allocated a struct and are filling it in: on success you hand it to the caller, who now owns it; on failure you must free it yourself, because the caller will never see it. <code>errdefer</code> registers a statement that runs only when the block exits by returning an error.</p>
+<p class="file">def4.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn work(fail: bool) !void {
+    std.debug.print(&quot;  BEGIN\n&quot;, .{});
+    errdefer std.debug.print(&quot;  ROLLBACK (errdefer)\n&quot;, .{});
+    defer std.debug.print(&quot;  cleanup (defer, always)\n&quot;, .{});
+
+    if (fail) return error.Boom;
+    std.debug.print(&quot;  COMMIT\n&quot;, .{});
+}
+
+pub fn main() void {
+    std.debug.print(&quot;success path:\n&quot;, .{});
+    work(false) catch {};
+    std.debug.print(&quot;failure path:\n&quot;, .{});
+    work(true) catch |err| std.debug.print(&quot;  caller saw {s}\n&quot;, .{@errorName(err)});
+}</code></pre>
+<pre class="term">success path:
+  BEGIN
+  COMMIT
+  cleanup (defer, always)
+failure path:
+  BEGIN
+  cleanup (defer, always)
+  ROLLBACK (errdefer)
+  caller saw Boom</pre>
+<p>Read the failure path carefully. Both deferred statements were registered, <code>errdefer</code> first and <code>defer</code> second. On the way out they run in reverse: the <code>defer</code> cleanup, then the <code>errdefer</code> rollback. On the success path the <code>errdefer</code> is silently skipped. "Exits with an error" means specifically that the block's function returns an error value: a <code>return error.X</code>, or a <code>try</code> that fails. A normal <code>return</code>, even of a value the caller might consider bad, does not trigger it.</p>
+<p>You can capture the error that is escaping, which is useful for logging:</p>
+<p class="file">def5.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn load(name: []const u8) !u32 {
+    errdefer |err| std.debug.print(&quot;load(&#x27;{s}&#x27;) failed: {s}\n&quot;, .{ name, @errorName(err) });
+    if (name.len == 0) return error.EmptyName;
+    if (name[0] == &#x27;#&#x27;) return error.BadName;
+    return @intCast(name.len);
+}
+
+pub fn main() void {
+    _ = load(&quot;alpha&quot;) catch {};
+    _ = load(&quot;&quot;) catch {};
+    _ = load(&quot;#x&quot;) catch {};
+}</code></pre>
+<pre class="term">load(&#x27;&#x27;) failed: EmptyName
+load(&#x27;#x&#x27;) failed: BadName</pre>
+<p>The successful call to <code>load("alpha")</code> printed nothing, because its <code>errdefer</code> never ran.</p>
+
+<h3 id="ch17-5">17.5 The constructor pattern</h3>
+<p>The most important use of <code>errdefer</code> is in functions that build something out of several allocations. Suppose the first allocation succeeds and the second fails. The function returns an error; the caller receives nothing and so cannot free anything. Unless the function itself frees the first allocation on the way out, it leaks. The rule is: <em>after each step that acquires something, add an <code>errdefer</code> that releases it</em>. Then any later failure unwinds everything acquired so far, in reverse order, and the success path hands the whole thing to the caller intact.</p>
+<p class="file">def6.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Pilot = struct { name: []const u8, skill: u8 };
+
+/// Builds a pilot on the heap. If anything after the allocation fails,
+/// the errdefer gives the memory back so the caller has nothing to clean.
+fn makePilot(a: std.mem.Allocator, name: []const u8, skill: u8) !*Pilot {
+    const p = try a.create(Pilot);
+    errdefer a.destroy(p);
+
+    if (skill &gt; 8) return error.SkillOutOfRange;
+    p.* = .{ .name = name, .skill = skill };
+    return p;
+}
+
+test &quot;makePilot cleans up after itself on failure&quot; {
+    const a = std.testing.allocator;
+
+    const ok = try makePilot(a, &quot;Ada&quot;, 4);
+    defer a.destroy(ok);
+    try std.testing.expectEqualStrings(&quot;Ada&quot;, ok.name);
+
+    // No leak here: errdefer destroyed the half-built pilot.
+    try std.testing.expectError(error.SkillOutOfRange, makePilot(a, &quot;Bo&quot;, 9));
+}</code></pre>
+<pre class="term">1/1 def6.test.makePilot cleans up after itself on failure...OK
+All 1 tests passed.</pre>
+<p>The test uses <code>std.testing.allocator</code>, which fails the test if any allocation is not freed by the end. Remove the <code>errdefer</code> line and run it again: the second call leaks the half-built pilot and the test reports it. (<a href="#ch19">Chapter 19</a> shows that report in full.) Here is a slightly harder version, where a loop acquires several things and the <code>errdefer</code> has to release however many were done:</p>
+<p class="file">def7.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn buildRoster(a: std.mem.Allocator, count: usize) ![][]u8 {
+    const roster = try a.alloc([]u8, count);
+    errdefer a.free(roster);
+
+    var built: usize = 0;
+    errdefer for (roster[0..built]) |name| a.free(name);
+
+    for (roster, 0..) |*slot, i| {
+        if (i == 3) return error.Simulated; // fail part way through
+        slot.* = try std.fmt.allocPrint(a, &quot;pilot-{d}&quot;, .{i});
+        built += 1;
+    }
+    return roster;
+}
+
+test &quot;partial failure frees everything built so far&quot; {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.Simulated, buildRoster(a, 5));
+
+    const r = try buildRoster(a, 2);
+    defer {
+        for (r) |name| a.free(name);
+        a.free(r);
+    }
+    try std.testing.expectEqualStrings(&quot;pilot-1&quot;, r[1]);
+}</code></pre>
+<pre class="term">1/1 def7.test.partial failure frees everything built so far...OK
+All 1 tests passed.</pre>
+<p>The counter <code>built</code> is read by the <code>errdefer</code> at the moment it runs, not when it was registered, so it sees how far the loop got. This is the same "evaluated late" behaviour from section 17.2, doing useful work. Also notice the order: the <code>errdefer</code> that frees the names was registered second, so it runs first, before the one that frees the outer slice it reads from.</p>
+
+<h3 id="ch17-6">17.6 The classic pairs</h3>
+<p>Once you see resources as pairs, <code>defer</code> becomes a habit: write the acquire, immediately write <code>defer release</code>, and move on. Here are three real pairs in one program, using the 0.16 standard library.</p>
+<p class="file">def10.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const a = init.gpa;
+
+    // Pair 1: alloc / free
+    const buf = try a.alloc(u8, 16);
+    defer a.free(buf);
+
+    // Pair 2: lock / unlock
+    var mutex: std.Io.Mutex = .init;
+    try mutex.lock(io);
+    defer mutex.unlock(io);
+
+    // Pair 3: open / close, on a real file
+    var dir = std.Io.Dir.cwd();
+    var file = try dir.createFile(io, &quot;def10_out.txt&quot;, .{});
+    defer file.close(io);
+
+    @memset(buf, &#x27;=&#x27;);
+    var wb: [64]u8 = undefined;
+    var w = file.writer(io, &amp;wb);
+    try w.interface.print(&quot;{s}\n&quot;, .{buf});
+    try w.interface.flush();
+    std.debug.print(&quot;wrote {d} bytes, all three pairs unwind now\n&quot;, .{buf.len + 1});
+}</code></pre>
+<pre class="term">wrote 17 bytes, all three pairs unwind now</pre>
+<p>Three pairs, three <code>defer</code>s, each on the line after its acquire, and the function body below them never mentions cleanup again. When <code>main</code> ends they run in reverse: the file closes, the mutex unlocks, the buffer is freed. The fourth classic pair, begin and rollback or commit, is a job for <code>errdefer</code>, and you will see the game's real one in the IRON LEDGER box below.</p>
+<table>
+<tr><th>Acquire</th><th>Release</th><th>Usual form</th></tr>
+<tr><td><code>a.alloc(T, n)</code> / <code>a.create(T)</code></td><td><code>a.free(s)</code> / <code>a.destroy(p)</code></td><td><code>defer</code> in the owner, <code>errdefer</code> in a constructor</td></tr>
+<tr><td><code>dir.openFile(io, …)</code> / <code>createFile</code></td><td><code>file.close(io)</code></td><td><code>defer</code></td></tr>
+<tr><td><code>mutex.lock(io)</code></td><td><code>mutex.unlock(io)</code></td><td><code>defer</code></td></tr>
+<tr><td><code>db.exec("BEGIN")</code></td><td><code>db.exec("ROLLBACK")</code></td><td><code>errdefer</code>, with <code>COMMIT</code> as the last statement</td></tr>
+<tr><td><code>list.init</code> / <code>.empty</code></td><td><code>list.deinit(a)</code></td><td><code>defer</code></td></tr>
+<tr><td><code>ArenaAllocator.init(gpa)</code></td><td><code>arena.deinit()</code></td><td><code>defer</code></td></tr>
+</table>
+<p>A note on the mutex: in Zig 0.16 the general mutex is <code>std.Io.Mutex</code>, its <code>lock</code> takes an <code>io</code> and can return an error (cancellation), and <code>unlock</code> also takes <code>io</code>. Older tutorials show <code>std.Thread.Mutex</code>, which no longer exists. <a href="#ch36">Chapter 36</a> covers threads properly.</p>
+
+<h3 id="ch17-7">17.7 Traps</h3>
+<div class="warn"><strong>Trap: defer in a loop.</strong> Because a loop body is a block, a <code>defer</code> inside it runs every iteration. That is right for per-iteration resources. It is wrong if you meant "clean up once, after the loop". If you write <code>defer list.deinit(a)</code> inside a loop that appends to <code>list</code>, the list is destroyed at the end of the first iteration and you are using freed memory on the second. Put the <code>defer</code> where the resource was created: if the list was created before the loop, the <code>defer</code> goes before the loop. Exercise 17.4 makes you do this right.</div>
+<div class="warn"><strong>Trap: a defer cannot return or try.</strong> A deferred statement runs while the block is already leaving; there is no function left to return from, and no way to route an error. Both are compile errors:
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn f() !void {
+    defer return error.Nope;
+}
+
+pub fn main() !void {
+    try f();
+}</code></pre>
+<pre class="term">def8.zig:4:11: error: cannot return from defer expression
+    defer return error.Nope;
+          ^~~~~~~~~~~~~~~~~
+def8.zig:4:5: note: defer expression here
+    defer return error.Nope;
+    ^~~~~~~~~~~~~~~~~~~~~~~</pre>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn f() !void {
+    defer {
+        try std.fmt.parseInt(u8, &quot;x&quot;, 10);
+    }
+}
+
+pub fn main() !void {
+    try f();
+}</code></pre>
+<pre class="term">def9.zig:5:9: error: &#x27;try&#x27; not allowed inside defer expression
+        try std.fmt.parseInt(u8, &quot;x&quot;, 10);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def9.zig:4:5: note: defer expression here
+    defer {
+    ^~~~~</pre>
+If a cleanup can fail, decide what to do with the failure right there: <code>defer file.close(io);</code> is fine because close cannot fail; <code>errdefer db.exec("ROLLBACK") catch {};</code> is how the game says "if the rollback itself fails, there is nothing more we can do". The <code>catch {}</code> is deliberate and commented.</div>
+<div class="note"><strong>Not a trap, but a surprise: no destructors.</strong> Zig will not run cleanup for you when a variable goes out of scope. A struct with a <code>deinit</code> method does nothing when it dies; you must write <code>defer thing.deinit()</code> yourself. This is on purpose. Nothing in Zig happens that you did not write, so there is never a hidden call at the end of a block. The trade is one line of <code>defer</code> per resource, which the compiler helps you remember for memory (the testing allocator) and which review makes easy to check, since setup and cleanup are adjacent.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The save store's opener in <code>game/src/persist/store.zig</code> has every idea from this chapter in twelve lines: a transaction begun, an <code>errdefer</code> that rolls it back with its own failure swallowed, a series of <code>try</code>s that each might trigger it, and a <code>COMMIT</code> that stands only if all of them passed.
+<pre><code>pub fn fromDb(db: sqlite.Db) !Store {
+    try db.exec(ddl);
+    const store: Store = .{ .db = db };
+    const stored: u32 = @intCast(@max(1, store.getSetting("schema_version", 1)));
+    if (stored &gt; schema_version) return error.StoreNewerThanGame;
+    try db.exec("BEGIN");
+    errdefer db.exec("ROLLBACK") catch {};
+    for (migrations) |m| {
+        if (m.version &lt;= stored) continue;
+        if (!try hasColumnRt(db, m.table, m.column)) try db.exec(m.sql);
+    }
+    try store.setSetting("schema_version", schema_version);
+    try db.exec("COMMIT");
+    return store;
+}</code></pre>
+The constructor pattern appears in <code>game/src/tui/emblem.zig</code>, where <code>Emblem.load</code> decodes a PNG, registers <code>errdefer { var i = img; i.deinit(gpa); }</code>, and only then duplicates the bytes; if the <code>dupe</code> fails, the decoded image is released. And the wizard's <code>generateCampaign</code> in <code>game/src/tui/app.zig</code> builds a <code>GameState</code>, writes <code>errdefer gs.deinit();</code>, then runs three commands through <code>try</code>: any failure tears down the half-made campaign instead of leaking it into the app.</div>
+
+<h3 id="ch17-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 17.1 · Predict the order <span class="level">warm-up</span></h4>
+  <p>Before running the program, write down the order of its eight output lines. Then run it and compare. File: <code>exercises/17-defer/ex1_order.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 17, exercise 1: predict the order.
+//! Run with:  zig run ex1_order.zig
+//! Goal: before running, write down the order of the lines. Then run it.
+//! Expected output:
+//!   enter mission
+//!     enter hangar
+//!     leave hangar
+//!   mission step 1
+//!   mission step 2
+//!   mission step 3
+//!   leave mission (second defer)
+//!   leave mission (first defer)
+const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    std.debug.print(&quot;enter mission\n&quot;, .{});
+    defer std.debug.print(&quot;leave mission (first defer)\n&quot;, .{});
+    defer std.debug.print(&quot;leave mission (second defer)\n&quot;, .{});
+    {
+        std.debug.print(&quot;  enter hangar\n&quot;, .{});
+        defer std.debug.print(&quot;  leave hangar\n&quot;, .{});
+    }
+    var i: u32 = 1;
+    while (i &lt;= 3) : (i += 1) {
+        std.debug.print(&quot;mission step {d}\n&quot;, .{i});
+    }
+}</code></pre>
+  <p>The hangar's defer belongs to the inner block, so it fires before the loop. The two mission defers belong to <code>main</code> and fire at the very end, in reverse order of registration.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 17.2 · errdefer keeps a failing constructor leak-free <span class="level">practice</span></h4>
+  <p>Implement <code>Squad.create</code>, which makes two allocations and validates in between. A bad size must return <code>error.BadSize</code> without leaking. The testing allocator will tell you if you got it wrong. File: <code>exercises/17-defer/ex2_errdefer.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 17, exercise 2: errdefer keeps a failing constructor leak-free.
+//! Run with:  zig test ex2_errdefer.zig
+//! Goal: make every test pass without changing the tests. The testing
+//! allocator fails the test if anything leaks.
+const std = @import(&quot;std&quot;);
+
+const Squad = struct {
+    name: []u8,
+    skills: []u8,
+
+    /// Allocates a copy of `name` and a skills array. If `size` is 0 or
+    /// more than 12, fails with error.BadSize, leaking nothing.
+    fn create(a: std.mem.Allocator, name: []const u8, size: usize) !Squad {
+        const name_copy = try a.dupe(u8, name);
+        errdefer a.free(name_copy);
+
+        if (size == 0 or size &gt; 12) return error.BadSize;
+
+        const skills = try a.alloc(u8, size);
+        errdefer a.free(skills);
+        @memset(skills, 4);
+
+        return .{ .name = name_copy, .skills = skills };
+    }
+
+    fn deinit(self: *Squad, a: std.mem.Allocator) void {
+        a.free(self.skills);
+        a.free(self.name);
+    }
+};
+
+test &quot;good squad&quot; {
+    var s = try Squad.create(std.testing.allocator, &quot;Alpha&quot;, 4);
+    defer s.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(&quot;Alpha&quot;, s.name);
+    try std.testing.expectEqual(@as(usize, 4), s.skills.len);
+    try std.testing.expectEqual(@as(u8, 4), s.skills[3]);
+}
+
+test &quot;bad size leaks nothing&quot; {
+    try std.testing.expectError(error.BadSize, Squad.create(std.testing.allocator, &quot;Beta&quot;, 0));
+    try std.testing.expectError(error.BadSize, Squad.create(std.testing.allocator, &quot;Gamma&quot;, 13));
+}</code></pre>
+  <p>Each allocation is followed by its own <code>errdefer</code>. The second one is technically unnecessary as written, since nothing after it can fail, but adding it costs nothing and protects you when someone later adds a step. Try removing the first <code>errdefer</code> and read the leak report.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 17.3 · begin / commit / rollback <span class="level">practice</span></h4>
+  <p>Implement <code>Ledger.payAll</code> so that a list of bills is paid atomically: begin a transaction, roll back with <code>errdefer</code> if any debit fails, commit at the end. File: <code>exercises/17-defer/ex3_transaction.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 17, exercise 3: begin / commit / rollback with errdefer.
+//! Run with:  zig test ex3_transaction.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const Ledger = struct {
+    funds: i64,
+    snapshot: i64 = 0,
+    in_transaction: bool = false,
+    rollbacks: u32 = 0,
+
+    fn begin(self: *Ledger) void {
+        self.snapshot = self.funds;
+        self.in_transaction = true;
+    }
+    fn commit(self: *Ledger) void {
+        self.in_transaction = false;
+    }
+    fn rollback(self: *Ledger) void {
+        self.funds = self.snapshot;
+        self.in_transaction = false;
+        self.rollbacks += 1;
+    }
+
+    fn debit(self: *Ledger, amount: i64) !void {
+        if (amount &gt; self.funds) return error.InsufficientTreasury;
+        self.funds -= amount;
+    }
+
+    /// Pay every bill in `bills` as one transaction: either all of them
+    /// are paid, or none are. Use begin, errdefer rollback, commit.
+    fn payAll(self: *Ledger, bills: []const i64) !void {
+        self.begin();
+        errdefer self.rollback();
+        for (bills) |b| try self.debit(b);
+        self.commit();
+    }
+};
+
+test &quot;all bills paid&quot; {
+    var l = Ledger{ .funds = 100 };
+    try l.payAll(&amp;.{ 10, 20, 30 });
+    try std.testing.expectEqual(@as(i64, 40), l.funds);
+    try std.testing.expect(!l.in_transaction);
+    try std.testing.expectEqual(@as(u32, 0), l.rollbacks);
+}
+
+test &quot;one bad bill rolls back the rest&quot; {
+    var l = Ledger{ .funds = 100 };
+    try std.testing.expectError(error.InsufficientTreasury, l.payAll(&amp;.{ 10, 20, 500, 5 }));
+    try std.testing.expectEqual(@as(i64, 100), l.funds);
+    try std.testing.expect(!l.in_transaction);
+    try std.testing.expectEqual(@as(u32, 1), l.rollbacks);
+}</code></pre>
+  <p>Four lines, and the same shape as the game's <code>fromDb</code>. The second test checks that after the failure the funds are back to 100, the transaction flag is clear, and exactly one rollback happened.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 17.4 · defer inside a loop <span class="level">challenge</span></h4>
+  <p>Implement <code>processAll</code>, which opens and closes one fake file per iteration. The tests require that at most one file is open at a time, that every open is matched by a close, and that an error part way through still closes the current file. File: <code>exercises/17-defer/ex4_loop.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 17, exercise 4: defer inside a loop runs every iteration.
+//! Run with:  zig test ex4_loop.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// A fake file handle that counts opens and closes on a shared tally.
+const Tally = struct { opens: u32 = 0, closes: u32 = 0, max_open: u32 = 0, open_now: u32 = 0 };
+
+fn open(t: *Tally) void {
+    t.opens += 1;
+    t.open_now += 1;
+    if (t.open_now &gt; t.max_open) t.max_open = t.open_now;
+}
+fn close(t: *Tally) void {
+    t.closes += 1;
+    t.open_now -= 1;
+}
+
+/// Process `n` files one after another. Each must be closed before the
+/// next is opened, and every file must be closed even when `fail_at`
+/// makes the function return early with an error.
+fn processAll(t: *Tally, n: u32, fail_at: ?u32) !void {
+    var i: u32 = 0;
+    while (i &lt; n) : (i += 1) {
+        open(t);
+        defer close(t);
+        if (fail_at) |f| if (i == f) return error.Corrupt;
+    }
+}
+
+test &quot;every open is matched by a close, one at a time&quot; {
+    var t = Tally{};
+    try processAll(&amp;t, 5, null);
+    try std.testing.expectEqual(@as(u32, 5), t.opens);
+    try std.testing.expectEqual(@as(u32, 5), t.closes);
+    try std.testing.expectEqual(@as(u32, 1), t.max_open);
+}
+
+test &quot;an early error still closes the current file&quot; {
+    var t = Tally{};
+    try std.testing.expectError(error.Corrupt, processAll(&amp;t, 5, 2));
+    try std.testing.expectEqual(@as(u32, 3), t.opens);
+    try std.testing.expectEqual(@as(u32, 3), t.closes);
+    try std.testing.expectEqual(@as(u32, 0), t.open_now);
+}</code></pre>
+  <p>Because the <code>defer close(t)</code> is inside the loop body, it runs at the end of every iteration, which keeps <code>max_open</code> at 1. When the <code>return error.Corrupt</code> fires on iteration 2, the block still unwinds, so the third open gets its close.</p></details>
+</div>
+
+<h3 id="ch17-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>In what order do three <code>defer</code>s in the same block run? <details class="answer"><summary>Answer</summary>Reverse order of registration: the last one written runs first.</details></li>
+  <li>When does a <code>defer</code> inside a <code>while</code> body run? <details class="answer"><summary>Answer</summary>At the end of every iteration, because the loop body is a block.</details></li>
+  <li>What triggers an <code>errdefer</code>? <details class="answer"><summary>Answer</summary>The block's function returning an error: a <code>return error.X</code> or a failing <code>try</code>. A normal return, even of an unhappy value, does not.</details></li>
+  <li>Why does a constructor need <code>errdefer</code> after each allocation? <details class="answer"><summary>Answer</summary>If a later step fails, the caller receives an error and no object, so it cannot free the earlier allocations. Only the constructor can, and <code>errdefer</code> does it on the error path alone.</details></li>
+  <li>Can you <code>try</code> inside a <code>defer</code>? <details class="answer"><summary>Answer</summary>No. The block is already leaving; there is nowhere for the error to go. Handle it there, for example with <code>catch {}</code>.</details></li>
+  <li>Does a deferred expression see the value of a variable at registration time or at run time? <details class="answer"><summary>Answer</summary>At run time. It is evaluated when it runs, which is how a loop counter can tell the errdefer how much to undo.</details></li>
+  <li>Why does Zig not run <code>deinit</code> automatically when a struct goes out of scope? <details class="answer"><summary>Answer</summary>No hidden control flow: nothing runs that you did not write. You add <code>defer x.deinit()</code> yourself, right after creating <code>x</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>defer stmt;</code> runs <code>stmt</code> when the enclosing block ends, however it ends, in reverse order of registration.</li>
+<li>The scope is the block: a bare <code>{}</code>, an <code>if</code> body or a loop body, not just the function.</li>
+<li><code>errdefer</code> runs only when the block exits with an error; <code>errdefer |err|</code> captures which one.</li>
+<li>After each acquire in a constructor, write an <code>errdefer</code> release; the success path hands everything to the caller.</li>
+<li>Write the release on the line after the acquire: alloc/free, open/close, lock/unlock, begin/rollback.</li>
+<li>A deferred statement cannot <code>return</code> or <code>try</code>; handle cleanup failures in place.</li>
+</ul></div>
+</section>

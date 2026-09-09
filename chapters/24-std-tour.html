@@ -1,0 +1,719 @@
+<section id="ch24">
+<h2>24. A tour of std.mem, std.sort and friends</h2>
+<p class="goals"><strong>In this chapter</strong> you will take a guided walk through the parts of the standard library you will reach for every day: searching and slicing with <code>std.mem</code>, chopping text with tokenizers and splitters, sorting and binary search with custom orderings, integer and float helpers in <code>std.math</code>, ASCII and Unicode utilities, the debugging aids in <code>std.debug</code>, reflection helpers in <code>std.meta</code>, and the small containers <code>EnumArray</code>, <code>EnumMap</code> and bit sets. Every function shown here was compiled with Zig 0.16; a few old favourites that no longer exist are called out with their replacements.</p>
+
+<h3 id="ch24-1">24.1 How to read the standard library</h3>
+<p>Zig ships its standard library as source, and it is the documentation. When you wonder whether <code>std.mem.something</code> exists, open <code>lib/zig/std/mem.zig</code> from your Zig install (<code>zig env</code> prints the <code>lib_dir</code>) and search for <code>pub fn something</code>. The naming is regular: functions that take an element type start with <code>comptime T: type</code>; functions that operate on one value end in <code>Scalar</code>; functions that search for any of several values end in <code>Any</code>; functions that search for a sequence end in <code>Sequence</code>. Once you know the pattern, you can guess most names correctly.</p>
+
+<h3 id="ch24-2">24.2 std.mem: searching and trimming</h3>
+<p class="file">a_mem_search.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const line = "contract: garrison duty, 90 days, 2,400,000 c-bills";
+
+    std.debug.print("eql:            {}\n", .{std.mem.eql(u8, "atlas", "atlas")});
+    std.debug.print("indexOf:        {?d}\n", .{std.mem.indexOf(u8, line, "days")});
+    std.debug.print("indexOf (none): {?d}\n", .{std.mem.indexOf(u8, line, "mechs")});
+    std.debug.print("indexOfScalar:  {?d}\n", .{std.mem.indexOfScalar(u8, line, ':')});
+    std.debug.print("lastIndexOf:    {?d}\n", .{std.mem.lastIndexOf(u8, line, ",")});
+    std.debug.print("indexOfAny:     {?d}\n", .{std.mem.indexOfAny(u8, line, "0123456789")});
+    std.debug.print("startsWith:     {}\n", .{std.mem.startsWith(u8, line, "contract")});
+    std.debug.print("endsWith:       {}\n", .{std.mem.endsWith(u8, line, "bills")});
+    std.debug.print("count:          {d}\n", .{std.mem.count(u8, line, ",")});
+    std.debug.print("trim:           [{s}]\n", .{std.mem.trim(u8, "  padded  ", " ")});
+    std.debug.print("trimStart:      [{s}]\n", .{std.mem.trimStart(u8, "xxhixx", "x")});
+    std.debug.print("trimEnd:        [{s}]\n", .{std.mem.trimEnd(u8, "xxhixx", "x")});
+
+    if (std.mem.indexOf(u8, line, ", ")) |i| {
+        std.debug.print("before: [{s}]  after: [{s}]\n", .{ line[0..i], line[i + 2 ..] });
+    }
+}</code></pre>
+<pre class="term">eql:            true
+indexOf:        28
+indexOf (none): null
+indexOfScalar:  8
+lastIndexOf:    39
+indexOfAny:     25
+startsWith:     true
+endsWith:       true
+count:          4
+trim:           [padded]
+trimStart:      [hixx]
+trimEnd:        [xxhi]
+before: [contract: garrison duty]  after: [90 days, 2,400,000 c-bills]</pre>
+<p>All of these take the element type first, which is why you keep writing <code>u8</code>: they work on slices of anything, and text is just the common case. The searchers return <code>?usize</code>, an optional index, so you unwrap with <code>if</code> or <code>orelse</code>. <code>trim</code> and its one-sided siblings take a set of characters to strip, not a single one; <code>" \t\r\n"</code> is the usual argument for whitespace. The last lines show the everyday idiom: find a separator, then slice around it.</p>
+
+<h3 id="ch24-3">24.3 Tokenize and split</h3>
+<p>The two families look similar and differ in exactly one way, which the transcript makes obvious.</p>
+<p class="file">b_split.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    // tokenize: runs of delimiters collapse, empty pieces never appear.
+    var t = std.mem.tokenizeScalar(u8, "  hire   pilot  Kell ", ' ');
+    std.debug.print("tokenizeScalar: ", .{});
+    while (t.next()) |tok| std.debug.print("[{s}] ", .{tok});
+
+    // split: every delimiter produces a piece, even empty ones.
+    var s = std.mem.splitScalar(u8, "a,,b,", ',');
+    std.debug.print("\nsplitScalar:    ", .{});
+    while (s.next()) |piece| std.debug.print("[{s}] ", .{piece});
+
+    // tokenizeAny: any of several delimiter characters.
+    var ta = std.mem.tokenizeAny(u8, "one, two;three\tfour", ", ;\t");
+    std.debug.print("\ntokenizeAny:    ", .{});
+    while (ta.next()) |tok| std.debug.print("[{s}] ", .{tok});
+
+    // splitSequence: a multi-character delimiter.
+    var ss = std.mem.splitSequence(u8, "alpha--beta--gamma", "--");
+    std.debug.print("\nsplitSequence:  ", .{});
+    while (ss.next()) |piece| std.debug.print("[{s}] ", .{piece});
+
+    // Iterators are structs; you can peek and rest.
+    var cmd = std.mem.tokenizeScalar(u8, "transfer outfit hq 5000", ' ');
+    const verb = cmd.next().?;
+    std.debug.print("\nverb={s} rest=[{s}]\n", .{ verb, cmd.rest() });
+}</code></pre>
+<pre class="term">tokenizeScalar: [hire] [pilot] [Kell] 
+splitScalar:    [a] [] [b] [] 
+tokenizeAny:    [one] [two] [three] [four] 
+splitSequence:  [alpha] [beta] [gamma] 
+verb=transfer rest=[outfit hq 5000]</pre>
+<p><strong>Tokenize</strong> skips empty pieces: runs of delimiters collapse and leading or trailing ones vanish. That is what you want for words on a command line. <strong>Split</strong> is exact: every delimiter separates two pieces, and <code>"a,,b,"</code> has four of them, two empty. That is what you want for CSV, where an empty field means something. Both come in <code>Scalar</code> (one delimiter byte), <code>Any</code> (any of a set) and <code>Sequence</code> (a multi-byte delimiter) forms.</p>
+<p>They are iterators: structs with a <code>next()</code> that returns <code>?[]const u8</code>, so the standard <code>while (it.next()) |tok|</code> loop drives them. The pieces are slices into the original string, so nothing is copied and nothing needs freeing. <code>rest()</code> gives you everything not yet consumed, which the game uses to pass "the rest of the line" to a sub-parser.</p>
+
+<h3 id="ch24-4">24.4 std.mem: changing things in place</h3>
+<p class="file">c_mem_mutate.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var arr = [_]i32{ 5, 3, 9, 1, 7 };
+
+    std.mem.reverse(i32, &amp;arr);
+    std.debug.print("reverse:  {any}\n", .{arr});
+    std.debug.print("min/max:  {d} {d}\n", .{ std.mem.min(i32, &amp;arr), std.mem.max(i32, &amp;arr) });
+    std.debug.print("indexOfMax: {d}\n", .{std.mem.indexOfMax(i32, &amp;arr)});
+
+    std.mem.sort(i32, &amp;arr, {}, std.sort.asc(i32));
+    std.debug.print("sorted:   {any}\n", .{arr});
+
+    var out: [32]u8 = undefined;
+    const n = std.mem.replace(u8, "a-b-c-d", "-", " + ", &amp;out);
+    const needed = std.mem.replacementSize(u8, "a-b-c-d", "-", " + ");
+    std.debug.print("replace:  {d} replacements, [{s}] ({d} bytes)\n", .{ n, out[0..needed], needed });
+
+    var word = "hello".*; // copy the literal into a mutable array
+    std.mem.replaceScalar(u8, &amp;word, 'l', 'L');
+    std.debug.print("replaceScalar: {s}\n", .{&amp;word});
+
+    const zeroed = std.mem.zeroes([4]u8);
+    std.debug.print("zeroes:   {any}\n", .{zeroed});
+}</code></pre>
+<pre class="term">reverse:  { 7, 1, 9, 3, 5 }
+min/max:  1 9
+indexOfMax: 2
+sorted:   { 1, 3, 5, 7, 9 }
+replace:  3 replacements, [a + b + c + d] (13 bytes)
+replaceScalar: heLLo
+zeroes:   { 0, 0, 0, 0 }</pre>
+<p><code>replace</code> writes into an output buffer you provide and returns the number of replacements; <code>replacementSize</code> tells you how big that buffer must be. The line <code>var word = "hello".*;</code> is worth a pause: a string literal is a pointer to constant memory, and <code>.*</code> dereferences it into a fresh, mutable array on the stack that <code>replaceScalar</code> may then edit. <code>std.mem.zeroes(T)</code> gives you an all-zero value of any type, handy for clearing structs.</p>
+
+<h3 id="ch24-5">24.5 std.mem: bytes and integers</h3>
+<p>When you write a file format or talk to a network, you need to turn integers into bytes and back, in a byte order you choose rather than whatever the CPU prefers.</p>
+<p class="file">d_bytes.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const v: u32 = 0x01020304;
+
+    // The same four bytes, viewed as a byte array (native order; little-endian here).
+    const bytes = std.mem.asBytes(&amp;v);
+    std.debug.print("asBytes:  {any}\n", .{bytes});
+    std.debug.print("toBytes:  {any}\n", .{std.mem.toBytes(v)});
+
+    // Explicit byte order for file formats and network protocols.
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &amp;buf, 258, .big);
+    std.debug.print("writeInt big:    {any}\n", .{buf});
+    std.mem.writeInt(u32, &amp;buf, 258, .little);
+    std.debug.print("writeInt little: {any}\n", .{buf});
+    std.debug.print("readInt little:  {d}\n", .{std.mem.readInt(u32, &amp;buf, .little)});
+    std.debug.print("readInt big:     {d}\n", .{std.mem.readInt(u32, &amp;buf, .big)});
+
+    // Reinterpret a byte slice as a slice of u16.
+    const words = std.mem.bytesAsSlice(u16, &amp;buf);
+    std.debug.print("bytesAsSlice u16: {any}\n", .{words});
+}</code></pre>
+<pre class="term">asBytes:  { 4, 3, 2, 1 }
+toBytes:  { 4, 3, 2, 1 }
+writeInt big:    { 0, 0, 1, 2 }
+writeInt little: { 2, 1, 0, 0 }
+readInt little:  258
+readInt big:     33619968
+bytesAsSlice u16: { 258, 0 }</pre>
+<p>This machine is little-endian, so <code>asBytes</code> shows the low byte first. <code>writeInt</code> and <code>readInt</code> take an explicit <code>.big</code> or <code>.little</code> and a pointer to an array of exactly the right size (<code>*[4]u8</code> for a <code>u32</code>), so a size mismatch is a compile error. <code>bytesAsSlice</code> reinterprets a byte slice as a slice of a wider type without copying; use it only for data that was produced on the same kind of machine.</p>
+
+<h3 id="ch24-6">24.6 std.sort: ordering and searching</h3>
+<p class="file">e_sort.zig</p>
+<pre><code>const std = @import("std");
+
+const Unit = struct { name: []const u8, tons: u32, bv: u32 };
+
+fn byTons(_: void, a: Unit, b: Unit) bool {
+    return a.tons &lt; b.tons;
+}
+
+fn byBvDesc(_: void, a: Unit, b: Unit) bool {
+    if (a.bv != b.bv) return a.bv &gt; b.bv;
+    return std.mem.lessThan(u8, a.name, b.name); // tie-break by name
+}
+
+fn cmpTons(key: u32, item: Unit) std.math.Order {
+    return std.math.order(key, item.tons);
+}
+
+pub fn main() void {
+    var units = [_]Unit{
+        .{ .name = "Marauder", .tons = 75, .bv = 1363 },
+        .{ .name = "Atlas", .tons = 100, .bv = 1897 },
+        .{ .name = "Locust", .tons = 20, .bv = 432 },
+        .{ .name = "Warhammer", .tons = 70, .bv = 1363 },
+    };
+
+    std.mem.sort(Unit, &amp;units, {}, byTons);
+    std.debug.print("by tons:   ", .{});
+    for (units) |u| std.debug.print("{s} ", .{u.name});
+
+    std.debug.print("\nbinarySearch tons=70: {?d}\n", .{std.sort.binarySearch(Unit, &amp;units, @as(u32, 70), cmpTons)});
+    std.debug.print("binarySearch tons=71: {?d}\n", .{std.sort.binarySearch(Unit, &amp;units, @as(u32, 71), cmpTons)});
+    std.debug.print("lowerBound tons=71:   {d}\n", .{std.sort.lowerBound(Unit, &amp;units, @as(u32, 71), cmpTons)});
+
+    std.mem.sort(Unit, &amp;units, {}, byBvDesc);
+    std.debug.print("by bv desc: ", .{});
+    for (units) |u| std.debug.print("{s} ", .{u.name});
+    std.debug.print("\nisSorted: {}\n", .{std.sort.isSorted(Unit, &amp;units, {}, byBvDesc)});
+
+    var small = [_]u8{ 3, 1, 2 };
+    std.sort.insertion(u8, &amp;small, {}, std.sort.desc(u8));
+    std.debug.print("insertion desc: {any}\n", .{small});
+}</code></pre>
+<pre class="term">by tons:   Locust Warhammer Marauder Atlas 
+binarySearch tons=70: 1
+binarySearch tons=71: null
+lowerBound tons=71:   2
+by bv desc: Atlas Marauder Warhammer Locust 
+isSorted: true
+insertion desc: { 3, 2, 1 }</pre>
+<p><code>std.mem.sort(T, slice, context, lessThan)</code> is a stable sort. <code>lessThan</code> is a plain function <code>fn (context, a: T, b: T) bool</code>; the context is usually <code>{}</code> (void) and only matters when the comparison needs extra data. For the simple cases <code>std.sort.asc(T)</code> and <code>std.sort.desc(T)</code> generate that function for you. Tie-breaking is your job: <code>byBvDesc</code> falls back to name order so the result is fully determined, which matters whenever output must be reproducible.</p>
+<p><code>binarySearch(T, sorted, key, compare)</code> has a shape that changed in 0.16: the key <em>is</em> the context, and <code>compare</code> is <code>fn (key, item) std.math.Order</code> returning <code>.lt</code>, <code>.eq</code> or <code>.gt</code>. It returns <code>?usize</code>. <code>lowerBound</code> returns the insertion point for a missing key. <code>isSorted</code> is a cheap assertion for tests. <code>std.sort.insertion</code> is the simple algorithm, best for tiny slices; <code>std.mem.sort</code> picks a good general one.</p>
+
+<h3 id="ch24-7">24.7 std.math</h3>
+<p class="file">f_math.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("maxInt(u8)={d} minInt(i8)={d} maxInt(i64)={d}\n", .{ std.math.maxInt(u8), std.math.minInt(i8), std.math.maxInt(i64) });
+    std.debug.print("clamp: {d} {d} {d}\n", .{ std.math.clamp(@as(i32, -5), 0, 10), std.math.clamp(@as(i32, 5), 0, 10), std.math.clamp(@as(i32, 50), 0, 10) });
+    std.debug.print("divCeil: {!d}  divFloor: {!d}  divTrunc: {!d}\n", .{ std.math.divCeil(i32, 7, 2), std.math.divFloor(i32, -7, 2), std.math.divTrunc(i32, -7, 2) });
+    std.debug.print("divCeil by zero: {!d}\n", .{std.math.divCeil(i32, 7, 0)});
+    std.debug.print("pow: {d}  powi: {!d}  sqrt: {d}  sqrt int: {d}\n", .{ std.math.pow(f64, 2, 10), std.math.powi(i32, 3, 4), std.math.sqrt(@as(f64, 2)), std.math.sqrt(@as(u32, 17)) });
+    std.debug.print("log2: {d}  log2_int: {d}  log10_int: {d}\n", .{ std.math.log2(@as(f64, 1024)), std.math.log2_int(u32, 1024), std.math.log10_int(@as(u32, 12345)) });
+    std.debug.print("@abs: {d} ({s})\n", .{ @abs(@as(i32, -5)), @typeName(@TypeOf(@abs(@as(i32, -5)))) });
+    std.debug.print("cast: {?d} {?d}\n", .{ std.math.cast(u8, @as(i32, 300)), std.math.cast(u8, @as(i32, 30)) });
+    std.debug.print("add overflow: {!d}  mul ok: {!d}\n", .{ std.math.add(u8, 200, 100), std.math.mul(u8, 20, 10) });
+    std.debug.print("isPowerOfTwo: {} {}  ceilPowerOfTwo: {!d}\n", .{ std.math.isPowerOfTwo(@as(u32, 64)), std.math.isPowerOfTwo(@as(u32, 65)), std.math.ceilPowerOfTwo(u32, 65) });
+    std.debug.print("floor/ceil/round: {d} {d} {d}\n", .{ std.math.floor(@as(f64, 2.7)), std.math.ceil(@as(f64, 2.2)), std.math.round(@as(f64, 2.5)) });
+    std.debug.print("pi: {d:.5}  order: {}\n", .{ std.math.pi, std.math.order(3, 7) });
+}</code></pre>
+<pre class="term">maxInt(u8)=255 minInt(i8)=-128 maxInt(i64)=9223372036854775807
+clamp: 0 5 10
+divCeil: 4  divFloor: -4  divTrunc: -3
+divCeil by zero: error.DivisionByZero
+pow: 1024  powi: 81  sqrt: 1.4142135623730951  sqrt int: 4
+log2: 10  log2_int: 10  log10_int: 4
+@abs: 5 (u32)
+cast: null 30
+add overflow: error.Overflow  mul ok: 200
+isPowerOfTwo: true false  ceilPowerOfTwo: 128
+floor/ceil/round: 2 3 3
+pi: 3.14159  order: .lt</pre>
+<p>Notes on the ones that trip people up. <code>maxInt</code> and <code>minInt</code> return <code>comptime_int</code>, so they fit anywhere a literal would. The three divisions differ on negative numbers: <code>divTrunc</code> rounds toward zero, <code>divFloor</code> toward negative infinity, <code>divCeil</code> toward positive infinity; all three return an error on division by zero rather than crashing. <code>sqrt</code> works on integers as well as floats. <code>std.math.cast</code> is the safe narrowing cast: <code>null</code> instead of a panic when the value does not fit. <code>std.math.add</code> and <code>mul</code> are checked arithmetic returning <code>error.Overflow</code>, the error-union cousins of the wrapping and saturating operators from <a href="#ch04">Chapter 4</a>.</p>
+<div class="note">Two removals. <code>std.math.absCast</code> is gone: the builtin <code>@abs</code> returns the unsigned type directly (<code>@abs(i32)</code> is a <code>u32</code>), which is what <code>absCast</code> used to do. And the trigonometric and exponential functions are still there (<code>sin</code>, <code>cos</code>, <code>exp</code>, <code>log</code>), but the more common float operations, <code>@sqrt</code>, <code>@floor</code>, <code>@round</code>, <code>@exp</code>, also exist as builtins, which is what the <code>std.math</code> versions call.</div>
+
+<h3 id="ch24-8">24.8 std.ascii and a glance at std.unicode</h3>
+<p class="file">g_ascii.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("isDigit('7')={} isAlphabetic('x')={} isWhitespace('\\t')={} isUpper('Q')={}\n", .{
+        std.ascii.isDigit('7'), std.ascii.isAlphabetic('x'), std.ascii.isWhitespace('\t'), std.ascii.isUpper('Q'),
+    });
+    std.debug.print("toUpper('a')={c} toLower('Q')={c}\n", .{ std.ascii.toUpper('a'), std.ascii.toLower('Q') });
+    var buf: [16]u8 = undefined;
+    std.debug.print("upperString: {s}\n", .{std.ascii.upperString(&amp;buf, "shout")});
+    std.debug.print("eqlIgnoreCase: {}  startsWithIgnoreCase: {}\n", .{
+        std.ascii.eqlIgnoreCase("Atlas", "ATLAS"), std.ascii.startsWithIgnoreCase("Atlas AS7-D", "atlas"),
+    });
+    std.debug.print("indexOfIgnoreCase: {?d}\n", .{std.ascii.indexOfIgnoreCase("Hello World", "world")});
+
+    // Unicode: bytes are not characters.
+    const s = "héllo ⚔";
+    std.debug.print("bytes={d} codepoints={!d} valid={}\n", .{ s.len, std.unicode.utf8CountCodepoints(s), std.unicode.utf8ValidateSlice(s) });
+    var it = (std.unicode.Utf8View.init(s) catch unreachable).iterator();
+    while (it.nextCodepoint()) |cp| std.debug.print("U+{X:0&gt;4} ", .{cp});
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">isDigit('7')=true isAlphabetic('x')=true isWhitespace('\t')=true isUpper('Q')=true
+toUpper('a')=A toLower('Q')=q
+upperString: SHOUT
+eqlIgnoreCase: true  startsWithIgnoreCase: true
+indexOfIgnoreCase: 6
+bytes=10 codepoints=7 valid=true
+U+0068 U+00E9 U+006C U+006C U+006F U+0020 U+2694 </pre>
+<p><code>std.ascii</code> is byte-at-a-time and only knows the 128 ASCII characters; <code>toUpper('é')</code> would do nothing. The case-insensitive comparisons are what you want for user commands and file extensions. The moment you need to count characters or reverse a string, remember that <code>len</code> counts bytes: <code>"héllo ⚔"</code> is 10 bytes and 7 code points. <code>std.unicode.Utf8View</code> walks the code points; the game uses it to pad table columns by visible width rather than by bytes.</p>
+
+<h3 id="ch24-9">24.9 std.debug and std.meta</h3>
+<p class="file">h_debug_meta.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { pilot, tech, medic };
+const Event = union(enum) { hired: []const u8, paid: u32 };
+const Pos = struct { x: i32, y: i32 };
+
+pub fn main() void {
+    std.debug.assert(2 + 2 == 4); // no-op when true; panics with a trace when false in Debug
+
+    std.debug.print("stringToEnum: {?} {?}\n", .{ std.meta.stringToEnum(Role, "tech"), std.meta.stringToEnum(Role, "cook") });
+    std.debug.print("activeTag:    {}\n", .{std.meta.activeTag(Event{ .paid = 5 })});
+    std.debug.print("Tag type:     {s}\n", .{@typeName(std.meta.Tag(Event))});
+    std.debug.print("meta.eql:     {} {}\n", .{
+        std.meta.eql(Pos{ .x = 1, .y = 2 }, Pos{ .x = 1, .y = 2 }),
+        std.meta.eql(Pos{ .x = 1, .y = 2 }, Pos{ .x = 1, .y = 3 }),
+    });
+    std.debug.print("fieldNames:   ", .{});
+    for (std.meta.fieldNames(Role)) |n| std.debug.print("{s} ", .{n});
+    std.debug.print("\ntags:         {any}\n", .{std.meta.tags(Role)});
+}</code></pre>
+<pre class="term">stringToEnum: .tech null
+activeTag:    .paid
+Tag type:     @typeInfo(h_debug_meta.Event).@"union".tag_type.?
+meta.eql:     true false
+fieldNames:   pilot tech medic 
+tags:         { .pilot, .tech, .medic }</pre>
+<p><code>std.debug.assert(cond)</code> panics with a stack trace in Debug and ReleaseSafe builds and is removed entirely in ReleaseFast, so never put a side effect inside one. <code>stringToEnum</code> is the inverse of <code>@tagName</code> and returns an optional. <code>activeTag</code> gives the tag of a tagged union and <code>Tag</code> its enum type. <code>meta.eql</code> compares structs field by field (and arrays element by element), which <code>==</code> does not do for structs. And <code>dumpCurrentStackTrace</code> prints where you are, which is the fastest way to answer "who called this?":</p>
+<p class="file">k_trace.zig</p>
+<pre><code>const std = @import("std");
+
+fn inner(depth: u32) void {
+    if (depth == 0) {
+        std.debug.print("where am I?\n", .{});
+        std.debug.dumpCurrentStackTrace(.{});
+        return;
+    }
+    inner(depth - 1);
+}
+
+pub fn main() void {
+    inner(2);
+}</code></pre>
+<pre class="term">where am I?
+k_trace.zig:6:40: 0x102e19de3 in inner (k_trace)
+        std.debug.dumpCurrentStackTrace(.{});
+                                       ^
+k_trace.zig:9:10: 0x102e19e07 in inner (k_trace)
+    inner(depth - 1);
+         ^
+k_trace.zig:9:10: 0x102e19e07 in inner (k_trace)
+    inner(depth - 1);
+         ^
+k_trace.zig:13:10: 0x102e19c17 in main (k_trace)
+    inner(2);</pre>
+
+<h3 id="ch24-10">24.10 EnumArray, EnumMap, EnumSet and bit sets</h3>
+<p class="file">i_enums_bits.zig</p>
+<pre><code>const std = @import("std");
+
+const Role = enum { pilot, tech, medic };
+
+pub fn main() void {
+    // EnumArray: a value for EVERY enum member, indexed by the enum.
+    var pay = std.enums.EnumArray(Role, u32).initFill(0);
+    pay.set(.pilot, 1500);
+    pay.getPtr(.tech).* += 900;
+    std.debug.print("EnumArray: pilot={d} tech={d} medic={d}  all={any}\n", .{ pay.get(.pilot), pay.get(.tech), pay.get(.medic), pay.values });
+
+    // EnumMap: optional value per member (absent until put).
+    var lead = std.enums.EnumMap(Role, []const u8).init(.{ .pilot = "Kell" });
+    lead.put(.medic, "Sato");
+    std.debug.print("EnumMap: pilot={?s} tech={?s} count={d}\n", .{ lead.get(.pilot), lead.get(.tech), lead.count() });
+
+    // EnumSet: a set of members, stored as bits.
+    var present = std.enums.EnumSet(Role).initEmpty();
+    present.insert(.pilot);
+    present.insert(.tech);
+    std.debug.print("EnumSet: tech? {} medic? {} count={d}\n", .{ present.contains(.tech), present.contains(.medic), present.count() });
+
+    // Bit sets: N bits, set/unset/toggle/count/iterate.
+    var slots = std.bit_set.IntegerBitSet(16).initEmpty();
+    slots.set(3);
+    slots.set(9);
+    slots.toggle(0);
+    std.debug.print("bits: isSet(3)={} isSet(4)={} count={d} first={?d} set: ", .{ slots.isSet(3), slots.isSet(4), slots.count(), slots.findFirstSet() });
+    var it = slots.iterator(.{});
+    while (it.next()) |i| std.debug.print("{d} ", .{i});
+
+    var big = std.bit_set.StaticBitSet(200).initFull();
+    big.unset(100);
+    std.debug.print("\nStaticBitSet(200): count={d}, type={s}\n", .{ big.count(), @typeName(@TypeOf(big)) });
+}</code></pre>
+<pre class="term">EnumArray: pilot=1500 tech=900 medic=0  all={ 1500, 900, 0 }
+EnumMap: pilot=Kell tech=null count=2
+EnumSet: tech? true medic? false count=2
+bits: isSet(3)=true isSet(4)=false count=3 first=0 set: 0 3 9 
+StaticBitSet(200): count=199, type=bit_set.ArrayBitSet(usize,200)</pre>
+<p><code>EnumArray(E, V)</code> is an array with one slot per enum member, indexed by the enum rather than by an integer. It cannot be out of bounds and it cannot forget a member; adding a variant to <code>Role</code> automatically adds a slot. Use it for "a value for every kind of thing". <code>EnumMap</code> is the same but each slot may be absent, and <code>EnumSet</code> is a set of members packed into bits. Bit sets proper come in <code>IntegerBitSet(N)</code> (fits in one integer) and <code>ArrayBitSet</code> (larger); <code>StaticBitSet(N)</code> picks for you, as the printed type name shows. They support set, unset, toggle, count, find-first and iteration, plus set algebra (<code>setUnion</code>, <code>setIntersection</code>, <code>complement</code>).</p>
+
+<h3 id="ch24-11">24.11 A fixed-capacity list</h3>
+<p>Older Zig had <code>std.BoundedArray</code>, a list that lived inside a fixed array and needed no allocator. It is gone in 0.16, and its job is done by <code>ArrayList</code> itself, pointed at a buffer you own:</p>
+<p class="file">j_bounded.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    // A list that lives entirely inside a fixed array: no allocator, cannot exceed 4.
+    var storage: [4]u32 = undefined;
+    var list: std.ArrayList(u32) = .initBuffer(&amp;storage);
+
+    list.appendBounded(10) catch unreachable;
+    list.appendBounded(20) catch unreachable;
+    list.appendSliceBounded(&amp;.{ 30, 40 }) catch unreachable;
+    std.debug.print("{any} len={d} cap={d}\n", .{ list.items, list.items.len, list.capacity });
+
+    const full = list.appendBounded(50);
+    std.debug.print("fifth append: {!}\n", .{full});
+    std.debug.print("pop: {?d}\n", .{list.pop()});
+}</code></pre>
+<pre class="term">{ 10, 20, 30, 40 } len=4 cap=4
+fifth append: error.OutOfMemory
+pop: 40</pre>
+<p><code>initBuffer(&amp;storage)</code> makes a list whose capacity is the array's length and which can never grow; the <code>Bounded</code> methods return <code>error.OutOfMemory</code> when it is full instead of allocating. Everything that does not allocate (<code>pop</code>, <code>items</code>, <code>orderedRemove</code>, iteration) works as before.</p>
+
+<h3 id="ch24-12">24.12 Gone in 0.16</h3>
+<table class="compare">
+<tr><th>Old</th><th>Now</th></tr>
+<tr><td><code>std.BoundedArray(T, n)</code></td><td><code>std.ArrayList(T).initBuffer(&amp;buf)</code> with <code>appendBounded</code></td></tr>
+<tr><td><code>std.math.absCast(x)</code></td><td><code>@abs(x)</code></td></tr>
+<tr><td><code>std.mem.tokenize(u8, s, " ")</code></td><td><code>std.mem.tokenizeAny</code> / <code>tokenizeScalar</code> / <code>tokenizeSequence</code></td></tr>
+<tr><td><code>std.mem.split(u8, s, ",")</code></td><td><code>std.mem.splitScalar</code> / <code>splitAny</code> / <code>splitSequence</code></td></tr>
+<tr><td><code>std.mem.trimLeft</code> / <code>trimRight</code></td><td><code>std.mem.trimStart</code> / <code>trimEnd</code></td></tr>
+<tr><td><code>std.sort.sort(...)</code></td><td><code>std.mem.sort(...)</code></td></tr>
+<tr><td><code>binarySearch(T, key, items, ctx, cmp)</code></td><td><code>binarySearch(T, items, key, cmp)</code> with <code>cmp: fn (key, item) Order</code></td></tr>
+</table>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> A count of the calls in <code>game/src</code> tells you what matters: <code>std.mem.eql</code> appears over two hundred times, <code>std.mem.indexOf</code> and <code>startsWith</code> dozens of times, <code>tokenizeScalar</code> seventeen, <code>std.math.clamp</code> and <code>divCeil</code> sixteen each. The console REPL in <code>game/src/main.zig</code> is 24.3 in one line: <code>var tokens = std.mem.tokenizeScalar(u8, line, ' ');</code> followed by <code>parseInt</code> on each token. Sorting with a tie-break, as in 24.6, is how the hangar screen orders units (<code>game/src/sim/queries.zig</code>):
+<pre><code>std.mem.sort(HangarRow, out.items, {}, struct {
+    fn lt(_: void, a: HangarRow, b: HangarRow) bool {
+        if (a.cost_index != b.cost_index) return a.cost_index &gt; b.cost_index;
+        return a.bill &gt; b.bill;
+    }
+}.lt);</code></pre>
+The comparison is an anonymous struct with one function, declared right where it is used; you will see that idiom often. And <code>std.ascii.endsWithIgnoreCase(e.name, ".png")</code> is how the emblem loader (<code>tui/emblem.zig</code>) filters a directory listing.</div>
+
+<h3 id="ch24-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 24.1 · Command line <span class="level">warm-up</span></h4>
+  <p>Write <code>parseCommand(line)</code> that tokenizes on spaces and tabs, matches the first word case-insensitively against an enum of verbs (lower-case it into a small buffer, then <code>stringToEnum</code>), and reports the argument count and the first argument. Name the file: <code>exercises/24-std-tour/ex1_command.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 24, exercise 1: chop a command line into a verb and arguments.
+//! Run with:  zig test ex1_command.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Verb = enum { hire, fire, transfer, unknown };
+const Command = struct { verb: Verb, arg_count: usize, first_arg: ?[]const u8 };
+
+/// "  hire   pilot Kell " -&gt; verb hire, 2 args, first arg "pilot".
+/// The verb is matched case-insensitively.
+fn parseCommand(line: []const u8) Command {
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    const word = it.next() orelse return .{ .verb = .unknown, .arg_count = 0, .first_arg = null };
+    var lower_buf: [16]u8 = undefined;
+    const verb: Verb = if (word.len &gt; lower_buf.len)
+        .unknown
+    else
+        std.meta.stringToEnum(Verb, std.ascii.lowerString(&amp;lower_buf, word)) orelse .unknown;
+    const first = it.next();
+    var count: usize = if (first != null) 1 else 0;
+    while (it.next()) |_| count += 1;
+    return .{ .verb = verb, .arg_count = count, .first_arg = first };
+}
+
+test "hire" {
+    const c = parseCommand("  hire   pilot Kell ");
+    try std.testing.expectEqual(Verb.hire, c.verb);
+    try std.testing.expectEqual(@as(usize, 2), c.arg_count);
+    try std.testing.expectEqualStrings("pilot", c.first_arg.?);
+}
+
+test "case and tabs" {
+    const c = parseCommand("TRANSFER\toutfit\thq\t5000");
+    try std.testing.expectEqual(Verb.transfer, c.verb);
+    try std.testing.expectEqual(@as(usize, 3), c.arg_count);
+}
+
+test "unknown and empty" {
+    try std.testing.expectEqual(Verb.unknown, parseCommand("dance").verb);
+    const e = parseCommand("   ");
+    try std.testing.expectEqual(Verb.unknown, e.verb);
+    try std.testing.expectEqual(@as(usize, 0), e.arg_count);
+    try std.testing.expect(e.first_arg == null);
+}</code></pre>
+  <p><code>lowerString</code> writes into a buffer you own and returns the slice it used, so a word longer than the buffer has to be rejected first. <code>orelse .unknown</code> turns the optional from <code>stringToEnum</code> into a definite verb.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 24.2 · CSV of integers <span class="level">practice</span></h4>
+  <p>Write <code>parseCsvInts(out, line)</code> using <code>splitScalar</code> (not tokenize: an empty field must be an error), <code>trim</code> and <code>parseInt</code>, filling a caller-provided slice, and <code>stats</code> returning sum, min and max using <code>std.mem.minMax</code>. Name the file: <code>exercises/24-std-tour/ex2_csv.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 24, exercise 2: a CSV line of numbers.
+//! Run with:  zig test ex2_csv.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Parse "12, 7,3" into `out`, trimming spaces around each field.
+/// Returns the slice of `out` that was filled. Empty fields are an error.
+fn parseCsvInts(out: []i32, line: []const u8) ![]i32 {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, line, ',');
+    while (it.next()) |raw| {
+        const field = std.mem.trim(u8, raw, " \t");
+        if (field.len == 0) return error.EmptyField;
+        if (n == out.len) return error.TooManyFields;
+        out[n] = try std.fmt.parseInt(i32, field, 10);
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Sum, min and max of a slice in one pass, or null if empty.
+fn stats(xs: []const i32) ?struct { sum: i64, min: i32, max: i32 } {
+    if (xs.len == 0) return null;
+    var sum: i64 = 0;
+    for (xs) |x| sum += x;
+    const mm = std.mem.minMax(i32, xs);
+    return .{ .sum = sum, .min = mm[0], .max = mm[1] };
+}
+
+test "parse" {
+    var buf: [8]i32 = undefined;
+    const got = try parseCsvInts(&amp;buf, "12, 7,3 , -1");
+    try std.testing.expectEqualSlices(i32, &amp;.{ 12, 7, 3, -1 }, got);
+    const s = stats(got).?;
+    try std.testing.expectEqual(@as(i64, 21), s.sum);
+    try std.testing.expectEqual(@as(i32, -1), s.min);
+    try std.testing.expectEqual(@as(i32, 12), s.max);
+}
+
+test "errors" {
+    var buf: [2]i32 = undefined;
+    try std.testing.expectError(error.EmptyField, parseCsvInts(&amp;buf, "1,,2"));
+    try std.testing.expectError(error.TooManyFields, parseCsvInts(&amp;buf, "1,2,3"));
+    try std.testing.expectError(error.InvalidCharacter, parseCsvInts(&amp;buf, "1,x"));
+    try std.testing.expect(stats(&amp;.{}) == null);
+}</code></pre>
+  <p>Because the function fills a slice it was given, it never allocates; the caller decides how many fields are acceptable by the size of <code>out</code>. The inferred error set carries both your errors and <code>parseInt</code>'s.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 24.3 · Sort and search <span class="level">practice</span></h4>
+  <p>Sort units heaviest first with names as a tie-break, then sort by name and implement <code>findByName</code> with <code>std.sort.binarySearch</code> and a <code>cmpName(key, item) Order</code> function using <code>std.mem.order</code>. Name the file: <code>exercises/24-std-tour/ex3_sort_search.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 24, exercise 3: sort by several keys, then binary search.
+//! Run with:  zig test ex3_sort_search.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Unit = struct { name: []const u8, tons: u32, bv: u32 };
+
+/// Heaviest first; equal tonnage sorts by name A to Z.
+fn byWeightThenName(_: void, a: Unit, b: Unit) bool {
+    if (a.tons != b.tons) return a.tons &gt; b.tons;
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+/// Sort by name only (for searching).
+fn byName(_: void, a: Unit, b: Unit) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn cmpName(key: []const u8, item: Unit) std.math.Order {
+    return std.mem.order(u8, key, item.name);
+}
+
+/// Index of the unit called `name` in a name-sorted slice, or null.
+fn findByName(units: []const Unit, name: []const u8) ?usize {
+    return std.sort.binarySearch(Unit, units, name, cmpName);
+}
+
+fn fixture() [5]Unit {
+    return .{
+        .{ .name = "Marauder", .tons = 75, .bv = 1363 },
+        .{ .name = "Atlas", .tons = 100, .bv = 1897 },
+        .{ .name = "Locust", .tons = 20, .bv = 432 },
+        .{ .name = "Warhammer", .tons = 70, .bv = 1363 },
+        .{ .name = "Archer", .tons = 70, .bv = 1300 },
+    };
+}
+
+test "weight then name" {
+    var units = fixture();
+    std.mem.sort(Unit, &amp;units, {}, byWeightThenName);
+    try std.testing.expectEqualStrings("Atlas", units[0].name);
+    try std.testing.expectEqualStrings("Marauder", units[1].name);
+    try std.testing.expectEqualStrings("Archer", units[2].name); // 70 tons, A before W
+    try std.testing.expectEqualStrings("Warhammer", units[3].name);
+    try std.testing.expectEqualStrings("Locust", units[4].name);
+}
+
+test "binary search by name" {
+    var units = fixture();
+    std.mem.sort(Unit, &amp;units, {}, byName);
+    try std.testing.expect(std.sort.isSorted(Unit, &amp;units, {}, byName));
+    try std.testing.expectEqual(@as(?usize, 0), findByName(&amp;units, "Archer"));
+    try std.testing.expectEqual(@as(?usize, 4), findByName(&amp;units, "Warhammer"));
+    try std.testing.expectEqual(@as(?usize, null), findByName(&amp;units, "Rifleman"));
+}</code></pre>
+  <p><code>std.mem.order(u8, a, b)</code> is the three-way comparison for slices, the exact shape <code>binarySearch</code> wants. A binary search on a slice that is not sorted by the same key returns nonsense, which is why the test asserts <code>isSorted</code> first.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 24.4 · Payroll and days off <span class="level">practice</span></h4>
+  <p>Use an <code>EnumArray(Role, u64)</code> to total salaries per role, an <code>IntegerBitSet(7)</code> to record which weekdays anyone is off, and set algebra to find the first day everyone is present. Name the file: <code>exercises/24-std-tour/ex4_payroll.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 24, exercise 4: EnumArray and a bit set.
+//! Run with:  zig test ex4_payroll.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Role = enum { pilot, tech, medic, admin };
+const Person = struct { role: Role, salary: u32, day_off: u3 }; // day 0..6
+
+/// Total salary per role.
+fn payroll(people: []const Person) std.enums.EnumArray(Role, u64) {
+    var totals = std.enums.EnumArray(Role, u64).initFill(0);
+    for (people) |p| totals.getPtr(p.role).* += p.salary;
+    return totals;
+}
+
+/// Which days of the week (0..6) is at least one person off?
+fn daysOff(people: []const Person) std.bit_set.IntegerBitSet(7) {
+    var days = std.bit_set.IntegerBitSet(7).initEmpty();
+    for (people) |p| days.set(p.day_off);
+    return days;
+}
+
+/// First day nobody is off, or null if every day has someone away.
+fn firstFullStrengthDay(people: []const Person) ?u3 {
+    const off = daysOff(people);
+    var all = std.bit_set.IntegerBitSet(7).initFull();
+    all.setIntersection(off.complement());
+    const first = all.findFirstSet() orelse return null;
+    return @intCast(first);
+}
+
+const crew = [_]Person{
+    .{ .role = .pilot, .salary = 1500, .day_off = 0 },
+    .{ .role = .pilot, .salary = 1200, .day_off = 1 },
+    .{ .role = .tech, .salary = 900, .day_off = 1 },
+    .{ .role = .medic, .salary = 1100, .day_off = 5 },
+};
+
+test "payroll" {
+    const t = payroll(&amp;crew);
+    try std.testing.expectEqual(@as(u64, 2700), t.get(.pilot));
+    try std.testing.expectEqual(@as(u64, 900), t.get(.tech));
+    try std.testing.expectEqual(@as(u64, 0), t.get(.admin));
+}
+
+test "days" {
+    const off = daysOff(&amp;crew);
+    try std.testing.expectEqual(@as(usize, 3), off.count());
+    try std.testing.expect(off.isSet(5));
+    try std.testing.expect(!off.isSet(2));
+    try std.testing.expectEqual(@as(?u3, 2), firstFullStrengthDay(&amp;crew));
+    const everyone = [_]Person{
+        .{ .role = .tech, .salary = 1, .day_off = 0 }, .{ .role = .tech, .salary = 1, .day_off = 1 },
+        .{ .role = .tech, .salary = 1, .day_off = 2 }, .{ .role = .tech, .salary = 1, .day_off = 3 },
+        .{ .role = .tech, .salary = 1, .day_off = 4 }, .{ .role = .tech, .salary = 1, .day_off = 5 },
+        .{ .role = .tech, .salary = 1, .day_off = 6 },
+    };
+    try std.testing.expectEqual(@as(?u3, null), firstFullStrengthDay(&amp;everyone));
+}</code></pre>
+  <p><code>complement()</code> flips every bit, <code>setIntersection</code> ands in place, and <code>findFirstSet</code> gives the lowest set bit as <code>?usize</code>. The <code>u3</code> for a day index is the compiler enforcing 0 to 7 for you.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 24.5 · A binary record <span class="level">challenge</span></h4>
+<p>Define an 8-byte big-endian wire format (<code>u32</code> id, <code>u16</code> armor, <code>u8</code> flags, one zero pad byte) and write <code>encode</code> and <code>decode</code> with <code>writeInt</code> and <code>readInt</code>. Decoding must reject a non-zero pad byte. Name the file: <code>exercises/24-std-tour/ex5_record.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 24, exercise 5: a fixed binary record with explicit byte order.
+//! Run with:  zig test ex5_record.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Wire format, 8 bytes, big-endian: id u32, armor u16, flags u8, pad u8 (zero).
+const Record = struct { id: u32, armor: u16, flags: u8 };
+const size = 8;
+
+fn encode(r: Record, out: *[size]u8) void {
+    std.mem.writeInt(u32, out[0..4], r.id, .big);
+    std.mem.writeInt(u16, out[4..6], r.armor, .big);
+    out[6] = r.flags;
+    out[7] = 0;
+}
+
+fn decode(in: *const [size]u8) !Record {
+    if (in[7] != 0) return error.BadPadding;
+    return .{
+        .id = std.mem.readInt(u32, in[0..4], .big),
+        .armor = std.mem.readInt(u16, in[4..6], .big),
+        .flags = in[6],
+    };
+}
+
+test "known bytes" {
+    var buf: [size]u8 = undefined;
+    encode(.{ .id = 258, .armor = 0x0102, .flags = 0xAB }, &amp;buf);
+    try std.testing.expectEqualSlices(u8, &amp;.{ 0, 0, 1, 2, 1, 2, 0xAB, 0 }, &amp;buf);
+}
+
+test "round trip" {
+    var buf: [size]u8 = undefined;
+    const r: Record = .{ .id = 0xDEADBEEF, .armor = 65535, .flags = 7 };
+    encode(r, &amp;buf);
+    try std.testing.expectEqual(r, try decode(&amp;buf));
+}
+
+test "bad padding" {
+    var buf: [size]u8 = .{ 0, 0, 0, 1, 0, 0, 0, 9 };
+    try std.testing.expectError(error.BadPadding, decode(&amp;buf));
+    buf[7] = 0;
+    try std.testing.expectEqual(@as(u32, 1), (try decode(&amp;buf)).id);
+}</code></pre>
+  <p><code>out[0..4]</code> on a pointer-to-array with comptime bounds is itself a <code>*[4]u8</code>, exactly the type <code>writeInt</code> requires; a wrong slice length is a compile error, not a runtime bug.</p></details>
+</div>
+
+<h3 id="ch24-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is the difference between <code>tokenizeScalar</code> and <code>splitScalar</code> on <code>"a,,b"</code>? <details class="answer"><summary>Answer</summary>Tokenize yields <code>a</code>, <code>b</code> (empty pieces are skipped). Split yields <code>a</code>, an empty string, <code>b</code>.</details></li>
+  <li>Why does every <code>std.mem</code> search function take a type as its first argument? <details class="answer"><summary>Answer</summary>They are generic over the element type: <code>indexOf(u8, ...)</code> searches bytes, <code>indexOf(u32, ...)</code> searches integers. Text is just the common case.</details></li>
+  <li>What does <code>std.mem.sort</code> need from you to sort a slice of structs? <details class="answer"><summary>Answer</summary>A <code>lessThan</code> function <code>fn (context, a: T, b: T) bool</code> (with <code>{}</code> as the context when none is needed), ideally with a tie-break so the order is fully determined.</details></li>
+  <li>What is the 0.16 signature of the compare function for <code>std.sort.binarySearch</code>? <details class="answer"><summary>Answer</summary><code>fn (key: K, item: T) std.math.Order</code>; the key is passed as the context argument, and the result is <code>?usize</code>.</details></li>
+  <li>How do <code>divTrunc</code>, <code>divFloor</code> and <code>divCeil</code> differ on <code>-7 / 2</code>? <details class="answer"><summary>Answer</summary><code>-3</code>, <code>-4</code> and <code>-3</code> respectively: toward zero, toward negative infinity, toward positive infinity.</details></li>
+  <li>What replaced <code>std.math.absCast</code> and <code>std.BoundedArray</code>? <details class="answer"><summary>Answer</summary><code>@abs</code> (which returns the unsigned type) and <code>std.ArrayList(T).initBuffer(&amp;buf)</code> with the <code>appendBounded</code> family.</details></li>
+  <li>Why is <code>"héllo".len</code> 6 and not 5? <details class="answer"><summary>Answer</summary><code>len</code> counts bytes and <code>é</code> is two bytes in UTF-8. Use <code>std.unicode.utf8CountCodepoints</code> for characters.</details></li>
+  <li>When would you pick <code>EnumArray</code> over a hash map keyed by the enum? <details class="answer"><summary>Answer</summary>Whenever the key is an exhaustive enum: an <code>EnumArray</code> has a slot for every member, never allocates, cannot miss, and is indexed by the enum directly.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>The standard library source is the reference; names follow patterns (<code>Scalar</code>, <code>Any</code>, <code>Sequence</code>).</li>
+<li><code>std.mem</code>: <code>eql</code>, <code>indexOf*</code>, <code>lastIndexOf</code>, <code>startsWith</code>/<code>endsWith</code>, <code>trim*</code>, <code>count</code>, <code>replace</code>, <code>reverse</code>, <code>min</code>/<code>max</code>, <code>zeroes</code>, <code>asBytes</code>, <code>readInt</code>/<code>writeInt</code>.</li>
+<li>Tokenize skips empty pieces; split keeps them. Both return slices into the input.</li>
+<li><code>std.mem.sort</code> with a <code>lessThan</code>; <code>std.sort.asc</code>/<code>desc</code>; <code>binarySearch(T, items, key, cmp)</code> with an <code>Order</code> compare.</li>
+<li><code>std.math</code>: <code>maxInt</code>/<code>minInt</code>, <code>clamp</code>, three divisions, <code>pow</code>/<code>sqrt</code>/<code>log2</code>, safe <code>cast</code>, checked <code>add</code>/<code>mul</code>; <code>@abs</code> replaces <code>absCast</code>.</li>
+<li><code>std.ascii</code> is byte-wise; <code>std.unicode</code> counts code points.</li>
+<li><code>std.debug.assert</code>, <code>dumpCurrentStackTrace</code>; <code>std.meta.stringToEnum</code>, <code>activeTag</code>, <code>eql</code>.</li>
+<li><code>EnumArray</code>, <code>EnumMap</code>, <code>EnumSet</code>, <code>IntegerBitSet</code>/<code>StaticBitSet</code>; <code>ArrayList.initBuffer</code> replaces <code>BoundedArray</code>.</li>
+</ul></div>
+</section>

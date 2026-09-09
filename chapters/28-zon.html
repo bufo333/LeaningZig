@@ -1,0 +1,610 @@
+<section id="ch28">
+<h2>28. ZON: data files as code</h2>
+<p class="goals"><strong>In this chapter</strong> you will move a table of numbers out of your source and into a <code>.zon</code> file, import it with a declared type so the compiler checks every entry, and see exactly what happens when the file is wrong. You will also parse ZON at run time with <code>std.zon.parse</code>, write it back with <code>std.zon.stringify</code>, and read the <code>build.zig.zon</code> that every project carries.</p>
+
+<h3 id="ch28-1">28.1 What ZON is</h3>
+<p>ZON stands for Zig Object Notation. It is not a new language: it is the subset of Zig you already use to write literals. An anonymous struct literal <code>.{ .a = 1 }</code>, an anonymous list <code>.{ 1, 2, 3 }</code>, numbers, strings, booleans, <code>null</code>, and enum literals such as <code>.common</code>. A ZON file contains exactly one such value and nothing else: no <code>const</code>, no functions, no expressions like <code>2 + 3</code>, no references to other names. Comments are allowed.</p>
+<p>Here is a small table of balance knobs in that form. Save it as <code>tuning.zon</code>.</p>
+<p class="file">tuning.zon</p>
+<pre><code>// Tuning knobs. Typed against `Tuning` in tuning.zig at compile time.
+.{
+    .person = .{
+        .fatigue_tired = 30,
+        .exhausted_fatigue = 70,
+        .turnover_target = 3, // 2d6 &lt; 3 + flags
+    },
+    .market = .{
+        .fab_cost_bp = 12_000,
+        .fab_days = 14,
+    },
+}</code></pre>
+<p>If you have used JSON, the mapping is direct: braces become <code>.{ }</code>, keys become <code>.name =</code>, and you gain three things JSON lacks: comments, numeric underscores like <code>12_000</code>, and enum literals. If you have used TOML or YAML, ZON is stricter and smaller; there is one way to write everything, and <code>zig fmt</code> formats it.</p>
+
+<h3 id="ch28-2">28.2 Importing a ZON file with a declared type</h3>
+<p>The remarkable part is how you load it. You do not open the file at run time. You <code>@import</code> it, the same builtin you use for other source files, and assign the result to a constant with an explicit type. The compiler reads the file while compiling, treats it as a literal, and coerces it to that type.</p>
+<p class="file">typed.zig</p>
+<pre><code>const std = @import("std");
+
+pub const Tuning = struct {
+    person: struct { fatigue_tired: u8, exhausted_fatigue: u8, turnover_target: u8 },
+    market: struct { fab_cost_bp: u32, fab_days: u32 },
+};
+
+pub const t: Tuning = @import("tuning.zon");
+
+pub fn main() void {
+    std.debug.print("tired at {d}, exhausted at {d}\n", .{ t.person.fatigue_tired, t.person.exhausted_fatigue });
+    std.debug.print("fab: {d} bp over {d} days\n", .{ t.market.fab_cost_bp, t.market.fab_days });
+}</code></pre>
+<pre class="term">$ zig run typed.zig
+tired at 30, exhausted at 70
+fab: 12000 bp over 14 days</pre>
+<p>Yes, that is plain <code>zig run</code> on a single file with the <code>.zon</code> sitting next to it. No build script is needed as long as the data file lives in the same directory as the source, or below it. The constant <code>t</code> is an ordinary <code>Tuning</code> value that exists in the compiled binary; reading <code>t.market.fab_days</code> costs the same as reading any other constant, and there is nothing to parse when the program starts.</p>
+<div class="note"><strong>The type annotation is what makes it safe.</strong> Without <code>: Tuning</code>, the import would still work, but the value would be an anonymous struct and any typo in the file would only surface where a field is used, if at all. With the annotation, the whole file is checked against the whole struct at the point of import, once, for every build.</div>
+
+<h3 id="ch28-3">28.3 What the compiler catches</h3>
+<p>Let us break the file on purpose. First a misspelled field name (<code>turnover_targt</code>):</p>
+<pre class="term">$ zig run bad.zig
+bad.zon:2:82: error: unexpected field 'turnover_targt'
+    .person = .{ .fatigue_tired = 30, .exhausted_fatigue = 70, .turnover_targt = 3 },
+                                                                                 ^
+bad.zig:8:31: note: imported here
+pub const t: Tuning = @import("bad.zon");
+                              ^~~~~~~~~</pre>
+<p>Then a value that does not fit its field (<code>exhausted_fatigue</code> is a <code>u8</code>) and a string where a number belongs:</p>
+<pre class="term">$ zig run bad2.zig
+bad2.zon:2:60: error: type 'u8' cannot represent integer value '300'
+    .person = .{ .fatigue_tired = 30, .exhausted_fatigue = 300, .turnover_target = 3 },
+                                                           ^~~
+bad2.zig:8:31: note: imported here
+pub const t: Tuning = @import("bad2.zon");</pre>
+<p>Each error points at the line and column <em>in the data file</em>, with a note showing which import pulled it in. A missing field without a default is reported the same way. Compare this with a JSON config loaded at start-up: the typo is discovered by a player, perhaps hours into a campaign, when the game reads a field that is not there. Here it is discovered by the person who made the typo, seconds later, before the program even links.</p>
+<div class="warn"><strong>The first error stops the file.</strong> The compiler reports the first problem in a ZON file and stops. If your file has three mistakes you will fix them one at a time. That is still far better than finding them one at a time at run time.</div>
+
+<h3 id="ch28-4">28.4 Lists of records, with defaults</h3>
+<p>Tables are usually lists of rows. In ZON a list is an anonymous tuple, <code>.{ row, row, row }</code>, and it coerces to a slice of the row type. Struct fields with default values need not be written in every row, which keeps a catalogue readable.</p>
+<p class="file">designs.zon</p>
+<pre><code>.{
+    .{ .key = "SHD-2H", .name = "Shadow Hawk", .tonnage = 55, .rarity = .common, .jump_mp = 3 },
+    .{ .key = "AS7-D", .name = "Atlas", .tonnage = 100, .rarity = .rare },
+    .{ .key = "LCT-1V", .name = "Locust", .tonnage = 20, .rarity = .common, .walk_mp = 8 },
+}</code></pre>
+<p class="file">designs.zig</p>
+<pre><code>const std = @import("std");
+
+pub const Rarity = enum { common, uncommon, rare };
+pub const Design = struct {
+    key: []const u8,
+    name: []const u8,
+    tonnage: u32,
+    rarity: Rarity,
+    walk_mp: u8 = 4,
+    jump_mp: u8 = 0,
+};
+
+pub const catalog: []const Design = @import("designs.zon");
+
+pub fn find(key: []const u8) ?Design {
+    for (catalog) |d| if (std.mem.eql(u8, d.key, key)) return d;
+    return null;
+}
+
+pub fn main() void {
+    std.debug.print("{d} designs\n", .{catalog.len});
+    for (catalog) |d| {
+        std.debug.print("{s:&lt;8} {s:&lt;12} {d:&gt;3}t walk {d} jump {d} {s}\n", .{ d.key, d.name, d.tonnage, d.walk_mp, d.jump_mp, @tagName(d.rarity) });
+    }
+    if (find("AS7-D")) |atlas| std.debug.print("Atlas weighs {d}\n", .{atlas.tonnage});
+}
+
+test "every key is unique" {
+    for (catalog, 0..) |a, i| {
+        for (catalog[i + 1 ..]) |b| {
+            try std.testing.expect(!std.mem.eql(u8, a.key, b.key));
+        }
+    }
+}
+
+test "tonnage is a multiple of 5 between 20 and 100" {
+    for (catalog) |d| {
+        try std.testing.expect(d.tonnage &gt;= 20 and d.tonnage &lt;= 100 and d.tonnage % 5 == 0);
+    }
+}</code></pre>
+<pre class="term">$ zig run designs.zig
+3 designs
+SHD-2H   Shadow Hawk   55t walk 4 jump 3 common
+AS7-D    Atlas        100t walk 4 jump 0 rare
+LCT-1V   Locust        20t walk 8 jump 0 common
+Atlas weighs 100
+$ zig test designs.zig
+1/2 designs.test.every key is unique...OK
+2/2 designs.test.tonnage is a multiple of 5 between 20 and 100...OK
+All 2 tests passed.</pre>
+<p>The declared type is <code>[]const Design</code>, so the tuple of three anonymous structs becomes a slice of three <code>Design</code> values, and the Atlas row gets <code>walk_mp = 4</code> and <code>jump_mp = 0</code> from the defaults. The enum literal <code>.rare</code> is checked against <code>Rarity</code>; write <code>.legendary</code> and the build fails.</p>
+<p>The two tests show the second half of the pattern. The type system checks <em>shape</em>: field names, field types, enum tags. It cannot check <em>meaning</em>: that keys are unique, that tonnage is in the BattleTech range. So you write tests over the imported table, and because the table is a compile-time constant, those tests run on the real data every time. IRON LEDGER's data tests work this way: every loadout part must exist in the parts catalogue, every random-assignment entry must name a real design.</p>
+
+<h3 id="ch28-5">28.5 Where the file may live</h3>
+<p><code>@import</code> resolves paths relative to the importing file, and subdirectories are fine: <code>@import("data/tables/tuning.zon")</code> works with <code>zig run</code>. What does not work is reaching upward. A file outside the directory tree of the root source file is refused:</p>
+<pre class="term">$ cd inner &amp;&amp; zig run outside.zig
+outside.zig:8:31: error: import of file outside module path
+pub const t: Tuning = @import("../tuning.zon");
+                              ^~~~~~~~~~~~~~~</pre>
+<p>The rule is the same for <code>.zig</code> files: a module is a directory tree with one root, and imports cannot escape it. Projects that keep data beside the source tree (<code>data/</code> next to <code>src/</code>, as IRON LEDGER does) solve this in <code>build.zig</code>: <code>addAnonymousImport</code> binds a file anywhere on disk to a name, and the code writes <code>@import("tuning_zon")</code>. Section 28.9 shows the minimum version and <a href="#ch31">Chapter 31</a> explains the build script in full.</p>
+
+<h3 id="ch28-6">28.6 Parsing ZON at run time</h3>
+<p>Sometimes the data is not known when you compile: a user's settings file, a save game, a mod dropped into a folder. For that there is <code>std.zon.parse</code>. It takes the target type, an allocator, the text, an optional diagnostics object and an options struct, and returns a value of the type or <code>error.ParseZon</code>.</p>
+<p>The text must be sentinel-terminated (<code>[:0]const u8</code>), because the parser is the compiler's own tokenizer and it wants a zero byte at the end. String literals already have one; text read from a file needs <code>allocator.dupeZ</code>. There are two entry points:</p>
+<ul>
+<li><code>std.zon.parse.fromSlice(T, gpa, source, diag, options)</code> for types that contain no pointers (plain numbers, enums, booleans, fixed arrays, nested structs of those). The result needs no freeing.</li>
+<li><code>std.zon.parse.fromSliceAlloc(T, gpa, source, diag, options)</code> for types with slices or strings. Free the result with <code>std.zon.parse.free(gpa, value)</code>, or simpler, parse into an arena and free everything at once.</li>
+</ul>
+<p class="file">runtime_nopointer.zig</p>
+<pre><code>const std = @import("std");
+
+const Point = struct { x: i32, y: i32 };
+
+pub fn main(init: std.process.Init) !void {
+    const p = try std.zon.parse.fromSlice(Point, init.gpa, ".{ .x = 3, .y = -4 }", null, .{});
+    std.debug.print("({d}, {d})\n", .{ p.x, p.y });
+}</code></pre>
+<pre class="term">$ zig run runtime_nopointer.zig
+(3, -4)</pre>
+<p class="file">runtime.zig</p>
+<pre><code>const std = @import("std");
+
+const Config = struct {
+    seed: u64 = 3025,
+    difficulty: enum { easy, normal, hard } = .normal,
+    autosave: bool = true,
+    company_name: []const u8 = "Unnamed",
+};
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const source: [:0]const u8 =
+        \\.{ .seed = 42, .difficulty = .hard, .company_name = "Kell Hounds" }
+    ;
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(gpa);
+    const cfg = std.zon.parse.fromSliceAlloc(Config, gpa, source, &amp;diag, .{}) catch |err| {
+        std.debug.print("could not parse config: {s}\n{f}", .{ @errorName(err), diag });
+        return err;
+    };
+    defer std.zon.parse.free(gpa, cfg);
+    std.debug.print("seed={d} difficulty={s} autosave={} name={s}\n", .{ cfg.seed, @tagName(cfg.difficulty), cfg.autosave, cfg.company_name });
+
+    const broken: [:0]const u8 = ".{ .seed = 42, .difficulty = .impossible }";
+    var diag2: std.zon.parse.Diagnostics = .{};
+    defer diag2.deinit(gpa);
+    _ = std.zon.parse.fromSliceAlloc(Config, gpa, broken, &amp;diag2, .{}) catch |err| {
+        std.debug.print("second parse failed: {s}\n{f}", .{ @errorName(err), diag2 });
+    };
+}</code></pre>
+<pre class="term">$ zig run runtime.zig
+seed=42 difficulty=hard autosave=true name=Kell Hounds
+second parse failed: ParseZon
+1:31: error: unexpected enum literal 'impossible'
+1:31: note: supported: 'easy', 'normal', 'hard'</pre>
+<p>Three things to notice. Defaults in the struct apply to fields the text omits, exactly as with <code>@import</code>. The <code>Diagnostics</code> value, printed with the <code>{f}</code> specifier, produces the same quality of message the compiler gives, including the list of accepted enum tags. And <code>options</code> is a struct with two useful fields: <code>ignore_unknown_fields</code> (default <code>false</code>, so a typo is an error) and <code>free_on_error</code>.</p>
+<div class="note"><strong>Use an arena for parsed data.</strong> A parsed <code>Config</code> whose <code>company_name</code> came from the text owns heap memory, while one that kept the default points at a string literal. <code>std.zon.parse.free</code> knows the difference in practice, but the simplest robust habit is to parse with an <code>ArenaAllocator</code> and <code>deinit</code> the arena when you are done, as Exercise 28.2 does.</div>
+
+<h3 id="ch28-7">28.7 @embedFile: bytes in the binary</h3>
+<p>Between "checked at compile time" and "parsed at run time" there is a third option. <code>@embedFile("path")</code> reads a file while compiling and gives you its bytes as a constant, sentinel-terminated string. The file is baked into the executable, so nothing needs to exist on disk when the program runs, but the bytes are not interpreted: you parse them yourself.</p>
+<p class="file">embed.zig</p>
+<pre><code>const std = @import("std");
+
+const Point = struct { x: i32, y: i32 };
+const raw = @embedFile("point.zon");
+
+pub fn main(init: std.process.Init) !void {
+    std.debug.print("embedded {d} bytes: {s}", .{ raw.len, raw });
+    const p = try std.zon.parse.fromSlice(Point, init.gpa, raw, null, .{});
+    std.debug.print("parsed ({d}, {d})\n", .{ p.x, p.y });
+    const typed: Point = @import("point.zon");
+    std.debug.print("imported ({d}, {d})\n", .{ typed.x, typed.y });
+}</code></pre>
+<pre class="term">$ zig run embed.zig
+embedded 20 bytes: .{ .x = 7, .y = 9 }
+parsed (7, 9)
+imported (7, 9)</pre>
+<p>The same file is used both ways so you can see the difference: <code>@embedFile</code> gives raw text that <code>fromSlice</code> then parses (its sentinel makes it directly acceptable), while <code>@import</code> gives a finished value. Use <code>@embedFile</code> for things that are not ZON at all, such as a test image or a shader; IRON LEDGER embeds a small PNG for its decoder's tests.</p>
+
+<h3 id="ch28-8">28.8 Writing ZON</h3>
+<p>The reverse direction is <code>std.zon.stringify.serialize(value, options, writer)</code>. It walks the value with reflection (<a href="#ch27">Chapter 27</a>) and writes valid ZON to any <code>*std.Io.Writer</code>. The default output is formatted the way <code>zig fmt</code> would format it; <code>.{ .whitespace = false }</code> gives one compact line.</p>
+<p class="file">stringify.zig</p>
+<pre><code>const std = @import("std");
+
+const Save = struct { day: u32, funds: i64, name: []const u8, roster: []const u8 };
+
+pub fn main(init: std.process.Init) !void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const s = Save{ .day = 12, .funds = -3_500, .name = "Kell Hounds", .roster = "ABC" };
+    try std.zon.stringify.serialize(s, .{}, &amp;w.interface);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
+}</code></pre>
+<pre class="term">$ zig run stringify.zig
+.{
+    .day = 12,
+    .funds = -3500,
+    .name = "Kell Hounds",
+    .roster = "ABC",
+}</pre>
+<p>Because the output is a legal ZON literal, it can be read back by <code>std.zon.parse</code> at run time or even by <code>@import</code> if you commit it as a source file. Exercise 28.3 makes a round trip.</p>
+
+<h3 id="ch28-9">28.9 build.zig.zon: the file every project has</h3>
+<p>You have already met one ZON file without being told: <code>build.zig.zon</code>, which <code>zig init</code> generates beside <code>build.zig</code>. It is the package manifest, and it is parsed by the compiler with a declared type just like your tuning table. Trimmed of its comments, the 0.16 version looks like this:</p>
+<pre><code>.{
+    .name = .init,
+    .version = "0.0.0",
+    .fingerprint = 0xc674e47417e230d0, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // .example = .{ .url = "https://…/foo.tar.gz", .hash = "…" },
+        // .local = .{ .path = "foo" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}</code></pre>
+<ul>
+<li><code>.name</code> is an enum literal, not a string: the package's identifier.</li>
+<li><code>.fingerprint</code> is generated once and never changed; it is how the toolchain recognises a package across versions.</li>
+<li><code>.dependencies</code> maps names to either a <code>url</code> plus <code>hash</code> or a local <code>path</code>. <code>zig fetch --save &lt;url&gt;</code> fills entries in for you.</li>
+<li><code>.paths</code> lists what belongs to the package when it is fetched by someone else.</li>
+</ul>
+<p>Everything you learned about ZON applies: comments are fine, a misspelled key is an error with a line number, and the file is checked before any build step runs.</p>
+
+<h3 id="ch28-10">28.10 Data beside the source: a first look at addAnonymousImport</h3>
+<p>To import a file from outside the source tree, <code>build.zig</code> can name it. Here is the smallest project that does so. The full meaning of every line waits for <a href="#ch31">Chapter 31</a>; for now, focus on the two lines marked with the import name.</p>
+<p class="file">proj/build.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // -Ddata=&lt;dir&gt; overlays data/tuning.zon from another directory (a "mod").
+    const data_dir = b.option([]const u8, "data", "Directory overlaying data/*.zon");
+
+    const exe = b.addExecutable(.{
+        .name = "tables",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    var tuning_path: std.Build.LazyPath = b.path("data/tuning.zon");
+    if (data_dir) |dir| tuning_path = .{ .cwd_relative = b.pathJoin(&amp;.{ dir, "tuning.zon" }) };
+    exe.root_module.addAnonymousImport("tuning_zon", .{ .root_source_file = tuning_path });
+
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&amp;run_cmd.step);
+
+    const tests = b.addTest(.{ .root_module = exe.root_module });
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&amp;b.addRunArtifact(tests).step);
+}</code></pre>
+<p class="file">proj/src/main.zig</p>
+<pre><code>const std = @import("std");
+
+pub const Tuning = struct {
+    person: struct { fatigue_tired: u8, exhausted_fatigue: u8, turnover_target: u8 },
+    market: struct { fab_cost_bp: u32, fab_days: u32 },
+};
+
+/// The live table: whichever file build.zig bound to the name "tuning_zon".
+pub const t: Tuning = @import("tuning_zon");
+
+pub fn main() void {
+    std.debug.print("fab_days = {d}\n", .{t.market.fab_days});
+}
+
+test "fab days is at least a week" {
+    try std.testing.expect(t.market.fab_days &gt;= 7);
+}</code></pre>
+<pre class="term">$ zig build run
+fab_days = 14
+$ zig build run -Ddata=mymod
+fab_days = 7
+$ zig build test --summary all
+Build Summary: 3/3 steps succeeded; 1/1 tests passed
+test success
++- run test 1 pass (1 total) 229ms MaxRSS:2M
+   +- compile test Debug native success 979ms MaxRSS:263M</pre>
+<p>The source file says <code>@import("tuning_zon")</code>, a name with no path and no extension. The build script decides which file that name means: <code>data/tuning.zon</code> normally, or <code>mymod/tuning.zon</code> when the user passes <code>-Ddata=mymod</code>. The simulation code neither knows nor cares. This is the mechanism behind IRON LEDGER's mod support, and it is why the modding guide tells you to run <code>zig build test -Ddata=mymod</code>: the same data tests run against your replacement tables.</p>
+
+<h3 id="ch28-11">28.11 Why compile-time data beats JSON for game tables</h3>
+<p>It is worth stating the trade-off plainly, because "just use JSON" is the default in most ecosystems.</p>
+<table class="compare">
+<tr><th>JSON parsed at start-up</th><th>ZON imported at compile time</th></tr>
+<tr><td>Typos found when the field is read, maybe never</td><td>Typos found at the import, with a line number</td></tr>
+<tr><td>Needs a parser, an allocator and error handling at run time</td><td>No run-time cost at all; the value is a constant</td></tr>
+<tr><td>Types are whatever the parser guesses (every number is a double)</td><td>Types are whatever your struct says (<code>u8</code>, <code>CBills</code>, an enum)</td></tr>
+<tr><td>Comments are not allowed</td><td>Comments are allowed</td></tr>
+<tr><td>Data can change without rebuilding</td><td>Changing data means rebuilding</td></tr>
+<tr><td>Tests need fixtures that mirror the real file</td><td>Tests run over the real table</td></tr>
+</table>
+<p>The last row of the left column is the one real advantage of run-time data, and it is exactly why the game keeps <em>both</em> tools: balance tables that ship with the binary are ZON imported at compile time, while player settings and mod overlays that must vary after the build go through <code>std.zon.parse</code> or the build option. Choose by asking "who changes this, and when?"</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> Every table the simulation reads is a ZON file under <code>game/data/</code>, bound by name in <code>build.zig</code> and imported with a declared type. The tuning table opens like this (<code>game/data/tables/tuning.zon</code>):
+<pre><code>// Tuning knobs. Typed against domain/tuning.zig `Tuning` at comptime.
+.{
+    .hq = .{
+        .influence_ly = .{ .field = 15, .regional = 60, .brigade = 90 },
+        .paperwork_base_days = 21,
+        .upgrade_cost_per_level = .{ .mek_bay = 800_000, .warehouse = 400_000, /* … */ },
+    },
+    .person = .{
+        .fatigue_tired = 30,
+        .exhausted_fatigue = 70,
+        .turnover_target = 3, // 2d6 &lt; 3 + flags
+        // …
+    },
+}</code></pre>
+and <code>game/src/domain/tuning.zig</code> gives it a shape and a name: <code>pub const t: Tuning = @import("tuning_zon");</code>. The design catalogue works the same way, one struct per row with defaults so a vehicle need not state mek-only fields; a row of <code>game/data/chassis.zon</code> reads <code>.{ .key = "SHD-2H", .name = "Shadow Hawk", .tonnage = 55, .bv = 1064, .cost = 4_701_800, .rarity = .common, .walk_mp = 5, .jump_mp = 3, … }</code>. The 97 designs, 234 systems and every knob are type-checked on every build, and the data tests in the same files check what types cannot.</div>
+
+<h3 id="ch28-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 28.1 · A typed design catalogue <span class="level">warm-up</span></h4>
+  <p>A small project with <code>src/designs.zon</code> next to <code>src/designs.zig</code>. Fill in <code>weightClass</code>, <code>find</code> and <code>countByRarity</code> and make the data tests pass with <code>zig build test</code> inside <code>exercises/28-zon/ex1_designs/</code>. (It is a directory exercise because the checker needs the <code>.zon</code> beside the source.)</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">src/designs.zig</p>
+<pre><code>//! Chapter 28, exercise 1: a typed design catalogue from a .zon file.
+//! Run with:  zig build test   (inside exercises/28-zon/ex1_designs/)
+//! Goal: fill in `Design`, import the catalogue, and make every test pass.
+const std = @import("std");
+
+pub const Rarity = enum { common, uncommon, rare };
+
+pub const Design = struct {
+    key: []const u8,
+    name: []const u8,
+    tonnage: u32,
+    rarity: Rarity,
+    walk_mp: u8 = 4,
+    jump_mp: u8 = 0,
+
+    pub fn weightClass(self: Design) []const u8 {
+        if (self.tonnage &lt;= 35) return "light";
+        if (self.tonnage &lt;= 55) return "medium";
+        if (self.tonnage &lt;= 75) return "heavy";
+        return "assault";
+    }
+};
+
+pub const catalog: []const Design = @import("designs.zon");
+
+pub fn find(key: []const u8) ?Design {
+    for (catalog) |d| if (std.mem.eql(u8, d.key, key)) return d;
+    return null;
+}
+
+pub fn countByRarity(r: Rarity) usize {
+    var n: usize = 0;
+    for (catalog) |d| if (d.rarity == r) {
+        n += 1;
+    };
+    return n;
+}
+
+test "catalogue has four designs" {
+    try std.testing.expectEqual(@as(usize, 4), catalog.len);
+}
+
+test "defaults fill in unspecified fields" {
+    const whm = find("WHM-6R").?;
+    try std.testing.expectEqual(@as(u8, 4), whm.walk_mp);
+    try std.testing.expectEqual(@as(u8, 0), whm.jump_mp);
+    try std.testing.expectEqual(@as(u8, 8), find("LCT-1V").?.walk_mp);
+}
+
+test "find and weight classes" {
+    try std.testing.expectEqualStrings("assault", find("AS7-D").?.weightClass());
+    try std.testing.expectEqualStrings("medium", find("SHD-2H").?.weightClass());
+    try std.testing.expect(find("nope") == null);
+}
+
+test "rarity counts" {
+    try std.testing.expectEqual(@as(usize, 2), countByRarity(.common));
+    try std.testing.expectEqual(@as(usize, 1), countByRarity(.rare));
+}
+
+test "every key is unique and every tonnage is a multiple of 5" {
+    for (catalog, 0..) |a, i| {
+        try std.testing.expect(a.tonnage % 5 == 0);
+        for (catalog[i + 1 ..]) |b| try std.testing.expect(!std.mem.eql(u8, a.key, b.key));
+    }
+}</code></pre>
+  <p>The <code>.zon</code> file has rows with and without <code>walk_mp</code>; the defaults in <code>Design</code> fill the gaps, which the second test checks.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 28.2 · Parse a config at run time <span class="level">practice</span></h4>
+  <p>Write <code>load(arena, source)</code> that parses a <code>Config</code> with <code>std.zon.parse.fromSliceAlloc</code>, printing diagnostics on failure. File: <code>exercises/28-zon/ex2_runtime.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 28, exercise 2: parse ZON at run time with std.zon.parse.
+//! Run with:  zig test ex2_runtime.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Difficulty = enum { easy, normal, hard };
+
+pub const Config = struct {
+    seed: u64 = 3025,
+    difficulty: Difficulty = .normal,
+    autosave: bool = true,
+    company_name: []const u8 = "Unnamed Company",
+};
+
+/// Parse `source` into a Config. Strings inside the result live in `arena`,
+/// so the caller frees everything by resetting the arena. On a parse error,
+/// print the diagnostics to stderr and return error.ParseZon.
+pub fn load(arena: std.mem.Allocator, source: [:0]const u8) !Config {
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(arena);
+    return std.zon.parse.fromSliceAlloc(Config, arena, source, &amp;diag, .{}) catch |err| {
+        std.debug.print("config error: {f}", .{diag});
+        return err;
+    };
+}
+
+test "full config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try load(arena.allocator(),
+        \\.{ .seed = 42, .difficulty = .hard, .autosave = false, .company_name = "Kell Hounds" }
+    );
+    try std.testing.expectEqual(@as(u64, 42), cfg.seed);
+    try std.testing.expectEqual(Difficulty.hard, cfg.difficulty);
+    try std.testing.expect(!cfg.autosave);
+    try std.testing.expectEqualStrings("Kell Hounds", cfg.company_name);
+}
+
+test "defaults apply to missing fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try load(arena.allocator(), ".{ .seed = 7 }");
+    try std.testing.expectEqual(@as(u64, 7), cfg.seed);
+    try std.testing.expectEqual(Difficulty.normal, cfg.difficulty);
+    try std.testing.expectEqualStrings("Unnamed Company", cfg.company_name);
+}
+
+test "bad enum literal is a parse error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ParseZon, load(arena.allocator(), ".{ .difficulty = .brutal }"));
+}
+
+test "unknown field is a parse error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ParseZon, load(arena.allocator(), ".{ .sead = 1 }"));
+}</code></pre>
+  <p>Parsing into the arena means the test's <code>defer arena.deinit()</code> frees the strings; no call to <code>std.zon.parse.free</code> is needed.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 28.3 · Round trip <span class="level">practice</span></h4>
+  <p>Serialize a <code>Roster</code> with <code>std.zon.stringify.serialize</code> (pretty and compact) and parse it back. File: <code>exercises/28-zon/ex3_roundtrip.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 28, exercise 3: serialize a value to ZON and read it back.
+//! Run with:  zig test ex3_roundtrip.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Pilot = struct { name: []const u8, gunnery: u8, piloting: u8 };
+pub const Roster = struct { day: u32, funds: i64, pilots: []const Pilot };
+
+/// Render `value` as ZON text into `buf`; return the written slice.
+/// `pretty` chooses multi-line Zig style; false gives one compact line.
+pub fn toZon(buf: []u8, value: anytype, pretty: bool) ![]u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try std.zon.stringify.serialize(value, .{ .whitespace = pretty }, &amp;w);
+    return w.buffered();
+}
+
+/// Parse ZON text back into a Roster, allocating from `arena`.
+/// The text must be sentinel-terminated: copy it with allocator.dupeZ first.
+pub fn fromZon(arena: std.mem.Allocator, text: []const u8) !Roster {
+    const z = try arena.dupeZ(u8, text);
+    return std.zon.parse.fromSliceAlloc(Roster, arena, z, null, .{});
+}
+
+test "round trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pilots = [_]Pilot{
+        .{ .name = "Kell", .gunnery = 3, .piloting = 4 },
+        .{ .name = "Ana", .gunnery = 5, .piloting = 5 },
+    };
+    const before = Roster{ .day = 12, .funds = -3_500, .pilots = &amp;pilots };
+    var buf: [1024]u8 = undefined;
+    const text = try toZon(&amp;buf, before, true);
+    try std.testing.expect(std.mem.indexOf(u8, text, ".name = \"Kell\"") != null);
+    const after = try fromZon(arena.allocator(), text);
+    try std.testing.expectEqual(before.day, after.day);
+    try std.testing.expectEqual(before.funds, after.funds);
+    try std.testing.expectEqual(@as(usize, 2), after.pilots.len);
+    try std.testing.expectEqualStrings("Ana", after.pilots[1].name);
+    try std.testing.expectEqual(@as(u8, 5), after.pilots[1].gunnery);
+}
+
+test "pretty and compact forms" {
+    var buf: [256]u8 = undefined;
+    const p = Pilot{ .name = "X", .gunnery = 1, .piloting = 2 };
+    try std.testing.expectEqualStrings(
+        ".{\n    .name = \"X\",\n    .gunnery = 1,\n    .piloting = 2,\n}",
+        try toZon(&amp;buf, p, true),
+    );
+    try std.testing.expectEqualStrings(".{.name=\"X\",.gunnery=1,.piloting=2}", try toZon(&amp;buf, p, false));
+}</code></pre>
+  <p><code>fromZon</code> has to copy the text with <code>dupeZ</code> because the parser demands a zero terminator, and a slice returned by <code>buffered()</code> has none.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 28.4 · A mod overlay <span class="level">challenge</span></h4>
+  <p>Finish <code>build.zig</code> in <code>exercises/28-zon/ex4_overlay/</code> so that <code>@import("tuning_zon")</code> resolves to <code>data/tuning.zon</code> normally and to <code>&lt;dir&gt;/tuning.zon</code> with <code>-Ddata=&lt;dir&gt;</code>. Verify with <code>zig build run -Ddata=mods/hardcore</code> and <code>zig build test</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">build.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // zig build -Ddata=mods/hardcore  overlays data/tuning.zon
+    const data_dir = b.option([]const u8, "data", "Directory overlaying data/tuning.zon");
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    var tuning: std.Build.LazyPath = b.path("data/tuning.zon");
+    if (data_dir) |dir| tuning = b.path(b.pathJoin(&amp;.{ dir, "tuning.zon" }));
+    mod.addAnonymousImport("tuning_zon", .{ .root_source_file = tuning });
+
+    const exe = b.addExecutable(.{ .name = "overlay", .root_module = mod });
+    b.installArtifact(exe);
+
+    const run_step = b.step("run", "Print the live tuning table");
+    run_step.dependOn(&amp;b.addRunArtifact(exe).step);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const test_step = b.step("test", "Validate the tuning table");
+    test_step.dependOn(&amp;b.addRunArtifact(tests).step);
+}</code></pre>
+<pre class="term">$ zig build run
+tired 30 exhausted 70 turnover 3
+fab 12000 bp, 14 days
+$ zig build run -Ddata=mods/hardcore
+tired 20 exhausted 50 turnover 5
+fab 20000 bp, 21 days</pre>
+  <p><code>b.option</code> returns an optional; when it is present we build a different <code>LazyPath</code> and hand it to <code>addAnonymousImport</code> under the same name.</p></details>
+</div>
+
+<h3 id="ch28-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Can a ZON file contain <code>2 * 3</code> or refer to a constant defined elsewhere? <details class="answer"><summary>Answer</summary>No. ZON is literals only: no expressions, no names, no code.</details></li>
+  <li>What does the type annotation in <code>const t: Tuning = @import("tuning.zon");</code> buy you? <details class="answer"><summary>Answer</summary>The compiler coerces the literal to <code>Tuning</code> at the import, so unknown fields, missing fields without defaults, and out-of-range values are build errors with line numbers in the data file.</details></li>
+  <li>Does plain <code>zig run main.zig</code> support <code>@import("data.zon")</code>? <details class="answer"><summary>Answer</summary>Yes, as long as the file is in the same directory as <code>main.zig</code> or below it. Paths that leave the root file's directory are refused.</details></li>
+  <li>When do you need <code>fromSliceAlloc</code> rather than <code>fromSlice</code>? <details class="answer"><summary>Answer</summary>When the target type contains pointers or slices, such as strings. <code>fromSlice</code> asserts at compile time that no allocation is needed for the result.</details></li>
+  <li>Why must the source given to <code>std.zon.parse</code> be <code>[:0]const u8</code>? <details class="answer"><summary>Answer</summary>The parser reuses the compiler's tokenizer, which expects a zero byte terminator. Use <code>dupeZ</code> for text read from a file; <code>@embedFile</code> and string literals already have one.</details></li>
+  <li>What is the difference between <code>@embedFile("x.zon")</code> and <code>@import("x.zon")</code>? <details class="answer"><summary>Answer</summary><code>@embedFile</code> gives the raw bytes as a constant string; <code>@import</code> gives the parsed, type-checked value.</details></li>
+  <li>How does a source file import a data file that lives outside its directory tree? <details class="answer"><summary>Answer</summary><code>build.zig</code> binds it to a name with <code>module.addAnonymousImport("name", .{ .root_source_file = path })</code>, and the source writes <code>@import("name")</code>.</details></li>
+  <li>Name one thing types cannot check about a table, and how the game checks it. <details class="answer"><summary>Answer</summary>Uniqueness of keys, references between tables, or ranges like "tonnage is a multiple of 5". Tests over the imported constant check those, on the real data, every build.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>ZON is the literal subset of Zig: anonymous structs and lists, numbers, strings, booleans, <code>null</code>, enum literals, comments.</li>
+<li><code>const t: T = @import("file.zon")</code> loads a file at compile time and type-checks it; errors point into the data file.</li>
+<li>Lists of rows coerce to <code>[]const Row</code>, and struct defaults fill omitted fields.</li>
+<li>Imports may go into subdirectories but never above the root file; <code>addAnonymousImport</code> in <code>build.zig</code> binds outside files to a name.</li>
+<li><code>std.zon.parse.fromSlice</code> / <code>fromSliceAlloc</code> parse ZON at run time from a sentinel-terminated string, with optional <code>Diagnostics</code>; parse into an arena.</li>
+<li><code>@embedFile</code> bakes raw bytes into the binary; <code>std.zon.stringify.serialize</code> writes ZON back out.</li>
+<li><code>build.zig.zon</code> is the package manifest, itself a ZON file with name, version, fingerprint, dependencies and paths.</li>
+<li>Compile-time data trades "change without rebuilding" for "every mistake is a build error"; game balance tables want the latter.</li>
+</ul></div>
+</section>

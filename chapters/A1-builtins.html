@@ -1,0 +1,109 @@
+<section id="appA1">
+<h2>Appendix A1. Builtin functions cheat sheet</h2>
+<p class="goals"><strong>This appendix</strong> lists every builtin used in the course, grouped by purpose. A builtin is a function whose name starts with <code>@</code>; it is part of the language, not the standard library, and it is documented in the language reference rather than in <code>std</code>. Every row was compiled with Zig 0.16.0 while this appendix was written. "Signature" is a sketch, not the formal grammar: <code>T</code> is a type, <code>x</code> a value, and the result type is often inferred from context (write <code>const n: u8 = @intCast(x)</code> or <code>@as(u8, @intCast(x))</code>).</p>
+
+<div class="note"><strong>How result types work.</strong> Many casts take no type argument. The result type comes from where the expression is used: a typed <code>const</code>, a function parameter, a struct field, or an explicit <code>@as(T, …)</code>. If the compiler says "must have a known result type", wrap the call in <code>@as</code>. This is the biggest difference from tutorials written for Zig 0.10 and earlier, where casts were written <code>@intCast(T, x)</code>.</div>
+
+<h3 id="appA1-1">A1.1 Casts and conversions</h3>
+<table>
+<tr><th>Builtin</th><th>Signature sketch</th><th>Meaning</th><th>Chapter</th></tr>
+<tr><td><code>@as</code></td><td><code>@as(T, x)</code></td><td>Give an expression an explicit type; the one cast that names its type.</td><td><a href="#ch03">3</a></td></tr>
+<tr><td><code>@intCast</code></td><td><code>@intCast(x)</code></td><td>Integer to integer of another width or signedness; panics in safe builds if the value does not fit.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@truncate</code></td><td><code>@truncate(x)</code></td><td>Keep only the low bits that fit the narrower result type; never panics.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@floatFromInt</code></td><td><code>@floatFromInt(x)</code></td><td>Integer to float.</td><td><a href="#ch05">5</a></td></tr>
+<tr><td><code>@intFromFloat</code></td><td><code>@intFromFloat(x)</code></td><td>Float to integer, truncating toward zero; panics if out of range.</td><td><a href="#ch05">5</a></td></tr>
+<tr><td><code>@floatCast</code></td><td><code>@floatCast(x)</code></td><td>Float to float of another width.</td><td><a href="#ch05">5</a></td></tr>
+<tr><td><code>@bitCast</code></td><td><code>@bitCast(x)</code></td><td>Reinterpret the bits as another type of the same size (float as int, packed struct as int).</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@enumFromInt</code></td><td><code>@enumFromInt(x)</code></td><td>Integer to enum value; the enum type comes from context.</td><td><a href="#ch13">13</a></td></tr>
+<tr><td><code>@intFromEnum</code></td><td><code>@intFromEnum(e)</code></td><td>Enum value to its integer tag.</td><td><a href="#ch13">13</a></td></tr>
+<tr><td><code>@intFromBool</code></td><td><code>@intFromBool(b)</code></td><td><code>true</code> to 1, <code>false</code> to 0, as a <code>u1</code> that widens.</td><td><a href="#ch05">5</a></td></tr>
+<tr><td><code>@ptrCast</code></td><td><code>@ptrCast(p)</code></td><td>Pointer to pointer of another pointee type.</td><td><a href="#ch18">18</a></td></tr>
+<tr><td><code>@alignCast</code></td><td><code>@alignCast(p)</code></td><td>Assert a pointer has the alignment the result type needs; checked in safe builds.</td><td><a href="#ch18">18</a></td></tr>
+<tr><td><code>@constCast</code></td><td><code>@constCast(p)</code></td><td>Remove <code>const</code> from a pointer type. Rare; usually a design smell.</td><td><a href="#ch18">18</a></td></tr>
+<tr><td><code>@intFromPtr</code></td><td><code>@intFromPtr(p)</code></td><td>Pointer to its address as <code>usize</code>.</td><td><a href="#ch18">18</a></td></tr>
+<tr><td><code>@ptrFromInt</code></td><td><code>@ptrFromInt(n)</code></td><td>Address to pointer. Used in IRON LEDGER for SQLite's <code>-1</code> sentinel.</td><td><a href="#ch47">47</a></td></tr>
+<tr><td><code>@errorCast</code></td><td><code>@errorCast(e)</code></td><td>Narrow an error set or error union to a smaller set; the result type must be known.</td><td><a href="#ch16">16</a></td></tr>
+<tr><td><code>@intFromError</code>, <code>@errorFromInt</code></td><td><code>@intFromError(e)</code></td><td>Error value to its global integer code and back. Rare.</td><td><a href="#ch16">16</a></td></tr>
+</table>
+
+<h3 id="appA1-2">A1.2 Arithmetic</h3>
+<table>
+<tr><th>Builtin</th><th>Signature sketch</th><th>Meaning</th><th>Chapter</th></tr>
+<tr><td><code>@divTrunc</code></td><td><code>@divTrunc(a, b)</code></td><td>Signed division rounding toward zero. Required for signed integers at runtime.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@divFloor</code></td><td><code>@divFloor(a, b)</code></td><td>Signed division rounding toward negative infinity.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@divExact</code></td><td><code>@divExact(a, b)</code></td><td>Division that asserts there is no remainder.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@mod</code>, <code>@rem</code></td><td><code>@mod(a, b)</code></td><td>Remainder with the sign of the divisor (<code>@mod</code>) or of the dividend (<code>@rem</code>).</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@abs</code></td><td><code>@abs(x)</code></td><td>Absolute value; for a signed integer the result is the unsigned type.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@min</code>, <code>@max</code></td><td><code>@min(a, b, …)</code></td><td>Smallest or largest of any numeric arguments; the result type is the narrowest that fits.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@addWithOverflow</code>, <code>@subWithOverflow</code>, <code>@mulWithOverflow</code>, <code>@shlWithOverflow</code></td><td><code>@addWithOverflow(a, b)</code></td><td>Return a tuple <code>{ result, overflow_bit }</code> instead of panicking.</td><td><a href="#ch04">4</a></td></tr>
+<tr><td><code>@shlExact</code>, <code>@shrExact</code></td><td><code>@shlExact(x, n)</code></td><td>Shifts that assert no bits are lost.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@clz</code>, <code>@ctz</code>, <code>@popCount</code></td><td><code>@popCount(x)</code></td><td>Count leading zeros, trailing zeros, set bits.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@byteSwap</code>, <code>@bitReverse</code></td><td><code>@byteSwap(x)</code></td><td>Reverse the byte order, or every bit.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@sqrt</code>, <code>@sin</code>, <code>@cos</code>, <code>@tan</code>, <code>@exp</code>, <code>@exp2</code>, <code>@log</code>, <code>@log2</code>, <code>@log10</code></td><td><code>@sqrt(x)</code></td><td>Float functions on scalars and vectors.</td><td><a href="#ch05">5</a></td></tr>
+<tr><td><code>@floor</code>, <code>@ceil</code>, <code>@round</code>, <code>@trunc</code></td><td><code>@floor(x)</code></td><td>Float rounding; <code>@round</code> rounds half away from zero.</td><td><a href="#ch05">5</a></td></tr>
+<tr><td><code>@mulAdd</code></td><td><code>@mulAdd(T, a, b, c)</code></td><td>Fused <code>a * b + c</code> with one rounding.</td><td><a href="#ch05">5</a></td></tr>
+</table>
+<p>Wrapping (<code>+%</code>, <code>*%</code>) and saturating (<code>+|</code>, <code>-|</code>) arithmetic are operators, not builtins; IRON LEDGER uses <code>*%</code> to seed its RNG streams and <code>-|</code> wherever a count must not go below zero (<a href="#ch41">Chapter 41</a>, <a href="#ch44">Chapter 44</a>).</p>
+
+<h3 id="appA1-3">A1.3 Memory</h3>
+<table>
+<tr><th>Builtin</th><th>Signature sketch</th><th>Meaning</th><th>Chapter</th></tr>
+<tr><td><code>@memcpy</code></td><td><code>@memcpy(dest, src)</code></td><td>Copy a slice or array into another of the same length; regions must not overlap.</td><td><a href="#ch19">19</a></td></tr>
+<tr><td><code>@memmove</code></td><td><code>@memmove(dest, src)</code></td><td>Like <code>@memcpy</code> but overlap is allowed.</td><td><a href="#ch19">19</a></td></tr>
+<tr><td><code>@memset</code></td><td><code>@memset(dest, byte)</code></td><td>Fill a slice with one value.</td><td><a href="#ch19">19</a></td></tr>
+<tr><td><code>@sizeOf</code></td><td><code>@sizeOf(T)</code></td><td>Bytes a value of <code>T</code> occupies in memory, including padding.</td><td><a href="#ch19">19</a></td></tr>
+<tr><td><code>@alignOf</code></td><td><code>@alignOf(T)</code></td><td>Required alignment of <code>T</code>.</td><td><a href="#ch19">19</a></td></tr>
+<tr><td><code>@bitSizeOf</code></td><td><code>@bitSizeOf(T)</code></td><td>Bits of information in <code>T</code> (a <code>u4</code> is 4, not 8).</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@offsetOf</code>, <code>@bitOffsetOf</code></td><td><code>@offsetOf(T, "field")</code></td><td>Byte (or bit) offset of a field within a struct.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@prefetch</code></td><td><code>@prefetch(p, .{})</code></td><td>Hint the CPU to fetch a cache line. Rare.</td><td><a href="#ch36">36</a></td></tr>
+</table>
+
+<h3 id="appA1-4">A1.4 Types and reflection</h3>
+<table>
+<tr><th>Builtin</th><th>Signature sketch</th><th>Meaning</th><th>Chapter</th></tr>
+<tr><td><code>@TypeOf</code></td><td><code>@TypeOf(x)</code></td><td>The type of an expression, without evaluating it at runtime.</td><td><a href="#ch26">26</a></td></tr>
+<tr><td><code>@typeInfo</code></td><td><code>@typeInfo(T)</code></td><td>A tagged union describing <code>T</code>: <code>.int</code>, <code>.@"struct"</code>, <code>.@"enum"</code>, <code>.@"union"</code>, <code>.optional</code>, <code>.pointer</code>, <code>.error_union</code>, <code>.@"fn"</code>… (lower-case tags, quoted where they collide with keywords).</td><td><a href="#ch27">27</a></td></tr>
+<tr><td><code>@typeName</code></td><td><code>@typeName(T)</code></td><td>The type's name as a compile-time string.</td><td><a href="#ch27">27</a></td></tr>
+<tr><td><code>@tagName</code></td><td><code>@tagName(e)</code></td><td>An enum or tagged-union value's tag as a string.</td><td><a href="#ch13">13</a></td></tr>
+<tr><td><code>@errorName</code></td><td><code>@errorName(err)</code></td><td>An error value's name as a string.</td><td><a href="#ch16">16</a></td></tr>
+<tr><td><code>@field</code></td><td><code>@field(x, "name")</code></td><td>Read or write a field by a compile-time string name.</td><td><a href="#ch27">27</a></td></tr>
+<tr><td><code>@hasField</code>, <code>@hasDecl</code></td><td><code>@hasDecl(T, "name")</code></td><td>Whether a type has a field, or a (public) declaration, of that name.</td><td><a href="#ch27">27</a></td></tr>
+<tr><td><code>@This</code></td><td><code>@This()</code></td><td>The innermost enclosing struct, union or enum; in a file, the file's own struct.</td><td><a href="#ch12">12</a></td></tr>
+<tr><td><code>@unionInit</code></td><td><code>@unionInit(U, "tag", payload)</code></td><td>Build a union value with the tag chosen by a compile-time string.</td><td><a href="#ch27">27</a></td></tr>
+<tr><td><code>@Vector</code></td><td><code>@Vector(n, T)</code></td><td>The SIMD vector type of <code>n</code> lanes of <code>T</code>.</td><td><a href="#ch29">29</a></td></tr>
+</table>
+<div class="warn"><strong>Gone in 0.16.</strong> <code>@Type</code>, which built a type from a <code>std.builtin.Type</code> value, is no longer a builtin ("invalid builtin function: '@Type'"). Tutorials that construct struct types at compile time with it do not work on 0.16; the course does not need it.</div>
+
+<h3 id="appA1-5">A1.5 Compile time</h3>
+<table>
+<tr><th>Builtin</th><th>Signature sketch</th><th>Meaning</th><th>Chapter</th></tr>
+<tr><td><code>@import</code></td><td><code>@import("file.zig")</code></td><td>Bring in a file (as a struct), a named module, <code>"std"</code>, <code>"builtin"</code>, or a <code>.zon</code> file (as a value).</td><td><a href="#ch30">30</a>, <a href="#ch28">28</a></td></tr>
+<tr><td><code>@embedFile</code></td><td><code>@embedFile("path")</code></td><td>A file's bytes as a compile-time <code>[]const u8</code>.</td><td><a href="#ch25">25</a></td></tr>
+<tr><td><code>@compileError</code></td><td><code>@compileError("msg")</code></td><td>Fail the build with a message if this code is ever analysed; the <code>else</code> arm of type switches.</td><td><a href="#ch25">25</a></td></tr>
+<tr><td><code>@compileLog</code></td><td><code>@compileLog(x, …)</code></td><td>Print values during compilation, then fail the build. A debugging tool.</td><td><a href="#ch25">25</a></td></tr>
+<tr><td><code>@setEvalBranchQuota</code></td><td><code>@setEvalBranchQuota(n)</code></td><td>Raise the limit on compile-time loop iterations.</td><td><a href="#ch25">25</a></td></tr>
+<tr><td><code>@inComptime</code></td><td><code>@inComptime()</code></td><td><code>true</code> when the current code is being evaluated at compile time.</td><td><a href="#ch25">25</a></td></tr>
+<tr><td><code>@splat</code></td><td><code>@splat(x)</code></td><td>A vector or array with every element set to <code>x</code>; the length comes from the result type.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@reduce</code></td><td><code>@reduce(.Add, v)</code></td><td>Fold a vector to a scalar with <code>.Add</code>, <code>.Mul</code>, <code>.Min</code>, <code>.Max</code>, <code>.And</code>, <code>.Or</code>, <code>.Xor</code>.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@select</code>, <code>@shuffle</code></td><td><code>@select(T, mask, a, b)</code></td><td>Per-lane choice between two vectors; rearrange lanes by a mask.</td><td><a href="#ch29">29</a></td></tr>
+<tr><td><code>@call</code></td><td><code>@call(.auto, f, args)</code></td><td>Call a function with an argument tuple and a call modifier.</td><td><a href="#ch26">26</a></td></tr>
+</table>
+
+<h3 id="appA1-6">A1.6 Atomics, control and miscellany</h3>
+<table>
+<tr><th>Builtin</th><th>Signature sketch</th><th>Meaning</th><th>Chapter</th></tr>
+<tr><td><code>@atomicLoad</code>, <code>@atomicStore</code></td><td><code>@atomicLoad(T, ptr, .seq_cst)</code></td><td>Atomic read or write with a memory ordering.</td><td><a href="#ch36">36</a></td></tr>
+<tr><td><code>@atomicRmw</code></td><td><code>@atomicRmw(T, ptr, .Add, x, .seq_cst)</code></td><td>Atomic read-modify-write; returns the old value.</td><td><a href="#ch36">36</a></td></tr>
+<tr><td><code>@cmpxchgStrong</code>, <code>@cmpxchgWeak</code></td><td><code>@cmpxchgStrong(T, ptr, expected, new, .seq_cst, .seq_cst)</code></td><td>Compare and swap; returns <code>null</code> on success or the value found.</td><td><a href="#ch36">36</a></td></tr>
+<tr><td><code>@panic</code></td><td><code>@panic("msg")</code></td><td>Abort with a message and a stack trace.</td><td><a href="#ch16">16</a></td></tr>
+<tr><td><code>@trap</code>, <code>@breakpoint</code></td><td><code>@trap()</code></td><td>Abort without a message; stop in a debugger.</td><td><a href="#ch37">37</a></td></tr>
+<tr><td><code>@src</code></td><td><code>@src()</code></td><td>A struct with the current file, function, line and column.</td><td><a href="#ch37">37</a></td></tr>
+<tr><td><code>@returnAddress</code>, <code>@frameAddress</code></td><td><code>@returnAddress()</code></td><td>Addresses for hand-rolled stack traces. Rare.</td><td><a href="#ch37">37</a></td></tr>
+<tr><td><code>@errorReturnTrace</code></td><td><code>@errorReturnTrace()</code></td><td>The current error return trace, or <code>null</code>.</td><td><a href="#ch16">16</a></td></tr>
+<tr><td><code>@branchHint</code></td><td><code>@branchHint(.likely)</code></td><td>Tell the optimiser which way a branch usually goes; must be the first statement of a block.</td><td><a href="#ch37">37</a></td></tr>
+<tr><td><code>@export</code></td><td><code>@export(&amp;f, .{ .name = "sym" })</code></td><td>Export a function or variable under a symbol name, from a <code>comptime</code> block.</td><td><a href="#ch35">35</a></td></tr>
+<tr><td><code>@extern</code></td><td><code>@extern(*const fn () callconv(.c) void, .{ .name = "sym" })</code></td><td>A pointer to an external symbol by name; the expression form of <code>extern fn</code>.</td><td><a href="#ch35">35</a></td></tr>
+<tr><td><code>@cImport</code>, <code>@cInclude</code></td><td><code>@cImport(@cInclude("stdio.h"))</code></td><td>Translate C headers into a Zig namespace; needs <code>-lc</code> or <code>link_libc</code>. IRON LEDGER avoids it by writing <code>extern fn</code> lines by hand.</td><td><a href="#ch35">35</a></td></tr>
+</table>
+<p>Two things that look like builtins but are not: <code>unreachable</code> is a keyword (an expression of type <code>noreturn</code> that asserts the point is never reached), and <code>undefined</code> is a keyword too (a value you promise to overwrite before reading).</p>
+</section>

@@ -1,0 +1,607 @@
+<section id="ch16">
+<h2>16. Errors</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn how Zig functions report failure: not by throwing, not by returning -1, but by returning a value from an error set. You will write error sets, error unions and the four verbs <code>try</code>, <code>catch</code>, <code>switch</code> and <code>errdefer</code> (the last one gets its own chapter next). You will read a real error return trace and learn what an error escaping from <code>main</code> does to your program's exit code.</p>
+
+<h3 id="ch16-1">16.1 Errors are values</h3>
+<p>If you come from Python or JavaScript, failure means an exception: control jumps out of the current function, and out of its caller, and its caller's caller, until something catches it. Nothing in the source text of the intermediate functions shows that this can happen. If you come from C, failure means a return code that every caller must remember to check, and many do not.</p>
+<p>Zig sits between the two. A function that can fail says so in its return type, and callers must do <em>something</em> with the failure: pass it up, handle it, or explicitly assert it cannot happen. But there is no jumping. An error is an ordinary value, returned with an ordinary <code>return</code>, and the code that passes it up is visible in the text as a <code>try</code>.</p>
+<p>The values come from an <em>error set</em>, which looks like an enum of failure names:</p>
+<pre><code>const HireError = error{
+    InsufficientTreasury,
+    NoBerth,
+    UnknownPerson,
+};</code></pre>
+<p>A single error value is written <code>error.NoBerth</code>. A function that either succeeds with a <code>u32</code> or fails with a <code>HireError</code> has the return type <code>HireError!u32</code>, read as "HireError or u32". This is an <em>error union</em>. Here is a complete program.</p>
+<p class="file">err1.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const HireError = error{
+    InsufficientTreasury,
+    NoBerth,
+    UnknownPerson,
+};
+
+fn hire(treasury: u32, cost: u32, free_berths: u32) HireError!u32 {
+    if (free_berths == 0) return error.NoBerth;
+    if (cost &gt; treasury) return error.InsufficientTreasury;
+    return treasury - cost;
+}
+
+pub fn main() !void {
+    const left = try hire(10_000, 2_500, 3);
+    std.debug.print(&quot;hired, {d} c-bills left\n&quot;, .{left});
+
+    const left2 = try hire(1_000, 2_500, 3);
+    std.debug.print(&quot;hired again, {d} c-bills left\n&quot;, .{left2});
+}</code></pre>
+<pre class="term">$ zig run err1.zig
+hired, 7500 c-bills left
+error: InsufficientTreasury
+ch16/err1.zig:11:26: 0x… in hire (err1)
+    if (cost &gt; treasury) return error.InsufficientTreasury;
+                         ^
+ch16/err1.zig:19:19: 0x… in main (err1)
+    const left2 = try hire(1_000, 2_500, 3);
+                  ^
+$ echo $?
+1</pre>
+<p>There is a lot in that transcript. The first <code>hire</code> succeeds and prints. The second fails: <code>hire</code> returns <code>error.InsufficientTreasury</code>, the <code>try</code> in <code>main</code> sees an error and returns it from <code>main</code>, and because <code>main</code> is declared as <code>!void</code>, the runtime prints the error's name, prints an <em>error return trace</em>, and exits with status 1. The trace is not a stack trace of where the program was; it is a list of every <code>return error…</code> and every <code>try</code> the error passed through on its way out, innermost first. In Debug builds this is free and always on, and it is the single most useful thing Zig gives you for debugging failures.</p>
+<p>The exit code matters when your program is run from a script. <code>echo $?</code> after a successful run prints 0. After an error escapes <code>main</code>, it prints 1. You do not have to write any of this yourself.</p>
+
+<h3 id="ch16-2">16.2 <code>try</code>: pass it up</h3>
+<p><code>try expr</code> means: evaluate <code>expr</code>; if it is an error, return that error from the current function right now; otherwise unwrap the success value. It is exactly this expansion:</p>
+<pre><code>const left = hire(10_000, 2_500, 3) catch |err| return err;</code></pre>
+<p>Nine out of ten error sites in real Zig code are a <code>try</code>. The failure path exists, is handled, and takes one syllable. Because <code>try</code> returns from the current function, the current function must itself be able to return errors. If it is not, you get a compile error, and it is one of the first you will meet:</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn mightFail(n: u32) !u32 {
+    if (n == 0) return error.Zero;
+    return n * 2;
+}
+
+pub fn main() void {
+    const v = try mightFail(3);
+    std.debug.print(&quot;{d}\n&quot;, .{v});
+}</code></pre>
+<pre class="term">err6.zig:9:15: error: expected type &#x27;void&#x27;, found &#x27;@typeInfo(@typeInfo(@TypeOf(err6.mightFail)).@&quot;fn&quot;.return_type.?).error_union.error_set&#x27;
+    const v = try mightFail(3);
+              ^~~~~~~~~~~~~~~~
+err6.zig:8:15: note: function cannot return an error
+pub fn main() void {
+…</pre>
+<p>The fix is to change <code>main</code>'s return type to <code>!void</code>, or to handle the error on the spot with <code>catch</code>. That type name in the message looks alarming; it is just the compiler spelling out "the error set of <code>mightFail</code>" without a short name for it.</p>
+<p>Here is a chain of three functions each using <code>try</code>, so you can see how the trace grows one line per hop.</p>
+<p class="file">err9.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn step3(n: u32) !u32 {
+    if (n &gt; 2) return error.TooDeep;
+    return n;
+}
+fn step2(n: u32) !u32 {
+    return try step3(n + 1);
+}
+fn step1(n: u32) !u32 {
+    return try step2(n + 1);
+}
+
+pub fn main() !void {
+    std.debug.print(&quot;step1(0) = {d}\n&quot;, .{try step1(0)});
+    std.debug.print(&quot;step1(1) = {d}\n&quot;, .{try step1(1)});
+}</code></pre>
+<pre class="term">step1(0) = 2
+error: TooDeep
+ch16/err9.zig:4:16: 0x… in step3 (err9)
+    if (n &gt; 2) return error.TooDeep;
+               ^
+ch16/err9.zig:8:12: 0x… in step2 (err9)
+    return try step3(n + 1);
+           ^
+ch16/err9.zig:11:12: 0x… in step1 (err9)
+    return try step2(n + 1);
+           ^
+ch16/err9.zig:16:43: 0x… in main (err9)
+    std.debug.print(&quot;step1(1) = {d}\n&quot;, .{try step1(1)});
+                                          ^</pre>
+
+<h3 id="ch16-3">16.3 Inferred error sets: <code>!T</code></h3>
+<p>Writing <code>error{…}!u32</code> on every function gets old. If you write just <code>!u32</code>, the compiler infers the error set from the body: every <code>return error.X</code> and every <code>try</code> contributes its errors. <code>step1</code>, <code>step2</code> and <code>step3</code> above all use this. Most functions you write should too. Name the set explicitly when it is part of an interface other people will program against (IRON LEDGER names <code>commands.Error</code> because the UI switches on it), or when you want the compiler to reject an error that should not be possible.</p>
+
+<h3 id="ch16-4">16.4 <code>catch</code>: handle it here</h3>
+<p>When you do not want to pass an error up, <code>catch</code> handles it in place. It has four shapes, and you will use all of them.</p>
+<p class="file">err2.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn parseTonnage(text: []const u8) !u8 {
+    return std.fmt.parseInt(u8, text, 10);
+}
+
+pub fn main() void {
+    // 1. catch with a fallback value
+    const a = parseTonnage(&quot;55&quot;) catch 50;
+    const b = parseTonnage(&quot;heavy&quot;) catch 50;
+    std.debug.print(&quot;a={d} b={d}\n&quot;, .{ a, b });
+
+    // 2. catch and look at the error
+    const c = parseTonnage(&quot;999&quot;) catch |err| blk: {
+        std.debug.print(&quot;could not parse: {s}\n&quot;, .{@errorName(err)});
+        break :blk 0;
+    };
+    std.debug.print(&quot;c={d}\n&quot;, .{c});
+
+    // 3. catch {} : swallow it (rare, do it on purpose)
+    _ = parseTonnage(&quot;x&quot;) catch {};
+
+    // 4. catch unreachable: &quot;this cannot fail&quot;, checked in Debug
+    const d = parseTonnage(&quot;75&quot;) catch unreachable;
+    std.debug.print(&quot;d={d}\n&quot;, .{d});
+}</code></pre>
+<pre class="term">a=55 b=50
+could not parse: Overflow
+c=0
+d=75</pre>
+<ul>
+<li><code>expr catch value</code>: if it fails, use <code>value</code> instead. The most common shape after <code>try</code>.</li>
+<li><code>expr catch |err| { … }</code>: capture the error and run a block. If the block must produce a value for the surrounding expression, use a labelled block with <code>break :blk value</code>, as in the third example. If the block returns or continues, no value is needed.</li>
+<li><code>expr catch {}</code>: swallow it. Legal, occasionally right, and always worth a comment. The game uses it for "if even the rollback fails there is nothing more to do".</li>
+<li><code>expr catch unreachable</code>: assert it cannot fail. Debug builds panic if you are wrong. Reach for it when the input is a compile-time constant you can see is valid, like <code>divCeil(u32, n, 30) catch unreachable</code> where the divisor is literally 30.</li>
+</ul>
+<p>Note that <code>"999"</code> failed with <code>Overflow</code>, not with some generic "bad input": <code>parseInt</code> into a <code>u8</code> reports a number that is too large separately from a string that is not a number. Its error set has several members, and <code>@errorName</code> turns any of them into its name as a string.</p>
+
+<h3 id="ch16-5">16.5 Switching on an error</h3>
+<p>Inside a <code>catch |err|</code> block, <code>err</code> is a value of the function's error set, and you can <code>switch</code> on it like an enum. The switch must be exhaustive: name every member of the set, or add an <code>else</code>.</p>
+<p class="file">err3.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const ParseError = error{ Empty, NotANumber, TooBig };
+
+fn parsePercent(text: []const u8) ParseError!u8 {
+    if (text.len == 0) return error.Empty;
+    const n = std.fmt.parseInt(u32, text, 10) catch return error.NotANumber;
+    if (n &gt; 100) return error.TooBig;
+    return @intCast(n);
+}
+
+fn describe(text: []const u8) void {
+    const pct = parsePercent(text) catch |err| {
+        const msg = switch (err) {
+            error.Empty =&gt; &quot;you gave me nothing&quot;,
+            error.NotANumber =&gt; &quot;that is not a number&quot;,
+            error.TooBig =&gt; &quot;a percentage between 0 and 100&quot;,
+        };
+        std.debug.print(&quot;&#x27;{s}&#x27;: {s}\n&quot;, .{ text, msg });
+        return;
+    };
+    std.debug.print(&quot;&#x27;{s}&#x27;: {d}%\n&quot;, .{ text, pct });
+}
+
+pub fn main() void {
+    describe(&quot;40&quot;);
+    describe(&quot;&quot;);
+    describe(&quot;forty&quot;);
+    describe(&quot;140&quot;);
+}</code></pre>
+<pre class="term">&#x27;40&#x27;: 40%
+&#x27;&#x27;: you gave me nothing
+&#x27;forty&#x27;: that is not a number
+&#x27;140&#x27;: a percentage between 0 and 100</pre>
+<p>This is the pattern for turning errors into sentences at the edge of a program. Note how <code>parsePercent</code> itself converts the standard library's parse error into its own vocabulary with <code>catch return error.NotANumber</code>. The caller never sees <code>Overflow</code> or <code>InvalidCharacter</code>; it sees the three cases the function promised. Because the set is explicit, forgetting one is a compile error:</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const ParseError = error{ Empty, NotANumber };
+
+fn parsePercent(text: []const u8) ParseError!u8 {
+    if (text.len == 0) return error.Empty;
+    return std.fmt.parseInt(u8, text, 10) catch error.NotANumber;
+}
+
+pub fn main() void {
+    _ = parsePercent(&quot;5&quot;) catch |err| switch (err) {
+        error.Empty =&gt; std.debug.print(&quot;empty\n&quot;, .{}),
+        // forgot NotANumber
+    };
+}</code></pre>
+<pre class="term">err4.zig:11:39: error: switch must handle all possibilities
+    _ = parsePercent(&quot;5&quot;) catch |err| switch (err) {
+                                      ^~~~~~
+err4.zig:11:39: note: unhandled error value: &#x27;error.NotANumber&#x27;
+…</pre>
+<p>Add a case to the error set and every switch that forgot it lights up. This is the same exhaustiveness guarantee you met with enums in <a href="#ch13">Chapter 13</a>, and it is why explicit error sets are worth their extra typing at module boundaries.</p>
+
+<h3 id="ch16-6">16.6 Merging sets, <code>anyerror</code> and <code>@errorName</code></h3>
+<p>Error sets combine with <code>||</code>. If <code>load</code> can fail in the file layer or the format layer, its set is the union of both, and any function that calls it with <code>try</code> inherits the union.</p>
+<p class="file">err5.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const FileError = error{ NotFound, PermissionDenied };
+const ParseError = error{ BadSyntax, TooLong };
+const LoadError = FileError || ParseError;
+
+fn load(name: []const u8) LoadError!u32 {
+    if (name.len == 0) return error.NotFound;
+    if (name.len &gt; 8) return error.TooLong;
+    if (name[0] == &#x27;!&#x27;) return error.BadSyntax;
+    return @intCast(name.len);
+}
+
+fn report(err: anyerror) void {
+    std.debug.print(&quot;failed with {s}\n&quot;, .{@errorName(err)});
+}
+
+pub fn main() void {
+    const names = [_][]const u8{ &quot;save1&quot;, &quot;&quot;, &quot;!bad&quot;, &quot;far_too_long&quot; };
+    for (names) |n| {
+        const v = load(n) catch |err| {
+            report(err);
+            continue;
+        };
+        std.debug.print(&quot;loaded {s}: {d}\n&quot;, .{ n, v });
+    }
+
+    // an error set is a type; its members are values you can compare
+    const e: LoadError = error.TooLong;
+    std.debug.print(&quot;e == error.TooLong? {}\n&quot;, .{e == error.TooLong});
+    std.debug.print(&quot;the whole union: {}\n&quot;, .{LoadError});
+}</code></pre>
+<pre class="term">loaded save1: 5
+failed with NotFound
+failed with BadSyntax
+failed with TooLong
+e == error.TooLong? true
+the whole union: error{BadSyntax,NotFound,PermissionDenied,TooLong}</pre>
+<p><code>anyerror</code> is the set of every error in the whole program. A function taking <code>anyerror</code> accepts any error value at all, which is what you want for a generic "print this failure" helper like <code>report</code>. Any specific set coerces to <code>anyerror</code>; the reverse needs an explicit check. Printing an error set type with <code>{}</code> shows its members, sorted, as the last line demonstrates.</p>
+<p>Two more shapes you will meet in signatures. <code>std.mem.Allocator.Error!T</code> says "this can only fail with <code>OutOfMemory</code>". And <code>error{}!T</code> uses the empty set: the function cannot fail, but has the error-union shape so that <code>try</code> on it compiles. It appears in generic code that wants one calling convention whether or not the underlying operation can fail.</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+/// `error{}` is the empty set: this function promises it cannot fail,
+/// but still has the error-union shape so `try` works on it.
+fn cannotFail(x: u32) error{}!u32 {
+    return x + 1;
+}
+
+fn onlyOom(a: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    return a.alloc(u8, 4);
+}
+
+pub fn main() !void {
+    const v = try cannotFail(1);
+    std.debug.print(&quot;{d}\n&quot;, .{v});
+    const buf = try onlyOom(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(buf);
+    std.debug.print(&quot;{d} bytes\n&quot;, .{buf.len});
+}</code></pre>
+<pre class="term">2
+4 bytes</pre>
+
+<h3 id="ch16-7">16.7 An error union around an optional</h3>
+<p>Because <code>?T</code> is a type, <code>E!?T</code> is a type: "either an error, or maybe a <code>T</code>". The two mean different things and both are useful. A command parser is the classic case: a malformed line is an <em>error</em>, an unrecognised verb is simply <em>no command</em>.</p>
+<p class="file">err7.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Command = union(enum) {
+    hire: []const u8,
+    fire: []const u8,
+    quit,
+};
+
+const ParseError = error{ MissingName, EmptyLine };
+
+/// Can fail (bad syntax), and on success may still be &quot;not a command&quot;.
+fn parseCommand(line: []const u8) ParseError!?Command {
+    var it = std.mem.tokenizeScalar(u8, line, &#x27; &#x27;);
+    const verb = it.next() orelse return error.EmptyLine;
+    if (std.mem.eql(u8, verb, &quot;quit&quot;)) return .quit;
+    if (std.mem.eql(u8, verb, &quot;hire&quot;)) return .{ .hire = it.next() orelse return error.MissingName };
+    if (std.mem.eql(u8, verb, &quot;fire&quot;)) return .{ .fire = it.next() orelse return error.MissingName };
+    return null; // not a verb we know
+}
+
+pub fn main() void {
+    const lines = [_][]const u8{ &quot;hire Steiner&quot;, &quot;dance&quot;, &quot;hire&quot;, &quot;&quot;, &quot;quit&quot; };
+    for (lines) |line| {
+        const maybe = parseCommand(line) catch |err| {
+            std.debug.print(&quot;&#x27;{s}&#x27;: error {s}\n&quot;, .{ line, @errorName(err) });
+            continue;
+        };
+        if (maybe) |cmd| {
+            std.debug.print(&quot;&#x27;{s}&#x27;: {s}\n&quot;, .{ line, @tagName(cmd) });
+        } else {
+            std.debug.print(&quot;&#x27;{s}&#x27;: unknown verb, ignored\n&quot;, .{line});
+        }
+    }
+}</code></pre>
+<pre class="term">&#x27;hire Steiner&#x27;: hire
+&#x27;dance&#x27;: unknown verb, ignored
+&#x27;hire&#x27;: error MissingName
+&#x27;&#x27;: error EmptyLine
+&#x27;quit&#x27;: quit</pre>
+<p>Read the type inside-out: an optional <code>Command</code>, wrapped in a possible <code>ParseError</code>. Unwrap it in the same order: <code>catch</code> or <code>try</code> first to remove the error, then <code>if … |cmd|</code> or <code>orelse</code> to remove the optional. Inside the parser, <code>it.next() orelse return error.MissingName</code> converts a missing token (an optional) into an error in one expression. Keep the two ideas distinct in your own designs: an optional is for "absent, and that is normal"; an error is for "something went wrong and the caller should know why".</p>
+
+<h3 id="ch16-8">16.8 Testing errors</h3>
+<p><code>std.testing.expectError</code> asserts that an expression fails with a specific error. Combined with <code>try</code> on the success path, it lets a test cover both outcomes without any <code>if</code>.</p>
+<p class="file">err8.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Bank = struct {
+    funds: u32,
+
+    const WithdrawError = error{Insufficient};
+
+    fn withdraw(self: *Bank, amount: u32) WithdrawError!void {
+        if (amount &gt; self.funds) return error.Insufficient;
+        self.funds -= amount;
+    }
+};
+
+test &quot;withdraw succeeds when funds allow&quot; {
+    var b = Bank{ .funds = 100 };
+    try b.withdraw(40);
+    try std.testing.expectEqual(@as(u32, 60), b.funds);
+}
+
+test &quot;withdraw fails when short&quot; {
+    var b = Bank{ .funds = 10 };
+    try std.testing.expectError(error.Insufficient, b.withdraw(40));
+    try std.testing.expectEqual(@as(u32, 10), b.funds);
+}</code></pre>
+<pre class="term">1/2 err8.test.withdraw succeeds when funds allow...OK
+2/2 err8.test.withdraw fails when short...OK
+All 2 tests passed.</pre>
+<p>Note that test blocks themselves return <code>!void</code>, which is why <code>try</code> works inside them. A test that returns an error fails.</p>
+
+<h3 id="ch16-9">16.9 Why this design</h3>
+<p>Exceptions hide control flow: any call might not return. Return codes hide failures: any caller might not check. Zig's error unions make the failure part of the type and the propagation part of the text, so both are visible, and the compiler enforces that neither is forgotten. The cost is a <code>try</code> on most lines that call something fallible. In exchange you get exhaustive handling at the edges, a return trace that names every hop, and functions whose signatures tell you everything that can go wrong.</p>
+<p>One thing errors deliberately cannot do is carry data. <code>error.UnknownPerson</code> has no field for which person. If the caller needs details, put them somewhere the caller can read (a field on the struct, an out-parameter, a log), or return a tagged union instead. This keeps errors as cheap as an integer, which is what makes returning them on every hop free.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The command layer names its error set explicitly in <code>game/src/sim/commands.zig</code>, about sixty members merged with the allocator's, and every command goes through one function with that set in its signature:
+<pre><code>pub const Error = error{
+    UnknownPerson,
+    UnknownForce,
+    UnknownUnit,
+    InsufficientTreasury,
+    CompanyDeployed,
+    NoBerth,
+    BadPercent,
+    BadYear,
+    // … about sixty
+} || std.mem.Allocator.Error;   // merged with OutOfMemory
+
+pub fn execute(gs: *GameState, cmd: Command) Error!Result { // … }</code></pre>
+The errors travel up unchanged until the user interface, where <code>errorText</code> in <code>game/src/sim/cli.zig</code> takes an <code>anyerror</code> and switches it into sentences, with <code>else =&gt; @errorName(err)</code> as the fallback so an unexpected error still shows its name. The terminal client's key loop is a single <code>catch</code>: <code>self.handleKey(key) catch |err| self.say(.crit, "error: {s}", .{@errorName(err)});</code>, so no keypress can crash the game, and the REPL parser returns <code>ParseError!?Command</code>, exactly the nesting from section 16.7.</div>
+
+<h3 id="ch16-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 16.1 · An error set and a function that uses it <span class="level">warm-up</span></h4>
+  <p>Implement <code>parsePercent</code> returning <code>ParseError!u8</code>, converting the standard library's parse failure into <code>error.NotANumber</code>, and <code>sumPercent</code> which propagates with <code>try</code>. File: <code>exercises/16-errors/ex1_parse.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 16, exercise 1: an error set and a function that uses it.
+//! Run with:  zig test ex1_parse.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const ParseError = error{ Empty, NotANumber, TooBig };
+
+/// &quot;40&quot; -&gt; 40. &quot;&quot; -&gt; Empty. &quot;forty&quot; -&gt; NotANumber. &quot;140&quot; -&gt; TooBig.
+fn parsePercent(text: []const u8) ParseError!u8 {
+    if (text.len == 0) return error.Empty;
+    const n = std.fmt.parseInt(u32, text, 10) catch return error.NotANumber;
+    if (n &gt; 100) return error.TooBig;
+    return @intCast(n);
+}
+
+/// Parse two percentages and add them; propagate any error with `try`.
+fn sumPercent(a: []const u8, b: []const u8) ParseError!u32 {
+    const x = try parsePercent(a);
+    const y = try parsePercent(b);
+    return @as(u32, x) + y;
+}
+
+test &quot;good input&quot; {
+    try std.testing.expectEqual(@as(u8, 40), try parsePercent(&quot;40&quot;));
+    try std.testing.expectEqual(@as(u8, 100), try parsePercent(&quot;100&quot;));
+}
+
+test &quot;bad input&quot; {
+    try std.testing.expectError(error.Empty, parsePercent(&quot;&quot;));
+    try std.testing.expectError(error.NotANumber, parsePercent(&quot;forty&quot;));
+    try std.testing.expectError(error.TooBig, parsePercent(&quot;140&quot;));
+}
+
+test &quot;try propagates&quot; {
+    try std.testing.expectEqual(@as(u32, 70), try sumPercent(&quot;30&quot;, &quot;40&quot;));
+    try std.testing.expectError(error.TooBig, sumPercent(&quot;30&quot;, &quot;400&quot;));
+    try std.testing.expectError(error.Empty, sumPercent(&quot;&quot;, &quot;400&quot;));
+}</code></pre>
+  <p>The <code>catch return error.NotANumber</code> is the translation step: callers only ever see the three errors in <code>ParseError</code>. Parsing into a <code>u32</code> first and checking <code>&gt; 100</code> afterwards keeps "140" a <code>TooBig</code> rather than an overflow.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 16.2 · catch, and switching on an error <span class="level">practice</span></h4>
+  <p>Write <code>parseOr</code> with a one-line <code>catch</code>, an exhaustive <code>errorText</code> switch, and <code>describe</code>, which returns a tagged union of value or message. File: <code>exercises/16-errors/ex2_catch.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 16, exercise 2: catch, and switching on an error.
+//! Run with:  zig test ex2_catch.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const ParseError = error{ Empty, NotANumber, TooBig };
+
+fn parsePercent(text: []const u8) ParseError!u8 {
+    if (text.len == 0) return error.Empty;
+    const n = std.fmt.parseInt(u32, text, 10) catch return error.NotANumber;
+    if (n &gt; 100) return error.TooBig;
+    return @intCast(n);
+}
+
+/// Parse, or fall back to `default`. One line with `catch`.
+fn parseOr(text: []const u8, default: u8) u8 {
+    return parsePercent(text) catch default;
+}
+
+/// A sentence for each error. The switch must be exhaustive.
+fn errorText(err: ParseError) []const u8 {
+    return switch (err) {
+        error.Empty =&gt; &quot;you gave me nothing&quot;,
+        error.NotANumber =&gt; &quot;that is not a number&quot;,
+        error.TooBig =&gt; &quot;a percentage between 0 and 100&quot;,
+    };
+}
+
+/// Parse and, on failure, return the sentence instead of the number.
+/// Return type: a tagged union so the caller can tell which happened.
+const Outcome = union(enum) { value: u8, message: []const u8 };
+
+fn describe(text: []const u8) Outcome {
+    const v = parsePercent(text) catch |err| return .{ .message = errorText(err) };
+    return .{ .value = v };
+}
+
+test &quot;parseOr&quot; {
+    try std.testing.expectEqual(@as(u8, 40), parseOr(&quot;40&quot;, 5));
+    try std.testing.expectEqual(@as(u8, 5), parseOr(&quot;&quot;, 5));
+    try std.testing.expectEqual(@as(u8, 5), parseOr(&quot;x&quot;, 5));
+}
+
+test &quot;errorText&quot; {
+    try std.testing.expectEqualStrings(&quot;you gave me nothing&quot;, errorText(error.Empty));
+    try std.testing.expectEqualStrings(&quot;a percentage between 0 and 100&quot;, errorText(error.TooBig));
+}
+
+test &quot;describe&quot; {
+    try std.testing.expectEqual(@as(u8, 12), describe(&quot;12&quot;).value);
+    try std.testing.expectEqualStrings(&quot;that is not a number&quot;, describe(&quot;twelve&quot;).message);
+}</code></pre>
+  <p><code>describe</code> shows <code>catch |err| return …</code>: the catch block leaves the function, so no value is needed for <code>v</code> on that path. Try deleting one arm of <code>errorText</code>'s switch to see the exhaustiveness error.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 16.3 · Merging sets, anyerror and @errorName <span class="level">practice</span></h4>
+  <p>Define <code>LoadError</code> as the merge of two sets and <code>Allocator.Error</code>, implement <code>load</code>, and write an <code>errorText(anyerror)</code> with an <code>else</code> that falls back to <code>@errorName</code>. File: <code>exercises/16-errors/ex3_merge.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 16, exercise 3: merging error sets, anyerror and @errorName.
+//! Run with:  zig test ex3_merge.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const FileError = error{ NotFound, PermissionDenied };
+const FormatError = error{ BadSyntax, TooLong };
+
+/// Everything `load` can fail with: both sets merged, plus OutOfMemory.
+const LoadError = FileError || FormatError || std.mem.Allocator.Error;
+
+/// Pretend loader. Returns a copy of `name` (caller frees) or an error:
+///   &quot;&quot;        -&gt; NotFound
+///   &quot;locked&quot;  -&gt; PermissionDenied
+///   starts &#x27;!&#x27; -&gt; BadSyntax
+///   &gt; 8 chars -&gt; TooLong
+fn load(a: std.mem.Allocator, name: []const u8) LoadError![]u8 {
+    if (name.len == 0) return error.NotFound;
+    if (std.mem.eql(u8, name, &quot;locked&quot;)) return error.PermissionDenied;
+    if (name[0] == &#x27;!&#x27;) return error.BadSyntax;
+    if (name.len &gt; 8) return error.TooLong;
+    return a.dupe(u8, name);
+}
+
+/// A message for any error at all. Unknown ones fall back to @errorName.
+fn errorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotFound =&gt; &quot;no such save&quot;,
+        error.PermissionDenied =&gt; &quot;that save is locked&quot;,
+        error.OutOfMemory =&gt; &quot;out of memory&quot;,
+        else =&gt; @errorName(err),
+    };
+}
+
+test &quot;load ok&quot; {
+    const s = try load(std.testing.allocator, &quot;save1&quot;);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings(&quot;save1&quot;, s);
+}
+
+test &quot;load errors&quot; {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.NotFound, load(a, &quot;&quot;));
+    try std.testing.expectError(error.PermissionDenied, load(a, &quot;locked&quot;));
+    try std.testing.expectError(error.BadSyntax, load(a, &quot;!x&quot;));
+    try std.testing.expectError(error.TooLong, load(a, &quot;far_too_long&quot;));
+}
+
+test &quot;errorText&quot; {
+    try std.testing.expectEqualStrings(&quot;no such save&quot;, errorText(error.NotFound));
+    try std.testing.expectEqualStrings(&quot;TooLong&quot;, errorText(error.TooLong));
+    try std.testing.expectEqualStrings(&quot;Whatever&quot;, errorText(error.Whatever));
+}</code></pre>
+  <p>The last assertion passes <code>error.Whatever</code>, an error that appears nowhere else in the program. It is still a valid <code>anyerror</code>, and the <code>else</code> arm prints its name. Also note the first test frees what <code>load</code> returned: an error union around an owned slice is the usual shape for "allocate or fail".</p></details>
+</div>
+<div class="exercise"><h4>Exercise 16.4 · An error union around an optional <span class="level">challenge</span></h4>
+  <p>Implement <code>parseCommand</code> returning <code>ParseError!?Command</code>: errors for malformed lines, <code>null</code> for unknown verbs, a command otherwise. File: <code>exercises/16-errors/ex4_nested.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 16, exercise 4: an error union around an optional (E!?T).
+//! Run with:  zig test ex4_nested.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const Command = union(enum) {
+    hire: []const u8,
+    fire: []const u8,
+    advance: u32,
+    quit,
+};
+
+const ParseError = error{ EmptyLine, MissingArgument, BadNumber };
+
+/// Parse one line of the REPL.
+///   error  -&gt; the line was malformed
+///   null   -&gt; well-formed but not a verb we know
+///   value  -&gt; a command
+fn parseCommand(line: []const u8) ParseError!?Command {
+    var it = std.mem.tokenizeScalar(u8, line, &#x27; &#x27;);
+    const verb = it.next() orelse return error.EmptyLine;
+    if (std.mem.eql(u8, verb, &quot;quit&quot;)) return .quit;
+    if (std.mem.eql(u8, verb, &quot;hire&quot;)) return .{ .hire = it.next() orelse return error.MissingArgument };
+    if (std.mem.eql(u8, verb, &quot;fire&quot;)) return .{ .fire = it.next() orelse return error.MissingArgument };
+    if (std.mem.eql(u8, verb, &quot;advance&quot;)) {
+        const arg = it.next() orelse return error.MissingArgument;
+        const n = std.fmt.parseInt(u32, arg, 10) catch return error.BadNumber;
+        return .{ .advance = n };
+    }
+    return null;
+}
+
+test &quot;commands&quot; {
+    const h = (try parseCommand(&quot;hire Steiner&quot;)).?;
+    try std.testing.expectEqualStrings(&quot;Steiner&quot;, h.hire);
+    const adv = (try parseCommand(&quot;advance 7&quot;)).?;
+    try std.testing.expectEqual(@as(u32, 7), adv.advance);
+    try std.testing.expect((try parseCommand(&quot;quit&quot;)).? == .quit);
+}
+
+test &quot;unknown verb is null, not an error&quot; {
+    try std.testing.expect((try parseCommand(&quot;dance wildly&quot;)) == null);
+}
+
+test &quot;malformed lines are errors&quot; {
+    try std.testing.expectError(error.EmptyLine, parseCommand(&quot;   &quot;));
+    try std.testing.expectError(error.MissingArgument, parseCommand(&quot;hire&quot;));
+    try std.testing.expectError(error.BadNumber, parseCommand(&quot;advance soon&quot;));
+}</code></pre>
+  <p>Every missing token becomes an error through <code>orelse return error.…</code>, and the number parse becomes <code>BadNumber</code> through <code>catch return</code>. The tests unwrap in the right order: <code>(try parseCommand(…)).?</code> removes the error first, then the optional.</p></details>
+</div>
+
+<h3 id="ch16-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does <code>try f()</code> expand to? <details class="answer"><summary>Answer</summary><code>f() catch |err| return err</code>: on failure, return the error from the current function; on success, the unwrapped value.</details></li>
+  <li>Why does <code>try</code> inside a function returning <code>void</code> fail to compile? <details class="answer"><summary>Answer</summary>Because <code>try</code> may return an error, and the function's return type says it returns none. Make it <code>!void</code> or handle the error with <code>catch</code>.</details></li>
+  <li>What happens when an error escapes <code>main</code>? <details class="answer"><summary>Answer</summary>The runtime prints <code>error: Name</code>, an error return trace in Debug builds, and the process exits with status 1.</details></li>
+  <li>What is the difference between an error return trace and a stack trace? <details class="answer"><summary>Answer</summary>A stack trace shows where the program is now. An error return trace lists every <code>return error</code> and <code>try</code> the error passed through on its way up, innermost first.</details></li>
+  <li>When would you use <code>catch unreachable</code>? <details class="answer"><summary>Answer</summary>When you can see from the inputs that failure is impossible, such as dividing by a literal constant. Debug builds panic if you are wrong.</details></li>
+  <li>What does <code>A || B</code> mean for error sets? <details class="answer"><summary>Answer</summary>The merged set containing every member of both. A function that <code>try</code>s calls from both layers has the merged set as its inferred error set.</details></li>
+  <li>What is the difference between returning <code>null</code> and returning an error from a parser? <details class="answer"><summary>Answer</summary><code>null</code> means "nothing here, and that is normal" (unknown verb). An error means "something went wrong and the caller should know why" (missing argument).</details></li>
+  <li>Can an error carry a payload, like a message or an ID? <details class="answer"><summary>Answer</summary>No. Errors are bare names, as cheap as an integer. Put the details somewhere else, or return a tagged union.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>An error set is a list of names; <code>error.Name</code> is a value; <code>E!T</code> is "error or value"; <code>!T</code> lets the compiler infer <code>E</code>.</li>
+<li><code>try</code> passes an error up and is only legal in a function that can return errors.</li>
+<li><code>catch value</code>, <code>catch |err| {…}</code>, <code>catch {}</code> and <code>catch unreachable</code> handle errors in place.</li>
+<li>A <code>switch</code> on an error must be exhaustive; explicit sets make forgotten cases compile errors.</li>
+<li><code>A || B</code> merges sets; <code>anyerror</code> accepts all; <code>@errorName</code> gives the name as text.</li>
+<li>An error escaping <code>main</code> prints a return trace and exits with status 1.</li>
+<li><code>E!?T</code> nests an optional inside an error union; unwrap the error first, then the optional.</li>
+</ul></div>
+</section>

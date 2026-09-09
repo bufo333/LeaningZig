@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+ledger.sav
+.DS_Store

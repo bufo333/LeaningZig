@@ -1,0 +1,4 @@
+.{
+    .person = .{ .fatigue_tired = 30, .exhausted_fatigue = 70, .turnover_target = 3 },
+    .market = .{ .fab_cost_bp = 12_000, .fab_days = 14 },
+}

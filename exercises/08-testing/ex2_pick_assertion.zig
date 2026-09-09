@@ -1,0 +1,50 @@
+//! Chapter 08, exercise 2: pick the right assertion.
+//! Run with:  zig test ex2_pick_assertion.zig
+//! Goal: replace every `expect(...)` with the most specific assertion that fits,
+//! so that a failure prints a useful message. All tests must still pass.
+const std = @import("std");
+
+const ParseError = error{ Empty, NotADigit };
+
+fn digit(s: []const u8) ParseError!u8 {
+    if (s.len == 0) return error.Empty;
+    const c = s[0];
+    if (c < '0' or c > '9') return error.NotADigit;
+    return c - '0';
+}
+
+fn shout(buf: []u8, word: []const u8) []const u8 {
+    for (word, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
+    return buf[0..word.len];
+}
+
+fn firstTwo(xs: []const u32) []const u32 {
+    return xs[0..2];
+}
+
+test "digit parses a single digit" {
+    // TODO: use expectEqual
+    try std.testing.expect((try digit("7")) == 7);
+}
+
+test "digit rejects empty input" {
+    // TODO: use expectError
+    try std.testing.expect(digit("") == error.Empty);
+}
+
+test "digit rejects letters" {
+    // TODO: use expectError
+    try std.testing.expect(digit("x") == error.NotADigit);
+}
+
+test "shout upper-cases" {
+    var buf: [16]u8 = undefined;
+    // TODO: use expectEqualStrings
+    try std.testing.expect(std.mem.eql(u8, "LANCE", shout(&buf, "lance")));
+}
+
+test "firstTwo slices" {
+    const data = [_]u32{ 5, 6, 7 };
+    // TODO: use expectEqualSlices
+    try std.testing.expect(std.mem.eql(u32, &[_]u32{ 5, 6 }, firstTwo(&data)));
+}

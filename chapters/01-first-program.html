@@ -1,0 +1,255 @@
+<section id="ch01">
+<h2>1. Installing Zig and your first program</h2>
+<p class="goals"><strong>In this chapter</strong> you will install the Zig 0.16 compiler, write a hello-world program by hand, run it three different ways, and read it line by line until every character in it makes sense. You will also meet the three shapes a Zig <code>main</code> function can take and learn why they differ.</p>
+
+<h3 id="ch01-1">1.1 What Zig is</h3>
+<p>Zig is a general-purpose programming language in the C tradition. Programs compile to native machine code, run without a virtual machine or a runtime, and manage their own memory. If you have used Python or JavaScript, the biggest change is that there is nothing between your code and the machine: no interpreter, no garbage collector, no exception system. If you have used C, the biggest change is that Zig removes the parts of C that cause most bugs (undefined behaviour is caught in debug builds, integer overflow panics rather than silently wrapping, and the preprocessor is gone) and adds compile-time code execution, a proper module system, built-in tests, and a cross-compiler that can build for any target from any machine.</p>
+<p>Three of Zig's slogans will come up again and again in this book, so here they are once:</p>
+<ul>
+<li><strong>No hidden control flow.</strong> When you read a line of Zig, what it does is what it says. A function call is written as a call. Nothing runs behind your back, so there are no exceptions that unwind through your code and no destructors that fire when a scope ends. Cleanup is written explicitly with <code>defer</code> (<a href="#ch17">Chapter 17</a>).</li>
+<li><strong>No hidden memory allocation.</strong> Nothing in the language or the standard library allocates memory unless you hand it an allocator. This is why Zig programs can run on tiny devices and why IRON LEDGER can free its entire campaign with one call.</li>
+<li><strong>Errors are values.</strong> A function that can fail says so in its return type, and the caller must do something about it. The compiler makes forgetting impossible.</li>
+</ul>
+<p>Zig is still a young language and its standard library changes between releases. This book is written for version <strong>0.16</strong>. Tutorials on the web written for 0.11, 0.13, or 0.14 will show you functions that no longer exist. When in doubt, trust the compiler in front of you, not a blog post.</p>
+
+<h3 id="ch01-2">1.2 Installing the compiler</h3>
+<p>Zig ships as a single folder containing one executable, <code>zig</code>, and its standard library. There is nothing to configure.</p>
+<p><strong>macOS.</strong> If you use Homebrew, one command does it:</p>
+<pre class="term">$ brew install zig</pre>
+<p><strong>Linux and Windows.</strong> Go to <code>https://ziglang.org/download/</code>, download the archive for your platform (for example <code>zig-x86_64-linux-0.16.0.tar.xz</code> or <code>zig-x86_64-windows-0.16.0.zip</code>), unpack it somewhere permanent such as your home folder, and add that folder to your <code>PATH</code>. On Linux that usually means one line in <code>~/.bashrc</code> or <code>~/.zshrc</code>:</p>
+<pre class="term">export PATH="$HOME/zig-x86_64-linux-0.16.0:$PATH"</pre>
+<p>On Windows, open <em>Edit environment variables for your account</em> and add the unpacked folder to <code>Path</code>. Many Linux distributions also package Zig, but the packaged version is often old; the download from ziglang.org is the reliable route.</p>
+<p><strong>Check it.</strong> Open a new terminal and ask the compiler for its version:</p>
+<pre class="term">$ zig version
+0.16.0</pre>
+<p>If you see <code>0.16.0</code> (a suffix such as <code>0.16.0-dev.123</code> is fine too), you are ready. If you see an older number, you have an old install somewhere on your <code>PATH</code>; find it with <code>which zig</code> on macOS and Linux or <code>where zig</code> on Windows and remove it.</p>
+<div class="note"><strong>An editor.</strong> Any text editor works. VS Code with the <em>Zig Language</em> extension, or any editor that speaks the language server <code>zls</code>, gives you error underlines as you type. The book never depends on an editor feature, so use what you like.</div>
+
+<h3 id="ch01-3">1.3 A folder and a file</h3>
+<p>Make a folder for the book's programs and go into it. Every command in Part 0 assumes you are inside this folder.</p>
+<pre class="term">$ mkdir ~/zig-book
+$ cd ~/zig-book</pre>
+<p>Now create a file called <code>hello.zig</code> in that folder and type the following into it. Type it rather than pasting: five lines is short enough, and your fingers will learn the shape of a Zig file.</p>
+<div class="file">hello.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("Hello, world!\n", .{});
+}</code></pre>
+<p>Save the file. The extension <code>.zig</code> matters; the compiler will not look at anything else.</p>
+
+<h3 id="ch01-4">1.4 Running it: zig run</h3>
+<p>The quickest way to run a single file is <code>zig run</code>:</p>
+<pre class="term">$ zig run hello.zig
+Hello, world!</pre>
+<p>The first run takes a few seconds while the compiler builds the standard library's pieces that your program uses; later runs are cached and fast. <code>zig run</code> compiles your file into an executable in a cache folder, runs it, and shows you the output. It is the command you will use most in Part 0.</p>
+<p>If you mistype something, the compiler tells you where. Delete the second argument to <code>print</code> so the line reads <code>std.debug.print("Hello, world!\n");</code> and run again:</p>
+<pre class="term">$ zig run hello.zig
+hello.zig:4:14: error: expected 2 argument(s), found 1
+    std.debug.print("Hello, world!\n");
+    ~~~~~~~~~^~~~~~
+&lt;zig&gt;/lib/std/debug.zig:307:5: note: function declared here
+pub fn print(comptime fmt: []const u8, args: anytype) void {
+~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~</pre>
+<p>Read that from the top. <code>hello.zig:4:14</code> is the file, the line, and the column. Then the word <code>error:</code> and a sentence. Then the offending line with a marker under the spot. Then a <code>note:</code> showing the declaration of the function you called wrongly, in this case in the standard library's <code>debug.zig</code>. Nearly every Zig error has this shape: location, message, source line, and notes. Put the argument back before going on.</p>
+
+<h3 id="ch01-5">1.5 Building an executable: zig build-exe</h3>
+<p><code>zig run</code> hides the executable. When you want a file you can copy somewhere and run later, use <code>zig build-exe</code>:</p>
+<pre class="term">$ zig build-exe hello.zig
+$ ls -la hello
+-rwxr-xr-x  1 john  staff  1873176 Sep  9 10:29 hello
+$ ./hello
+Hello, world!</pre>
+<p>The compiler wrote a native executable called <code>hello</code> (<code>hello.exe</code> on Windows) into the current folder, and running it prints the same line. It is 1.8 megabytes because a debug build carries symbol tables and safety checks; a release build (<code>zig build-exe -O ReleaseSmall hello.zig</code>) is a few kilobytes. You do not need release builds until much later; the debug build is the one that catches your mistakes.</p>
+<p>Real projects with many files use a third command, <code>zig build</code>, driven by a script called <code>build.zig</code>. That is <a href="#ch31">Chapter 31</a>. For now, one file and <code>zig run</code> is all you need.</p>
+
+<h3 id="ch01-6">1.6 One formatter: zig fmt</h3>
+<p>Zig has exactly one code style, and the compiler ships the tool that enforces it. Write the hello program badly on purpose:</p>
+<div class="file">ugly.zig</div>
+<pre><code>const std=@import("std");
+pub fn main() void{
+std.debug.print("Hello, world!\n",.{}); }</code></pre>
+<p>It runs fine, because the compiler does not care about whitespace. Now ask <code>zig fmt</code> to fix it in place:</p>
+<pre class="term">$ zig fmt ugly.zig
+ugly.zig
+$ cat ugly.zig
+const std = @import("std");
+pub fn main() void {
+    std.debug.print("Hello, world!\n", .{});
+}</pre>
+<p><code>zig fmt</code> prints the name of each file it changed and rewrites it: four-space indentation, spaces around <code>=</code>, one statement per line, the closing brace on its own line. It will also add a trailing comma to a multi-line list and reflow the list one item per line, which is how the long argument lists in this book got their shape. There is no configuration, so every Zig codebase in the world looks the same, and code review never argues about style.</p>
+<p>Two habits worth forming now: run <code>zig fmt .</code> (with a dot, meaning the current folder) before you consider any file finished, and run <code>zig fmt --check .</code> to list files that need formatting without changing them. IRON LEDGER's test suite refuses to pass if <code>zig fmt --check src/</code> finds anything.</p>
+
+<h3 id="ch01-7">1.7 The anatomy of hello world</h3>
+<p>Here is the program again, and then one paragraph per line.</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("Hello, world!\n", .{});
+}</code></pre>
+<p><code>const std = @import("std");</code> brings the standard library into the file under the name <code>std</code>. Three things are happening. <code>@import</code> is a <em>builtin function</em>: anything starting with <code>@</code> is part of the language rather than something defined in a library, and there are about a hundred of them (<a href="#appA1">Appendix A1</a> lists them). <code>@import("std")</code> returns a value, the whole standard library as one big struct. And <code>const std = …</code> binds that value to a name that cannot be reassigned. You could call it anything, but every Zig file on Earth calls it <code>std</code>, so do that. A file that does not print, read files, or use any library code does not need this line.</p>
+<p><code>pub fn main() void {</code> declares a function. <code>fn</code> introduces it, <code>main</code> is its name, the empty parentheses say it takes no parameters, and <code>void</code> is its return type: it gives nothing back. <code>pub</code> makes the function visible outside this file. The program's entry point must be <code>pub</code>, because the code that starts your program lives in the standard library and has to be able to see <code>main</code> from there. Leave <code>pub</code> off and the compiler says so:</p>
+<pre class="term">$ zig run hello.zig
+&lt;zig&gt;/lib/std/start.zig:697:43: error: 'main' is not marked 'pub'
+    const fn_info = @typeInfo(@TypeOf(root.main)).@"fn";
+                                      ~~~~^~~~~
+hello.zig:3:1: note: declared here
+fn main() void {
+^~~~~~~~~~~~~~
+&lt;zig&gt;/lib/std/start.zig:638:20: note: called inline here
+    return callMain(argv[0..argc], env_block);
+           ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~
+&lt;zig&gt;/lib/std/start.zig:590:38: note: called inline here
+    std.process.exit(callMainWithArgs(argc, argv, envp));
+                     ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~</pre>
+<p>Notice where the error is reported: inside the standard library's <code>start.zig</code>, the file that calls your <code>main</code>, with a note pointing back at your declaration. You will occasionally see errors located in library code like this; the note is the part to read.</p>
+<p><code>std.debug.print("Hello, world!\n", .{});</code> is a function call. <code>std.debug</code> is a namespace inside the standard library, <code>print</code> is a function in it, and it takes two arguments: a <em>format string</em> and a list of values to substitute into it. The format string here has no placeholders, so the list is empty. The <code>\n</code> at the end is an escape sequence meaning a newline; without it the next thing printed would land on the same line. The semicolon ends the statement, as in C or JavaScript, and it is not optional.</p>
+<p><code>.{}</code> is the piece that puzzles everyone. It is an empty <em>anonymous struct literal</em>, which is Zig's way of writing "a bundle of values whose type the callee will figure out". Because <code>print</code> may be given any number of values of any type, it cannot declare a fixed parameter list, so it takes one parameter that is a bundle. With no values the bundle is <code>.{}</code>; with one value it is <code>.{name}</code>; with two, <code>.{ a, b }</code>. You will write <code>.{}</code> thousands of times, and <a href="#ch02">Chapter 2</a> is entirely about what goes inside it.</p>
+<p>Finally the closing brace ends the function body. Zig uses braces for blocks and does not care about indentation; <code>zig fmt</code> cares for you.</p>
+<div class="try"><strong>Try it.</strong> Add a second line to <code>main</code> that prints your name using a placeholder: <code>std.debug.print("Welcome, {s}. The company is yours.\n", .{"Commander"});</code>. Run it. Then remove the <code>\n</code> from the first line and run it again to see the two lines collide.</div>
+<div class="file">name.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const name = "Commander";
+    std.debug.print("Welcome, {s}. The company is yours.\n", .{name});
+}</code></pre>
+<pre class="term">$ zig run name.zig
+Welcome, Commander. The company is yours.</pre>
+
+<h3 id="ch01-8">1.8 Three shapes of main</h3>
+<p>The <code>main</code> you wrote returns <code>void</code> and takes nothing. That is the simplest form, and it is enough for every program in Part 0. But you will see two other forms in real code, including in IRON LEDGER, so here they are.</p>
+<p><strong>Form 1: <code>pub fn main() void</code>.</strong> No parameters, cannot fail. The program exits with status 0 when <code>main</code> returns. Use it for small programs that only compute and print.</p>
+<p><strong>Form 2: <code>pub fn main() !void</code>.</strong> The exclamation mark makes the return type an <em>error union</em>: the function returns either nothing or an error. This lets you write <code>try</code> inside <code>main</code> to propagate failures, which <a href="#ch16">Chapter 16</a> covers properly. If an error escapes from <code>main</code>, the program prints it and exits with status 1:</p>
+<div class="file">hello_err.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    std.debug.print("about to fail\n", .{});
+    return error.SomethingWentWrong;
+}</code></pre>
+<pre class="term">$ zig run hello_err.zig
+about to fail
+error: SomethingWentWrong
+hello_err.zig:5:5: 0x10000abcd in main (hello_err)
+    return error.SomethingWentWrong;
+    ^</pre>
+<p>The first line is your print. Then the runtime reports the error by name and shows where it was returned. The last line of the transcript, cut here, is a stack trace into the standard library. Try it and check the exit status: <code>echo $?</code> prints <code>1</code>.</p>
+<p><strong>Form 3: <code>pub fn main(init: std.process.Init) !void</code>.</strong> This is new in 0.16 and it is the form every real program uses. The single parameter, conventionally called <code>init</code>, is a struct that the runtime fills in before calling you. It carries an allocator (<code>init.gpa</code>), an I/O context (<code>init.io</code>), the command-line arguments, and the environment. Anything that touches the outside world, which means writing to standard output, reading a file, or asking the time, needs the <code>init.io</code> value. Here is the standard-output version of hello world:</p>
+<div class="file">hello_stdout.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+    try out.print("Hello from stdout, {d}\n", .{42});
+    try out.flush();
+}</code></pre>
+<pre class="term">$ zig run hello_stdout.zig
+Hello from stdout, 42</pre>
+<p>Do not worry about the middle four lines yet. <a href="#ch02">Chapter 2</a> takes them apart, and Part 4 explains the design behind <code>std.Io</code>. What matters now is the pattern: a program that only needs to show you something uses <code>std.debug.print</code> and Form 1; a program that produces output meant to be captured, piped, or saved uses a real writer and Form 3. IRON LEDGER's <code>main</code> is Form 3.</p>
+<div class="warn"><strong>Trap: old tutorials.</strong> Code written for Zig 0.13 or 0.14 obtains standard output with <code>std.io.getStdOut().writer()</code>. That function does not exist in 0.16 and the compiler will tell you <code>no field named 'getStdOut'</code>. When a snippet from the web will not build, check its Zig version before you check your typing. <a href="#appA3">Appendix A3</a> lists the old and new forms side by side.</div>
+
+<h3 id="ch01-9">1.9 What just happened, in order</h3>
+<p>It helps to have a picture of the pipeline, because the error messages refer to its stages. When you type <code>zig run hello.zig</code>:</p>
+<ol>
+<li>The compiler parses <code>hello.zig</code> into a tree. Syntax errors (a missing semicolon, an unbalanced brace) stop it here.</li>
+<li>It analyses the tree, starting from <code>main</code> and following every reference. Only code that is reachable from <code>main</code> gets checked, which is why a typo in a function you never call can go unnoticed until you call it. Type errors, unused variables, and missing arguments stop it here.</li>
+<li>It generates machine code for your target, links it with the pieces of the standard library you used, and writes an executable to its cache.</li>
+<li>It runs that executable, passing through any arguments you gave after the file name, and shows you its output.</li>
+</ol>
+<p>When something goes wrong at stage 1 or 2, you get a compile error and no program runs. When it goes wrong at stage 4, you get a runtime panic with a stack trace, which you will see for the first time in <a href="#ch04">Chapter 4</a>. Keeping the two apart is the beginning of reading Zig's messages well.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game's entry point is <code>game/src/main.zig</code>, and its <code>main</code> is Form 3: <code>pub fn main(init: std.process.Init) !void</code>. The first thing it does is build the game state from the allocator the runtime handed it, then it walks the command-line arguments looking for flags such as <code>--tui</code> and <code>--repl</code>:
+<pre><code>pub fn main(init: std.process.Init) !void {
+    var gs = game.state.GameState.init(init.gpa, .{ .seed = 3025 });
+    defer gs.deinit();
+
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.next(); // exe name
+    var repl = false;
+    var tui = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--repl")) repl = true;
+        if (std.mem.eql(u8, arg, "--tui")) tui = true;
+        // …
+    }</code></pre>
+Every piece of that will be familiar by the end of Part 1: <code>defer</code> in <a href="#ch17">Chapter 17</a>, the <code>while … |arg|</code> capture in <a href="#ch15">Chapter 15</a>, <code>std.mem.eql</code> in <a href="#ch11">Chapter 11</a>. The file also starts with a <code>//!</code> comment, a doc comment for the whole file; the game's house rule is that every file opens with one.</div>
+
+<h3 id="ch01-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 1.1 · Hello, by hand <span class="level">warm-up</span></h4>
+  <p>Without looking at the chapter, write a complete program that prints <code>Hello, world!</code> and a newline, then run it with <code>zig run</code> and format it with <code>zig fmt</code>. The starter file contains only the import line. Name the file: <code>exercises/01-first-program/ex1_hello.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 01, exercise 1: hello, world by hand.
+//! Run with:  zig run ex1_hello.zig
+//! Expected output (on stderr):
+//!   Hello, world!
+const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("Hello, world!\n", .{});
+}</code></pre>
+  <p>Four things must be present: the <code>pub</code>, the name <code>main</code>, a return type, and the empty argument bundle <code>.{}</code>. Forget any one of them and the compiler names the problem; the missing-<code>pub</code> and missing-argument errors are both shown in this chapter.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 1.2 · Three lines, three values <span class="level">warm-up</span></h4>
+  <p>The starter declares a company name, a commander name, and a unit count. Print them on three lines exactly as the header comment shows, using <code>{s}</code> for text and <code>{d}</code> for the number. The file does not compile until every constant is used. Name the file: <code>exercises/01-first-program/ex2_roster.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 01, exercise 2: three lines, one placeholder each.
+//! Run with:  zig run ex2_roster.zig
+//! Expected output (on stderr):
+//!   Company: Grey Death Legion
+//!   Commander: Carlyle
+//!   Units: 4
+const std = @import("std");
+
+pub fn main() void {
+    const company = "Grey Death Legion";
+    const commander = "Carlyle";
+    const units: u32 = 4;
+    std.debug.print("Company: {s}\n", .{company});
+    std.debug.print("Commander: {s}\n", .{commander});
+    std.debug.print("Units: {d}\n", .{units});
+}</code></pre>
+  <p>Each <code>print</code> call takes one placeholder and a one-element bundle <code>.{value}</code>. The reason the starter refuses to compile is Zig's unused-constant rule, which <a href="#ch03">Chapter 3</a> explains: declaring a value and never using it is an error, not a warning.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 1.3 · The stdout version <span class="level">practice</span></h4>
+  <p>The starter is a Form 3 program that writes to standard output, but when you run it nothing appears. Work out why (the chapter mentions it), fix it, and add a second line that prints <code>The answer is 42.</code> using a <code>{d}</code> placeholder. Confirm the output really goes to stdout by running <code>zig run ex3_stdout.zig 2&gt;/dev/null</code>, which hides stderr. Name the file: <code>exercises/01-first-program/ex3_stdout.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 01, exercise 3: the same greeting, written to stdout.
+//! Run with:  zig run ex3_stdout.zig
+//! Expected output (on stdout, so `zig run ex3_stdout.zig 2&gt;/dev/null` still shows it):
+//!   Hello from stdout!
+//!   The answer is 42.
+const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+    try out.print("Hello from stdout!\n", .{});
+    try out.print("The answer is {d}.\n", .{42});
+    try out.flush();
+}</code></pre>
+  <p>The missing piece is <code>try out.flush();</code>. The writer collects text in the 1024-byte buffer you gave it and only hands it to the operating system when the buffer fills or when you flush. A program that returns from <code>main</code> without flushing throws away whatever is still in the buffer. <code>std.debug.print</code> has no buffer, which is why it never needs a flush; <a href="#ch02">Chapter 2</a> goes into the trade-off.</p></details>
+</div>
+
+<h3 id="ch01-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does <code>zig run hello.zig</code> do that <code>zig build-exe hello.zig</code> does not? <details class="answer"><summary>Answer</summary>It runs the program after compiling it, and it keeps the executable in a cache folder instead of writing it next to your source file. <code>build-exe</code> only compiles, and leaves the executable in the current folder.</details></li>
+  <li>Why must <code>main</code> be marked <code>pub</code>? <details class="answer"><summary>Answer</summary>The code that starts your program lives in the standard library (<code>start.zig</code>) and calls <code>main</code> from outside your file. Without <code>pub</code> the function is private to the file and the library cannot see it.</details></li>
+  <li>What is <code>.{}</code> in <code>std.debug.print("hi\n", .{});</code>? <details class="answer"><summary>Answer</summary>An empty anonymous struct literal: the bundle of values to substitute into the format string. It is empty because the string has no placeholders.</details></li>
+  <li>What does the <code>!</code> in <code>pub fn main() !void</code> mean? <details class="answer"><summary>Answer</summary>The return type is an error union: <code>main</code> returns either nothing or an error. If an error escapes, the runtime prints its name and exits with status 1.</details></li>
+  <li>Which form of <code>main</code> does a program need if it wants to write to standard output, and why? <details class="answer"><summary>Answer</summary><code>pub fn main(init: std.process.Init) !void</code>. Writing to stdout in 0.16 needs the I/O context <code>init.io</code>, which only arrives through that parameter, and the <code>try</code> on the write and flush needs the <code>!</code> return type.</details></li>
+  <li>What does <code>zig fmt --check .</code> do? <details class="answer"><summary>Answer</summary>It lists every file in the current folder that is not formatted the standard way and exits with an error if there are any, without modifying anything. Without <code>--check</code>, <code>zig fmt</code> rewrites the files.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Zig is a compiled systems language with no hidden control flow, no hidden allocation, and errors as values; this book is for version 0.16.</li>
+<li>Install with <code>brew install zig</code> on macOS or the archive from ziglang.org elsewhere; confirm with <code>zig version</code>.</li>
+<li><code>zig run</code> compiles and runs one file; <code>zig build-exe</code> writes an executable; <code>zig fmt</code> is the single formatter.</li>
+<li>Hello world is an import, a <code>pub fn main</code>, and one <code>std.debug.print</code> call whose second argument is the value bundle <code>.{}</code>.</li>
+<li><code>main</code> comes in three shapes: <code>void</code>, <code>!void</code>, and <code>(init: std.process.Init) !void</code>; the last one is what real programs use.</li>
+<li>A compile error names file, line, column, message, and notes; learn to read it top to bottom.</li>
+</ul></div>
+</section>

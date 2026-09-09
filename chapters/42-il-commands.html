@@ -1,0 +1,343 @@
+<section id="ch42">
+<h2>42. Commands: the only way in</h2>
+<p class="goals"><strong>In this chapter</strong> you read the one function that is allowed to change a campaign. Every player action is a value of one tagged union, every arm of one <code>switch</code> follows the same three-beat shape, and every refusal is a named error that both frontends turn into a sentence. By the end you will add a command of your own and watch the compiler walk you through every place it must be handled.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch14">Chapter 14</a> (tagged unions, payload captures with <code>|x|</code>, and exhaustive <code>switch</code>), <a href="#ch16">Chapter 16</a> (error sets, <code>try</code>, <code>catch |err| switch (err)</code>, merging sets with <code>||</code>), <a href="#ch12">Chapter 12</a> (a result struct whose fields all have defaults), <a href="#ch11">Chapter 11</a> (tokenising a line with <code>std.mem.tokenizeScalar</code>) and <a href="#ch08">Chapter 8</a> (<code>expectError</code>).</div>
+
+<h3 id="ch42-1">42.1 One union, one switch</h3>
+<p>Nothing outside the simulation core mutates <code>GameState</code> except through one function:</p>
+<pre><code>pub fn execute(gs: *GameState, cmd: Command) Error!Result</code></pre>
+<p>Its argument is a tagged union with 71 variants at the time of writing (the original guide said "about ninety"; the count is easy to check, and Exercise 42.3 pins it). Here is the top of it:</p>
+<div class="file">src/sim/commands.zig</div>
+<pre><code>pub const Command = union(enum) {
+    /// End the turn: advance one day. Turn-based — time only moves here,
+    /// and nothing blocks it; decisions wait in the inbox with deadlines.
+    advance_day,
+    advance_days: u32,
+    hire: struct {
+        first: []const u8,
+        last: []const u8,
+        role: person_mod.Role,
+    },
+    /// Hire a randomly generated candidate (experience rolled on 2d6).
+    recruit: person_mod.Role,
+    fire: types.PersonId,
+    /// Generate a full company: 3 lances of meks with pilots + support tail.
+    new_company: []const u8,
+    rename_outfit: []const u8,
+    rename_force: struct { force: types.ForceId, name: []const u8 },
+    /// Attach an emblem image (raw bytes) to a force (ARCH §9.8 identity).
+    set_emblem: struct { force: types.ForceId, image: []const u8 },
+    /// Character creation: origin picks the starter world (weighted, in the
+    /// commander's faction space); profession grants one 2% edge.
+    create_commander: struct {
+        name: []const u8,
+        origin: commander_mod.Faction,
+        profession: commander_mod.Profession,
+        /// Campaign start year (12C.16): the market, RATs and salvage field
+        /// only what exists by then.
+        start_year: u16 = 3025,
+    },
+    // … sixty more, ending with:
+    /// Trim a deployed company's field stores to its field plan …
+    trim_stock: types.ForceId,
+};</code></pre>
+<p>The three payload shapes from <a href="#ch14">Chapter 14</a> are all here. <code>advance_day</code> carries nothing. <code>fire</code> carries one typed ID. <code>hire</code> carries an inline struct, and <code>create_commander</code>'s inline struct even has a defaulted field, so a caller may write <code>.{ .create_commander = .{ .name = "Erik", .origin = .CC, .profession = .quartermaster } }</code> and get the year 3025. A command value is data: it can be built by a key handler, parsed from text, stored in an array for a test script, or (in principle) written to a replay file. That is why a union was chosen over a method per action.</p>
+<p>The union's doc comments are worth a moment. They are the specification of the game's rules in the player's terms ("time only moves here, and nothing blocks it"), and they sit exactly where a reader looking for the rule will look.</p>
+
+<h3 id="ch42-2">42.2 The error set and the result</h3>
+<p>Before the switch, two more types:</p>
+<pre><code>pub const Error = error{
+    UnknownPerson,
+    UnknownForce,
+    UnknownUnit,
+    UnknownChassis,
+    NoSuchEvent,
+    NoSuchChoice,
+    NotADecision,
+    CommanderExists,
+    NoHomeWorld,
+    NoSuchOffer,
+    NotACompany,
+    CompanyDeployed,
+    UnknownPlanet,
+    // … eighty named errors in all, ending with:
+    UnknownAbility,
+    AlreadyLearned,
+    /// That term is already at the best the employer will give.
+    TermAtCap,
+} || std.mem.Allocator.Error;
+
+pub const Result = struct {
+    days_advanced: u32 = 0,
+    hired: types.PersonId = .none,
+    created_force: types.ForceId = .none,
+    /// Tons a `trim_stock` sent home.
+    tons_moved: u32 = 0,
+    /// The hull a `buy_hull_for` bought, and its delivery time (0 = on hand).
+    unit: types.UnitId = .none,
+    eta_days: u32 = 0,
+    /// People a `crew_company` hired (halls plus the astech/medic pools),
+    /// and the manning lines it could not fill because no candidate of
+    /// that role walked the boards.
+    hired_count: u32 = 0,
+    still_open: u32 = 0,
+    /// `order_part`: false when logistics failed the sourcing roll.
+    sourced: bool = true,
+    /// `negotiate`: how the round went.
+    negotiation: enum { none, improved, hardened, withdrawn } = .none,
+    // …
+};</code></pre>
+<p><code>Error</code> is an explicit set merged with <code>std.mem.Allocator.Error</code> (<a href="#ch16">Chapter 16</a>), so <code>try gs.log(…)</code> inside an arm, which can fail with <code>OutOfMemory</code>, needs no conversion. Every other error is a refusal with a name a human can read. There is no <code>Error.Failed</code>; the design rule (from <code>ARCHITECTURE.md</code>) is that command validation returns values the UI can explain, and you will see the explaining in 42.5.</p>
+<p><code>Result</code> is the mirror image: every field has a default, so an arm that has nothing to report returns <code>.{}</code>, and an arm that created something fills one field. A caller that does not care writes <code>_ = try execute(…)</code>; a caller that does writes <code>(try execute(gs, .{ .new_company = "Alpha" })).created_force</code>. The doc comments on the fields name the command that fills each, which is how you find your way from a result field back to its arm.</p>
+
+<h3 id="ch42-3">42.3 The shape of an arm</h3>
+<p>Now the switch. The first arms are the simplest, and they show the mechanics of a payload capture:</p>
+<pre><code>pub fn execute(gs: *GameState, cmd: Command) Error!Result {
+    switch (cmd) {
+        .advance_day =&gt; return advance(gs, 1),
+        .advance_days =&gt; |n| return advance(gs, n),
+        .hire =&gt; |h| {
+            const id = try gs.hirePerson(h.first, h.last, h.role);
+            return .{ .hired = id };
+        },
+        .recruit =&gt; |role| {
+            const id = try gs.recruitGenerated(role);
+            return .{ .hired = id };
+        },
+        .fire =&gt; |id| {
+            const p = gs.person(id) orelse return Error.UnknownPerson;
+            // 12C.2: a firing pays half the departure payout; seats open.
+            const paid = try @import("personnel.zig").depart(gs, id, .resigned, tuning.person.fire_severance_bp, "severance (fired)");
+            if (paid &gt; 0) try gs.log(.rotation, .{ .company = gs.companyOf(p.assigned_force) }, "[personnel] {s} {s} fired — {d} c-bills severance", .{ p.first_name, p.last_name, paid });
+            return .{};
+        },
+        // …</code></pre>
+<p><code>|n|</code> binds the <code>u32</code> of <code>advance_days</code>; <code>|h|</code> binds the inline struct so <code>h.first</code> works; <code>|id|</code> binds the typed ID. The <code>.fire</code> arm shows the three beats that every non-trivial arm follows: <strong>validate</strong> (<code>gs.person(id) orelse return Error.UnknownPerson</code>), <strong>mutate</strong> (<code>depart</code>), <strong>report</strong> (a log line, then a <code>Result</code>).</p>
+<p>Here is the arm the original guide singled out, because its comment records a real bug:</p>
+<pre><code>        .upgrade_tier =&gt; |hq_id| {
+            // Check everything before a c-bill moves: a refused upgrade used
+            // to keep the money.
+            const h = gs.hqs.getPtr(hq_id) orelse return Error.UnknownHq;
+            if (h.tier != .field) return Error.MaxLevel;
+            for (h.projects.items) |p| if (p.kind == .tier_upgrade) return Error.ProjectInProgress;
+            if (gs.treasuryBalance(.{ .hq = hq_id }) &lt; hq_ops.tier_upgrade_cost) return Error.InsufficientTreasury;
+            hq_ops.startTierUpgrade(gs, hq_id) catch |err| switch (err) {
+                error.ProjectInProgress =&gt; return Error.ProjectInProgress,
+                error.MaxLevel =&gt; return Error.MaxLevel,
+                error.UnknownHq =&gt; return Error.UnknownHq,
+                error.OutOfMemory =&gt; return Error.OutOfMemory,
+            };
+            try gs.postTreasury(.{ .hq = hq_id }, .{
+                .day = gs.clock.day_index,
+                .amount = -hq_ops.tier_upgrade_cost,
+                .category = .hq_construction,
+                .hq = hq_id,
+                .note = "regional upgrade",
+            });
+            return .{};
+        },</code></pre>
+<p>Four checks, then two effects, then <code>.{}</code>. An earlier version debited first and checked second, so a refused upgrade kept the money; the discipline "all checks, then all effects" is what prevents that class of bug, and the test <code>"tier upgrade: refusals keep the money; a funded field HQ starts the project and pays once"</code> makes sure it stays prevented.</p>
+<p>The middle of the arm shows a pattern from <a href="#ch16">Chapter 16</a> that you will see throughout the file. <code>hq_ops.startTierUpgrade</code> has its own, smaller error set (it is declared <code>!void</code>, so the compiler infers <code>error{UnknownHq, MaxLevel, ProjectInProgress, OutOfMemory}</code> from its body). The arm translates each case into the command layer's <code>Error</code> explicitly with a <code>catch |err| switch (err)</code>. Because a <code>switch</code> on an error set is exhaustive, a new failure mode added to <code>startTierUpgrade</code> shows up here as a compile error ("unhandled error"), which is exactly where you want to be told.</p>
+
+<h3 id="ch42-4">42.4 A longer arm: crewing a company</h3>
+<p>Most arms are ten to thirty lines. Here is a thirty-line one you will meet again in <a href="#ch50">Chapter 50</a>, where a single keypress runs it:</p>
+<pre><code>        .crew_company =&gt; |company| {
+            const f = gs.force(company) orelse return Error.UnknownForce;
+            if (f.echelon != .company) return Error.NotACompany;
+            if (gs.deploymentContract(company) != null) return Error.CompanyDeployed;
+            const personnel = @import("personnel.zig");
+            var hired: u32 = 0;
+            var still_open: u32 = 0;
+            for (personnel.manningNeeds(gs, company)) |n| {
+                var have = personnel.manningHave(gs, company, n.role);
+                while (have &lt; n.need) : (have += 1) {
+                    if (personnel.isPooledRole(n.role)) {
+                        // MekHQ hires astechs and medics to complement on
+                        // demand: no market, no signing bonus, salary only.
+                        const spec = person_gen.generateWithBonus(&amp;gs.rng, n.role, gs.recruitBonus());
+                        const id = try gs.hireFromSpec(spec);
+                        gs.person(id).?.assigned_force = company;
+                        hired += 1;
+                    } else if (try hireRoleFromHall(gs, n.role, company)) {
+                        hired += 1;
+                    } else {
+                        still_open += n.need - have;
+                        break;
+                    }
+                }
+            }
+            _ = try gs.autoAssign(company);
+            try gs.log(.decision, .{ .company = company }, "[raise] {s}: {d} hired to fill the manning table ({d} still open — the halls had nobody)", .{ f.name, hired, still_open });
+            return .{ .hired_count = hired, .still_open = still_open };
+        },</code></pre>
+<p>Three validations, then a loop over the fourteen-row manning table (<code>manningNeeds</code> returns a fixed-size array <code>[14]Need</code>), then <code>autoAssign</code>, then a log line and a two-field result. Notice <code>gs.person(id).?.assigned_force = company;</code>: the person was just created by <code>hireFromSpec</code>, so the lookup cannot fail and <code>.?</code> is the honest way to say so (<a href="#ch15">Chapter 15</a>). Notice also that the code looks the person up <em>after</em> hiring rather than keeping a pointer from before, which is the stale-pointer rule from <a href="#ch41">Chapter 41</a>. And notice <code>hireRoleFromHall</code> calling <code>execute</code> recursively with <code>.hire_candidate</code>: an arm may compose other commands, which keeps the signing-bonus accounting in one place.</p>
+
+<h3 id="ch42-5">42.5 Advancing time is a command too</h3>
+<p>The two arms at the top of the switch call <code>advance</code>, a private function that is the only place the daily tick (<a href="#ch43">Chapter 43</a>) is invoked from:</p>
+<pre><code>fn advance(gs: *GameState, days: u32) Error!Result {
+    // Turn-based: each day is a turn; nothing interrupts the advance.
+    // Decisions wait in the inbox and default at their deadlines — except
+    // money (Stage 12): a negative outfit treasury holds the turn until a
+    // loan or a sale covers it, and past all credit the outfit folds.
+    var result: Result = .{};
+    for (0..days) |_| {
+        if (gs.bankrupt) return Error.Bankrupt;
+        // Couriers already bound for the outfit count: the turn can end
+        // while the money is on the road.
+        if (gs.funds + gs.inboundToOutfit() &lt; 0) {
+            if (gs.funds + gs.liquidationValue() + gs.creditRemaining() &lt; 0) {
+                gs.bankrupt = true;
+                try gs.log(.finance, .{}, "[bankrupt] the outfit cannot cover {d}: creditors seize what is left", .{gs.funds});
+                return Error.Bankrupt;
+            }
+            return Error.Insolvent;
+        }
+        try tick.advanceDay(gs);
+        result.days_advanced += 1;
+    }
+    return result;
+}</code></pre>
+<p>This is where the game's turn structure lives: a day is a turn, the only thing that can stop the clock is a negative treasury, and <code>days_advanced</code> tells the caller how far it got. It is also a good example of a Zig function that returns an error <em>and</em> has partially done its work: if day three of seven is refused with <code>Error.Insolvent</code>, days one and two happened and the state reflects them. The caller learns this from the error, not from a rollback, because the design says time only moves forward.</p>
+
+<h3 id="ch42-6">42.6 From text to command, and from error to sentence</h3>
+<p>Both frontends build <code>Command</code> values. The terminal client's keys build them directly (<code>try self.exec(.{ .crew_company = co })</code>). Typed text, whether in the REPL or the client's <code>:</code> line, goes through one parser:</p>
+<div class="file">src/sim/cli.zig</div>
+<pre><code>pub fn parseCommand(verb: []const u8, tokens: *std.mem.TokenIterator(u8, .scalar)) ParseError!?Command {
+    const eq = std.mem.eql;
+    if (eq(u8, verb, "transfer")) {
+        return .{ .transfer = .{ .from = try parseTreasury(try need(tokens.next())), .to = try parseTreasury(try need(tokens.next())), .amount = try num(i64, tokens.next()) } };
+    }
+    if (eq(u8, verb, "admit")) return .{ .admit = @enumFromInt(try num(u32, tokens.next())) };
+    if (eq(u8, verb, "depot")) return .{ .depot = @enumFromInt(try num(u32, tokens.next())) };
+    // …
+    if (eq(u8, verb, "shares")) {
+        return .{ .set_shares_pct = try num(u8, tokens.next()) };
+    }
+    // …
+    return null; // not a verb we know
+}</code></pre>
+<p>The return type <code>ParseError!?Command</code> reads inside-out: an optional command (null means "not my verb; maybe the frontend knows it") wrapped in a possible parse error (<code>BadArguments</code>, <code>BadSite</code>, <code>BadNumber</code>). The helpers <code>num</code> and <code>need</code> turn a maybe-token into a number or a required string, and <code>@enumFromInt</code> turns the user's typed number into a typed ID at the edge, which is one of the few places that conversion is legitimate (<a href="#ch13">Chapter 13</a>). A verb also needs a row in the <code>verbs</code> list (for tab completion) and in the <code>usage</code> table (for help), and a test checks that every listed verb has a parser branch, so you cannot add one and forget the others.</p>
+<p>When <code>execute</code> refuses, the error travels back up to the frontend, and a shared table turns it into a sentence:</p>
+<pre><code>pub fn errorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InsufficientTreasury =&gt; "not enough money in that treasury — transfer funds first",
+        error.MaxLevel =&gt; "already at the top: this HQ is regional (or the facility is maxed)",
+        error.ProjectInProgress =&gt; "a project is already running here — watch PROJECTS",
+        error.BadPercent =&gt; "a percentage between 0 and 100",
+        error.BadYear =&gt; "the campaign starts between 3000 and 3060",
+        error.CompanyDeployed =&gt; "that company is deployed — hire at an HQ hall and `xfer person &lt;id&gt; co:N` to send people out to it",
+        // …
+        else =&gt; @errorName(err),
+    };
+}</code></pre>
+<p><code>anyerror</code> accepts any error set, and the <code>else</code> arm falls back to the error's name, so a new error is never silent; it just reads as <code>UnknownAbility</code> until someone writes it a sentence. This is the payoff of <code>Error</code> being a set of names rather than one <code>Failed</code>: the same table serves the REPL's stderr and the client's status line.</p>
+
+<h3 id="ch42-7">42.7 The tests</h3>
+<p><code>commands.zig</code> ends with about fifty tests, and their style is the style of the whole suite: build the smallest state that exercises the rule, run one command, assert on state. The refusal test for the arm you read above:</p>
+<pre><code>test "tier upgrade: refusals keep the money; a funded field HQ starts the project and pays once" {
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 1230 });
+    defer gs.deinit();
+    _ = try execute(&amp;gs, .{ .create_commander = .{ .name = "T", .origin = .LC, .profession = .paymaster } });
+    const home = gs.hqs.keys()[0];
+    const home_funds = gs.hqs.getPtr(home).?.funds;
+    try std.testing.expectError(Error.MaxLevel, execute(&amp;gs, .{ .upgrade_tier = home })); // already regional
+    try std.testing.expectEqual(home_funds, gs.hqs.getPtr(home).?.funds);
+    // … found a field HQ, empty its till …
+    try std.testing.expectError(Error.InsufficientTreasury, execute(&amp;gs, .{ .upgrade_tier = fb }));
+    try std.testing.expectEqual(@as(usize, 0), gs.hqs.getPtr(fb).?.projects.items.len);
+    // Funded: the project starts and the cost is paid exactly once.
+    gs.hqs.getPtr(fb).?.funds = hq_ops.tier_upgrade_cost + 1;
+    _ = try execute(&amp;gs, .{ .upgrade_tier = fb });
+    try std.testing.expectEqual(@as(types.CBills, 1), gs.hqs.getPtr(fb).?.funds);
+    try std.testing.expectError(Error.ProjectInProgress, execute(&amp;gs, .{ .upgrade_tier = fb }));
+}</code></pre>
+<p>Every <code>expectError</code> is paired with an <code>expectEqual</code> on the money, which is the actual property: not just "it refused" but "it refused and nothing moved". Tests reach into <code>GameState</code> fields directly (<code>gs.hqs.getPtr(fb).?.funds = …</code>) to set up situations; that is allowed in tests precisely because it is not allowed anywhere else.</p>
+
+<h3 id="ch42-reading">Guided reading</h3>
+<ol>
+<li><code>src/sim/commands.zig</code>, the <code>Command</code> union, all of it. It is two hundred lines of doc comments and is the best single description of what the game lets you do.</li>
+<li>The <code>Error</code> set and <code>Result</code> struct just below it.</li>
+<li><code>execute</code>: read the first ten arms in order, then jump to <code>.upgrade_tier</code>, <code>.crew_company</code>, <code>.set_shares_pct</code> and <code>.trim_stock</code>. Note the three beats in each. Then <code>advance</code> and <code>debitPurchase</code> (a four-line helper that is "check, then post").</li>
+<li><code>src/sim/cli.zig</code>: <code>parseCommand</code> (skim the branches, read <code>newlance</code> fully), <code>errorText</code>, <code>verbs</code>, <code>usage</code>, and the two tests at the bottom.</li>
+<li>Back in <code>commands.zig</code>, read three tests: "command validation errors", "tier upgrade: refusals keep the money", and "golden master: same seed + same script". You will return to the last one in <a href="#ch49">Chapter 49</a>.</li>
+</ol>
+
+<h3 id="ch42-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 42.1 · A command from the union to the REPL <span class="level">challenge</span></h4>
+<p>Add a command <code>set_morale_all: u8</code> that sets the morale of every <em>active</em> person to the given value, refusing values over 100 with <code>Error.BadPercent</code>. Add the variant, the arm, a REPL verb <code>morale &lt;0-100&gt;</code> (verb list, parser branch, usage row), and a test. Do it in that order and read every compile error before fixing it.</p>
+<details class="answer"><summary>Solution</summary>
+<p>Adding the variant alone makes <code>zig build test</code> fail with <code>error: switch must handle all possibilities</code> at <code>execute</code>'s switch and <code>note: unhandled enumeration value: 'set_morale_all'</code>. (The two <code>switch (cmd)</code> in <code>main.zig</code> have <code>else</code> arms and are untouched.) The arm, placed next to <code>.set_shares_pct</code>:</p>
+<pre><code>        .set_morale_all =&gt; |value| {
+            if (value &gt; 100) return Error.BadPercent;
+            var it = gs.people.iterator();
+            while (it.next()) |entry| {
+                const p = entry.value_ptr;
+                if (p.status == .active) p.morale = value;
+            }
+            try gs.log(.decision, .{}, "[exercise] morale set to {d} for everyone on the books", .{value});
+            return .{};
+        },</code></pre>
+<p>In <code>cli.zig</code>: <code>"morale",</code> in the <code>verbs</code> array; <code>.{ "morale", "morale &lt;0-100&gt;" },</code> in the <code>usage</code> table; and a parser branch <code>if (eq(u8, verb, "morale")) return .{ .set_morale_all = try num(u8, tokens.next()) };</code>. If you forget the usage row, the test "every listed verb parses or fails on arguments" fails with <code>usage(v) != null</code>. The test:</p>
+<pre><code>test "set_morale_all touches the active only and refuses over 100" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    const a = try gs.hirePerson("A", "One", .mekwarrior);
+    const b = try gs.hirePerson("B", "Two", .tech_mek);
+    gs.person(b).?.status = .retired;
+    try std.testing.expectError(Error.BadPercent, execute(&amp;gs, .{ .set_morale_all = 101 }));
+    _ = try execute(&amp;gs, .{ .set_morale_all = 90 });
+    try std.testing.expectEqual(@as(u8, 90), gs.person(a).?.morale);
+    try std.testing.expectEqual(@as(u8, 50), gs.person(b).?.morale);
+}</code></pre>
+<p>The retired person keeps the default morale of 50, which checks the <code>.active</code> filter. <code>zig build run -- --repl</code> then accepts <code>morale 75</code>, and so does the terminal client's <code>:</code> line, without either frontend being edited. That is the whole argument for one parser.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 42.2 · Refusals with expectError <span class="level">warm-up</span></h4>
+<p>Write a test proving <code>set_shares_pct</code> refuses 101 with <code>Error.BadPercent</code> and accepts 100, and check what 100 percent becomes in <code>gs.share_profit_bp</code> (read the arm to find the unit).</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "shares refuse 101 percent" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    try std.testing.expectError(Error.BadPercent, execute(&amp;gs, .{ .set_shares_pct = 101 }));
+    _ = try execute(&amp;gs, .{ .set_shares_pct = 100 });
+    try std.testing.expectEqual(@as(types.Bp, 10_000), gs.share_profit_bp);
+}</code></pre>
+<p>The arm stores <code>@as(types.Bp, pct) * 100</code>: percent to basis points, the unit <a href="#ch45">Chapter 45</a> explains. <code>expectError</code> takes the error and the <em>expression</em>, not its result; the call happens inside.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 42.3 · Count the variants <span class="level">warm-up</span></h4>
+<p>Write a one-assertion test that pins the number of <code>Command</code> variants using <code>@typeInfo</code>. First guess the number, then print it with <code>std.debug.print</code> inside the test, then replace the print with an <code>expectEqual</code>.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "the command union is large" {
+    const n = @typeInfo(Command).@"union".fields.len;
+    try std.testing.expectEqual(@as(usize, 71), n);
+}</code></pre>
+<p><code>@typeInfo(Command).@"union".fields</code> is the variant list, available at compile time. The number is 71 today; if you did Exercise 42.1 first it is 72. A pinned count is a mild nuisance for whoever adds the next command, which is the point of the exercise rather than a recommendation: the game does not pin it, and you should think about whether you would.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 42.4 · Find the three beats <span class="level">practice</span></h4>
+<p>Open the <code>.found_hq</code> arm (near <code>.upgrade_tier</code>). It calls <code>debitPurchase</code> <em>before</em> <code>gs.foundHq</code>. Is that a violation of "all checks, then all effects"? Read <code>debitPurchase</code> and <code>foundHq</code>'s error set and argue either way in three sentences.</p>
+<details class="answer"><summary>Solution</summary>
+<p>The arm does its own checks first (<code>planet_mod.find</code>, <code>reachable</code>), so by the time it debits, the only ways <code>foundHq</code> can fail are the ones already ruled out (<code>UnknownPlanet</code>, <code>NotReachable</code>) plus <code>OutOfMemory</code>. <code>debitPurchase</code> itself is "check the balance, then post", so it cannot half-succeed. It is therefore not a violation in practice, but it is fragile: if <code>foundHq</code> gained a new failure mode, the exhaustive <code>catch |err| switch</code> would force someone to add an arm and, one hopes, to notice the money had already left. The <code>.upgrade_tier</code> arm avoids the question by posting last; that ordering is the safer habit.</p></details>
+</div>
+
+<h3 id="ch42-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>Why is a player action a value rather than a method call? <details class="answer"><summary>Answer</summary>A value can be built by a key handler, parsed from text, stored in an array for a test script, or logged; one <code>switch</code> then handles all of them identically, and the compiler checks the switch is complete.</details></li>
+<li>What are the three beats of an arm, and which bug does the order prevent? <details class="answer"><summary>Answer</summary>Validate, mutate, report. Doing every check before any effect prevents a refused command from leaving a partial change behind, such as a debited treasury for an upgrade that never started.</details></li>
+<li>What does <code>catch |err| switch (err) { … }</code> buy over <code>try</code> when calling <code>hq_ops.startTierUpgrade</code>? <details class="answer"><summary>Answer</summary>It translates the helper's smaller error set into the command layer's set explicitly, and because the switch is exhaustive, a new error in the helper becomes a compile error at the arm.</details></li>
+<li>Why does <code>Result</code> give every field a default? <details class="answer"><summary>Answer</summary>So most arms can return <code>.{}</code> and only the arms with something to report fill a field; callers read the field they care about.</details></li>
+<li>What does <code>ParseError!?Command</code> mean? <details class="answer"><summary>Answer</summary>Parsing may fail (bad number, missing argument); if it succeeds it may still yield <code>null</code>, meaning "not a verb this parser knows", which lets the frontend try its own verbs.</details></li>
+<li>What happens if <code>execute</code> refuses on day 3 of <code>advance_days = 7</code>? <details class="answer"><summary>Answer</summary>Days 1 and 2 have already happened and remain; the error (<code>Insolvent</code> or <code>Bankrupt</code>) is returned and no rollback occurs, because time only moves forward.</details></li>
+<li>Why does <code>errorText</code> take <code>anyerror</code> and end with <code>else => @errorName(err)</code>? <details class="answer"><summary>Answer</summary>So it can be called with errors from any layer and never fails to produce text; an error without a sentence shows its name until someone writes one.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>All mutation of a campaign goes through <code>commands.execute</code>, one exhaustive <code>switch</code> over a 71-variant tagged union.</li>
+<li>Every arm validates, then mutates, then reports; refusals are named errors from one merged set, and results are a struct of defaulted fields.</li>
+<li>Helpers with smaller error sets are translated with an exhaustive <code>catch |err| switch</code>, so new failure modes surface at compile time.</li>
+<li>Time advances through the same door, and money is the only thing that can hold a turn.</li>
+<li>One parser (<code>cli.parseCommand</code>) and one error table (<code>cli.errorText</code>) serve both frontends, so adding a verb is a change in one file.</li>
+</ul></div>
+</section>

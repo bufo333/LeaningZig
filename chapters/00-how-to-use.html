@@ -1,0 +1,62 @@
+<section id="ch00">
+<h2>0. How to use this book</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn how the book is laid out, how to run the examples and exercises with the <code>zig</code> command, how to check your answers, and what IRON LEDGER is and why every chapter keeps pointing at it.</p>
+
+<h3 id="ch00-1">0.1 What this book is</h3>
+<p>This is a slow book. It teaches the Zig programming language, version 0.16, from the very first line you type to the point where you can open a real 31,000-line program and read it with understanding. It assumes you have written a little code in some language, enough to know what a loop and a function are, and nothing else. If you have never used C, never thought about where a variable lives in memory, and never seen a compiler refuse to build your program because of an unused variable, you are exactly the reader it was written for.</p>
+<p>Zig is a small language with strong opinions. It has no hidden memory allocation, no hidden control flow, no exceptions, and no garbage collector. Every one of those absences is a design choice, and the book explains the reason each time one of them shows up. Learning Zig is largely learning to like those reasons.</p>
+
+<h3 id="ch00-2">0.2 How the book is organised</h3>
+<p>The book has six parts and a set of appendices.</p>
+<table>
+<tr><th>Part</th><th>Chapters</th><th>What you learn</th></tr>
+<tr><td>0 · Getting started</td><td>1 to 7</td><td>Installing the compiler, printing, variables, numbers, control flow, functions.</td></tr>
+<tr><td>1 · Data</td><td>8 to 18</td><td>Testing, arrays, slices, strings, structs, enums, unions, optionals, errors, defer, pointers.</td></tr>
+<tr><td>2 · Memory and the standard library</td><td>19 to 24</td><td>Allocators, growable lists, hash maps, formatting, and a tour of <code>std</code>.</td></tr>
+<tr><td>3 · The compile-time language</td><td>25 to 29</td><td><code>comptime</code>, generics, reflection, ZON data files, bit-level types.</td></tr>
+<tr><td>4 · Whole programs</td><td>30 to 38</td><td>Files and modules, the build system, command-line tools, files, time, C, threads, style, and a capstone project.</td></tr>
+<tr><td>5 · Reading IRON LEDGER</td><td>39 to 51</td><td>A guided tour of the real game's source, one subsystem at a time.</td></tr>
+<tr><td>Appendices</td><td>A1 to A5</td><td>Builtins, format specifiers, 0.16 migration notes, decoded compile errors, glossary.</td></tr>
+</table>
+<p>Every chapter from 1 onward follows the same shape. It opens with a short statement of goals, works through its topic in numbered subsections, and ends with three fixed pieces: a blue <em>In IRON LEDGER</em> box that shows where the chapter's idea appears in the game's source, a set of exercises with hidden solutions, and a short quiz with hidden answers. A summary box closes the chapter.</p>
+<p>Inside a chapter you will see callouts. An amber <em>note</em> adds context. A green <em>Try it</em> box asks you to change something and run it again. A red <em>warning</em> marks a trap that catches beginners. Read the warnings twice.</p>
+<p>The book is meant to be read in order through Part 2 at least. Later parts lean on earlier ones, and the exercises assume you did the previous chapter's exercises. Part 5 can be read on its own by someone who already knows Zig.</p>
+
+<h3 id="ch00-3">0.3 Running the examples</h3>
+<p>You need a terminal and the Zig compiler. <a href="#ch01">Chapter 1</a> walks through installing it. Once <code>zig version</code> prints <code>0.16.0</code>, you can run any single-file example in this book with one command:</p>
+<pre class="term">$ zig run hello.zig
+Hello, world!</pre>
+<p><code>zig run</code> compiles the file to a temporary executable and runs it. There is no project to set up and no build file to write. Every example in Parts 0 to 3 is a complete file you can copy into an editor, save, and run this way. Programs whose output goes to the terminal print it through <code>std.debug.print</code>, which writes to the standard error stream; you will see the output either way, and <a href="#ch02">Chapter 2</a> explains the difference.</p>
+<p>Examples that contain tests are run with a different command:</p>
+<pre class="term">$ zig test ex2_overflow.zig
+All 4 tests passed.</pre>
+<p><code>zig test</code> compiles the file, runs every <code>test "..." { }</code> block in it, and reports how many passed. A test that fails prints where and why. This is the main way you will check your own work.</p>
+<p>All output shown in the book in a dark terminal block was produced by actually running the code with Zig 0.16.0. Where a program is meant to fail, the book shows the real compiler error or the real panic message, trimmed of a few lines of internal stack trace, so you learn what those messages look like before you meet them alone.</p>
+
+<h3 id="ch00-4">0.4 Doing the exercises</h3>
+<p>Each chapter has three to six exercises, marked warm-up, practice, or challenge. They live in the <code>exercises/</code> folder next to the chapters, one folder per chapter, and every exercise is a single <code>.zig</code> file with a header comment that tells you three things: what to do, which command runs it, and how you will know you are done.</p>
+<pre><code>//! Chapter 04, exercise 2: overflow arithmetic.
+//! Run with:  zig test ex2_overflow.zig
+//! Goal: make every test pass without changing the tests.</code></pre>
+<p>There are two kinds. A <strong>zig test</strong> exercise has tests at the bottom of the file; you fill in the function bodies marked <code>// TODO</code> until every test passes. A <strong>zig run</strong> exercise asks you to make the program print exactly the output listed in the header. Some starters do not compile until you finish them, and the header says so when that is the case.</p>
+<p>Every exercise has a complete solution in a <code>solutions/</code> subfolder and, in the book, behind a <em>Solution</em> disclosure under the exercise text. Try before you look. When you do look, read the explanation under the code, because the point of most exercises is a rule, not a program.</p>
+<div class="try"><strong>Try it.</strong> Before going on, make a folder for your work, such as <code>~/zig-book</code>. You will keep every program you write in it, and by the end of Part 0 it will hold a few dozen small files you can look back on.</div>
+
+<h3 id="ch00-5">0.5 What IRON LEDGER is, and why it anchors the book</h3>
+<p>IRON LEDGER is a mercenary-company simulator set in the BattleTech universe. You command a small band of BattleMech pilots in the year 3025, take contracts, fight battles, repair machines, pay salaries, and try to end each month with more C-bills than you started with. It runs in a terminal, saves to a SQLite database, and is written entirely in Zig with no third-party libraries. Its source lives in the <code>game/</code> folder next to this course and is about 31,000 lines long.</p>
+<p>It is here for a reason that has nothing to do with giant robots. A book that teaches a language with toy examples leaves you unable to read a real program, because real programs are where the toy pieces meet: a struct holds a list that was made by an allocator that belongs to a game state that a command mutates that a query reads that a screen draws. IRON LEDGER is big enough to have all of that, small enough to read in full, and, because it was written in Zig 0.16 with no libraries, every idiom it uses is one this book can teach you.</p>
+<p>So each chapter ends by pointing at the game. In <a href="#ch04">Chapter 4</a> you learn integer arithmetic, then see that the game stores money as a 64-bit integer and never uses a float for it. In <a href="#ch06">Chapter 6</a> you learn <code>switch</code>, then see the calendar's days-in-month function. By the time you reach Part 5, the tour of the game's architecture, you have already met most of its code in small pieces. The last chapters put the pieces together and follow one keypress from the terminal all the way through the simulation and back.</p>
+<div class="note"><strong>You do not need to know BattleTech.</strong> A BattleMech is a walking tank measured in tons; a lance is four of them; a C-bill is money; a contract is a job. That is the whole glossary you need, and the appendix has the rest.</div>
+
+<h3 id="ch00-6">0.6 A word about compile errors</h3>
+<p>Zig's compiler is strict in ways that surprise people who come from Python or JavaScript. An unused variable is an error. A variable declared changeable but never changed is an error. Reusing a name from an outer scope is an error. None of these stop a Python program. In Zig they stop the build, and the book shows you each one deliberately, with the exact text the compiler prints, so that the first time it happens on your own code you recognise it and know the one-line fix.</p>
+<p>Treat the compiler as a patient reviewer rather than an obstacle. Almost every message it prints names the file, the line, the column, and often what to do about it. Learning to read those messages is a skill this book teaches on purpose, and <a href="#appA4">Appendix A4</a> collects the common ones in one place.</p>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>The book has six parts; Parts 0 to 2 should be read in order.</li>
+<li><code>zig run file.zig</code> runs a program; <code>zig test file.zig</code> runs its tests.</li>
+<li>Exercises are single files with a header that names the command and the goal; solutions are in <code>solutions/</code> and behind the <em>Solution</em> disclosure.</li>
+<li>IRON LEDGER is a real 31,000-line Zig program; each chapter ends by pointing at where its idea appears there, and Part 5 reads the game end to end.</li>
+<li>Compile errors are the compiler helping; the book shows real ones on purpose.</li>
+</ul></div>
+</section>

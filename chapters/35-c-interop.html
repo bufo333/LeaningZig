@@ -1,0 +1,543 @@
+<section id="ch35">
+<h2>35. Calling C</h2>
+<p class="goals"><strong>In this chapter</strong> you will call functions from the C standard library and from SQLite without writing a line of C: declaring them with <code>extern fn</code>, matching C's types, handling C strings and opaque handles, and turning C's integer return codes into Zig errors. You will also see <code>@cImport</code>, which reads a C header for you, and <code>export fn</code>, which goes the other way.</p>
+
+<h3 id="ch35-1">35.1 Why this is easy in Zig</h3>
+<p>Most languages need a "foreign function interface": a binding generator, a wrapper library, some glue in a third language. Zig needs none of that, because Zig's types already include every type C has. A C <code>int</code> is <code>c_int</code>. A C pointer is a Zig pointer. A C string is a pointer to bytes with a zero at the end, and Zig has a type for exactly that. So calling C is a matter of <em>declaring</em> the function with Zig types, and the linker does the rest.</p>
+<p>Here is the smallest possible example: two functions from libc.</p>
+<div class="file">c1_strlen.zig</div>
+<pre><code>const std = @import("std");
+
+extern fn strlen(s: [*:0]const u8) usize;
+extern fn getpid() c_int;
+
+pub fn main() void {
+    const name: [*:0]const u8 = "Grayson Carlyle";
+    std.debug.print("strlen = {d}\n", .{strlen(name)});
+    std.debug.print("pid    = {d}\n", .{getpid()});
+}</code></pre>
+<pre class="term">$ zig run -lc c1_strlen.zig
+strlen = 15
+pid    = 36500</pre>
+<p><code>extern fn</code> says "this function exists, somewhere in a library I will link; here is its signature". There is no body. The name must match the C symbol exactly. And <code>-lc</code> on the command line tells Zig to link the C library, which is where <code>strlen</code> and <code>getpid</code> live. (On macOS the system library is always linked, so this particular example happens to work without <code>-lc</code>; on Linux it would fail with an undefined symbol. Always pass <code>-lc</code> when you use libc, so your program is portable.)</p>
+
+<h3 id="ch35-2">35.2 C types in Zig</h3>
+<p>The signature is the whole contract, so it has to be right. Zig provides the C integer types as builtins whose size follows the target platform:</p>
+<table>
+<tr><th>C</th><th>Zig</th><th>Notes</th></tr>
+<tr><td><code>int</code>, <code>unsigned</code></td><td><code>c_int</code>, <code>c_uint</code></td><td>32 bits on every mainstream target</td></tr>
+<tr><td><code>long</code>, <code>unsigned long</code></td><td><code>c_long</code>, <code>c_ulong</code></td><td>64 bits on macOS and Linux, 32 on Windows</td></tr>
+<tr><td><code>char</code></td><td><code>c_char</code> (or <code>u8</code> for bytes)</td><td>signedness follows the platform</td></tr>
+<tr><td><code>short</code>, <code>long long</code></td><td><code>c_short</code>, <code>c_longlong</code></td><td></td></tr>
+<tr><td><code>size_t</code></td><td><code>usize</code></td><td></td></tr>
+<tr><td><code>int64_t</code>, <code>uint8_t</code></td><td><code>i64</code>, <code>u8</code></td><td>fixed-width types are the same in both</td></tr>
+<tr><td><code>double</code>, <code>float</code></td><td><code>f64</code>, <code>f32</code></td><td></td></tr>
+<tr><td><code>const char *</code> (a string)</td><td><code>[*:0]const u8</code></td><td>many-item pointer, zero-terminated</td></tr>
+<tr><td><code>char *buf</code> (a buffer)</td><td><code>[*]u8</code></td><td>many-item pointer, length passed separately</td></tr>
+<tr><td><code>T *</code> (one thing)</td><td><code>*T</code> or <code>?*T</code></td><td><code>?</code> when NULL is a legal value</td></tr>
+<tr><td><code>void *</code></td><td><code>?*anyopaque</code></td><td>pointer to "I don't know what"</td></tr>
+<tr><td><code>void</code> return</td><td><code>void</code></td><td></td></tr>
+<tr><td>a struct handle you never look inside</td><td><code>opaque {}</code></td><td>see 35.4</td></tr>
+</table>
+<p>The important mental shift is about pointers. In Zig a pointer's type says whether it points to one thing (<code>*T</code>) or to many (<code>[*]T</code>), and whether it can be null (<code>?</code>). C has one pointer type for all of these, so when you declare a C function you are <em>adding</em> information the C header did not have. Choose honestly: if C can hand you NULL, write <code>?</code>; if it is a string, write the sentinel.</p>
+<p>Two more pieces of vocabulary. <code>callconv(.c)</code> on a Zig function says "make this callable the way C expects", which you need whenever C will call <em>your</em> function (a callback). And <code>@cImport</code>/<code>std.c</code> can spare you writing declarations at all; both come later in the chapter.</p>
+
+<h3 id="ch35-3">35.3 A callback: qsort</h3>
+<p>C's <code>qsort</code> sorts an array of anything, given the element size and a comparison function. It is the classic example of C calling back into your code, and it shows every type from the table at once.</p>
+<div class="file">c3_qsort.zig</div>
+<pre><code>const std = @import("std");
+
+const Compare = *const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
+extern fn qsort(base: ?*anyopaque, count: usize, size: usize, cmp: Compare) void;
+
+fn ascending(a: ?*const anyopaque, b: ?*const anyopaque) callconv(.c) c_int {
+    const x: *const c_int = @ptrCast(@alignCast(a.?));
+    const y: *const c_int = @ptrCast(@alignCast(b.?));
+    if (x.* &lt; y.*) return -1;
+    if (x.* &gt; y.*) return 1;
+    return 0;
+}
+
+pub fn main() void {
+    var values = [_]c_int{ 1500, 400, 800, 640 };
+    qsort(&amp;values, values.len, @sizeOf(c_int), ascending);
+    std.debug.print("{any}\n", .{values});
+}</code></pre>
+<pre class="term">$ zig run -lc c3_qsort.zig
+{ 400, 640, 800, 1500 }</pre>
+<p>Read the comparator slowly. C promises to call it with two <code>const void *</code>, so the parameters are <code>?*const anyopaque</code>. We know they are really pointers to <code>c_int</code>, so we convert: <code>a.?</code> unwraps the optional (a null here would be a bug in qsort), <code>@alignCast</code> asserts the pointer is aligned well enough for a <code>c_int</code>, and <code>@ptrCast</code> changes the pointee type. Both casts are safety-checked in Debug builds. The <code>callconv(.c)</code> after the parameter list is what makes this function acceptable where C expects a function pointer.</p>
+<p>The type <code>*const fn (...) callconv(.c) c_int</code> is a pointer to such a function. We give it a name, <code>Compare</code>, only to keep the <code>qsort</code> declaration readable. And <code>&amp;values</code>, a pointer to an array, coerces to <code>?*anyopaque</code> automatically, because any pointer can become a <code>void *</code>.</p>
+
+<h3 id="ch35-4">35.4 Strings across the border</h3>
+<p>A C string is a <code>[*:0]const u8</code>: a pointer to bytes, with the promise that a zero byte marks the end. A Zig string is a <code>[]const u8</code>: a pointer and a length, no terminator needed. Crossing from one to the other is a small ceremony in each direction.</p>
+<p><strong>Zig to C.</strong> String literals are secretly <code>[:0]const u8</code>, a slice that also promises the terminator, and they coerce to <code>[*:0]const u8</code> without a copy. That is why passing <code>"Grayson Carlyle"</code> to <code>strlen</code> just worked. A runtime slice does not carry that promise: to hand one to C you copy it into a buffer and add the zero yourself (Exercise 35.5), or allocate with <code>allocator.dupeZ(u8, s)</code>, which does the same on the heap.</p>
+<p><strong>C to Zig.</strong> Given a <code>[*:0]const u8</code>, <code>std.mem.span</code> walks to the zero and returns a proper slice with a length. From then on it is an ordinary Zig string.</p>
+<div class="file">c4_span.zig</div>
+<pre><code>const std = @import("std");
+
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+pub fn main() void {
+    const raw = getenv("HOME") orelse {
+        std.debug.print("HOME is not set\n", .{});
+        return;
+    };
+    const home: []const u8 = std.mem.span(raw);
+    std.debug.print("HOME has {d} bytes and starts with '{c}'\n", .{ home.len, home[0] });
+
+    // Going the other way: a Zig string literal is already sentinel-terminated.
+    const lit: [:0]const u8 = "campaigns.db";
+    const ptr: [*:0]const u8 = lit; // coerces, no copy
+    std.debug.print("{s}\n", .{ptr});
+}</code></pre>
+<pre class="term">$ zig run -lc c4_span.zig
+HOME has 11 bytes and starts with '/'
+campaigns.db</pre>
+<p><code>getenv</code> returns NULL when the variable is unset, so the return type is <code>?[*:0]const u8</code> and we use <code>orelse</code>. The type system made us think about the missing case, which is precisely what C would not have done.</p>
+<div class="warn"><strong>Who owns the bytes?</strong> A string C gives you usually points into C's memory. <code>getenv</code>'s result lives as long as the environment; SQLite's column text is valid only until the next <code>step</code>. If you need it later, copy it (<code>allocator.dupe</code>). IRON LEDGER's <code>Stmt.text</code> always copies for this reason.</div>
+
+<h3 id="ch35-5">35.5 Opaque handles and return codes</h3>
+<p>Most C libraries give you a pointer to some struct they never let you see, and every function returns an <code>int</code> that is zero on success. SQLite is the model citizen of this style, and it is installed on this machine, so we can use the real thing. Three declarations get us open, execute and close:</p>
+<div class="file">c8_errors.zig</div>
+<pre><code>const std = @import("std");
+
+const Handle = opaque {};
+extern fn sqlite3_open(filename: [*:0]const u8, db: *?*Handle) c_int;
+extern fn sqlite3_close(db: *Handle) c_int;
+extern fn sqlite3_exec(db: *Handle, sql: [*:0]const u8, cb: ?*anyopaque, arg: ?*anyopaque, errmsg: ?*?[*:0]u8) c_int;
+extern fn sqlite3_free(p: ?*anyopaque) void;
+extern fn sqlite3_libversion() [*:0]const u8;
+
+const SQLITE_OK = 0;
+
+const Db = struct {
+    h: *Handle,
+
+    fn open(path: [*:0]const u8) error{SqliteError}!Db {
+        var h: ?*Handle = null;
+        if (sqlite3_open(path, &amp;h) != SQLITE_OK or h == null) return error.SqliteError;
+        return .{ .h = h.? };
+    }
+
+    fn close(self: Db) void {
+        _ = sqlite3_close(self.h);
+    }
+
+    fn exec(self: Db, sql: [*:0]const u8) error{SqliteError}!void {
+        var msg: ?[*:0]u8 = null;
+        if (sqlite3_exec(self.h, sql, null, null, &amp;msg) != SQLITE_OK) {
+            if (msg) |m| {
+                std.debug.print("sqlite says: {s}\n", .{m});
+                sqlite3_free(m);
+            }
+            return error.SqliteError;
+        }
+    }
+};
+
+pub fn main() !void {
+    std.debug.print("SQLite {s}\n", .{sqlite3_libversion()});
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE TABLE person (name TEXT, salary INTEGER)");
+    try db.exec("INSERT INTO person VALUES ('Grayson', 1500)");
+    std.debug.print("two statements ran\n", .{});
+    db.exec("SELEKT * FROM person") catch |e| std.debug.print("caught {s}\n", .{@errorName(e)});
+}</code></pre>
+<pre class="term">$ zig run -lc -lsqlite3 c8_errors.zig
+SQLite 3.51.0
+two statements ran
+sqlite says: near "SELEKT": syntax error
+caught SqliteError</pre>
+<p>Walk through the shapes:</p>
+<ul>
+<li><code>const Handle = opaque {};</code> declares a type with unknown size and contents. You can have a <code>*Handle</code> and pass it around, but you cannot dereference it or make one yourself. That is exactly what SQLite's <code>sqlite3 *</code> is. Because it is a distinct type, you also cannot pass a statement handle where a database handle belongs; C would let you.</li>
+<li><code>sqlite3_open</code> takes an <em>out-parameter</em>, a pointer to a pointer: <code>*?*Handle</code>. We declare <code>var h: ?*Handle = null;</code> and pass <code>&amp;h</code>. After the call, if it succeeded, <code>h</code> is non-null and we unwrap it with <code>h.?</code>.</li>
+<li><code>sqlite3_exec</code>'s error message is another out-parameter, <code>?*?[*:0]u8</code>: an optional pointer (we may pass NULL to say "I don't want it") to an optional C string (SQLite may leave it NULL). The message is allocated by SQLite, so we must give it back with <code>sqlite3_free</code>.</li>
+<li>Every return code is compared with <code>SQLITE_OK</code>, and the wrapper turns "not OK" into <code>error.SqliteError</code>. Above the wrapper, nobody sees a <code>c_int</code> again; they see <code>try db.exec(...)</code>.</li>
+</ul>
+<p>This is the pattern for every C library: raw <code>extern</code> declarations at the bottom of one file, a thin Zig struct with methods above them that speaks errors and slices, and nothing C-shaped leaking out of that file. If you forget to link the library, the error is clear and comes from the linker, not the compiler:</p>
+<pre class="term">$ zig run -lc c8_errors.zig
+error: undefined symbol: _sqlite3_close
+    note: referenced by .../c8_errors_zcu.o:_c8_errors.Db.close
+error: undefined symbol: _sqlite3_exec
+    ...</pre>
+
+<h3 id="ch35-6">35.6 @cImport and std.c: letting the compiler read the header</h3>
+<p>Writing declarations by hand is fine for a dozen functions, and it keeps your dependency on the C library explicit and reviewable. For a large API, Zig can translate the header for you. <code>@cImport</code> takes a block of <code>@cInclude</code> calls and produces a namespace containing every function, type and macro from those headers:</p>
+<div class="file">c7_cimport.zig</div>
+<pre><code>const std = @import("std");
+const c = @cImport({
+    @cInclude("stdio.h");
+    @cInclude("math.h");
+});
+
+pub fn main() void {
+    const root = c.sqrt(2.0);
+    _ = c.printf("sqrt(2) = %.4f\n", root);
+    std.debug.print("c_int is {d} bits, c_long is {d} bits\n", .{ @bitSizeOf(c_int), @bitSizeOf(c_long) });
+}</code></pre>
+<pre class="term">$ zig run -lc c7_cimport.zig
+c_int is 32 bits, c_long is 64 bits
+sqrt(2) = 1.4142</pre>
+<p>This works directly from <code>zig run -lc</code> in 0.16; no <code>build.zig</code> configuration is needed for headers that live in the system include path. (In a build script the equivalent is <code>exe.linkLibC()</code> plus, for third-party headers, <code>exe.addIncludePath</code>.) The translated declarations use C's loose pointer types (<code>[*c]u8</code>, a "C pointer" that may be null and may point to one or many), so you will do a little more casting than with hand-written declarations, but you get the entire header for free. Exercise 35.4 wraps <code>strtol</code> this way.</p>
+<p>For libc specifically there is a middle path: <code>std.c</code> already contains hand-written declarations for most of POSIX, with good Zig types.</p>
+<div class="file">c5_stdc.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("pid  {d}\n", .{std.c.getpid()});
+    std.debug.print("ppid {d}\n", .{std.c.getppid()});
+    if (std.c.getenv("SHELL")) |sh| std.debug.print("shell {s}\n", .{sh});
+}</code></pre>
+<pre class="term">$ zig run -lc c5_stdc.zig
+pid  36661
+ppid 36655
+shell /bin/zsh</pre>
+<p>Not everything is there (<code>strlen</code> is not, for instance, because <code>std.mem</code> covers it), so when a name is missing, declare it yourself. Note also that <code>std.c.getenv</code> is typed to return <code>?[*:0]u8</code>, and <code>{s}</code> knows how to print a sentinel-terminated pointer.</p>
+
+<h3 id="ch35-7">35.7 The other direction: export</h3>
+<p><code>export fn</code> makes a Zig function visible to C under its exact name, with the C calling convention. Compile the file as a library (<code>zig build-lib</code>) and a C program can link against it; or, as here, simply call it from Zig, which is a handy way to test.</p>
+<div class="file">c6_export.zig</div>
+<pre><code>const std = @import("std");
+
+export fn ledger_apply_bp(amount: i64, bp: i64) i64 {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{ledger_apply_bp(1500, 11_000)});
+}</code></pre>
+<pre class="term">$ zig run c6_export.zig
+1650</pre>
+<p>An exported function's parameters and return type must be C-compatible: integers, floats, pointers, <code>extern struct</code>s. A Zig slice or error union would not have a C representation, and the compiler will tell you so. This is how IRON LEDGER could one day expose its simulation to a C or Python front end: an <code>export</code>ed function per command, taking integers and C strings.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game's whole persistence layer stands on <code>src/persist/sqlite.zig</code>: eleven <code>extern fn</code> declarations against SQLite plus two <code>opaque {}</code> handle types, with no header translation. The file is the pattern of 35.5 at full size. <code>Db.open</code>, <code>Db.exec</code> and <code>Db.prepare</code> wrap return codes; <code>Stmt.bind</code> uses <code>@typeInfo</code> (as in <a href="#ch27">Chapter 27</a>) to choose <code>sqlite3_bind_int64</code>, <code>sqlite3_bind_text</code> or <code>sqlite3_bind_null</code> from the Zig type of the value; <code>Stmt.text</code> copies column bytes into an allocator because SQLite's buffer dies on the next step. The constant <code>transient</code> is SQLite's <code>SQLITE_TRANSIENT</code>, the special destructor pointer <code>(void*)-1</code>, spelled as <code>@ptrFromInt(std.math.maxInt(usize))</code>. The linker finds the symbols because <code>build.zig</code> says <code>linkSystemLibrary("sqlite3")</code>, the build-script form of <code>-lsqlite3</code>. The same discipline holds for the terminal: <code>std.posix.tcsetattr</code> for raw mode and <code>std.c.waitpid</code> for the music player are each confined to one file.
+<pre><code>pub fn open(path: [*:0]const u8) Error!Db {
+    var h: ?*Handle = null;
+    if (sqlite3_open(path, &amp;h) != SQLITE_OK or h == null) return error.SqliteError;
+    return .{ .h = h.? };
+}</code></pre></div>
+
+<h3 id="ch35-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 35.1 · Three libc functions <span class="level">warm-up</span></h4>
+  <p>Declare <code>strlen</code>, <code>getpid</code> and <code>toupper</code> with <code>extern fn</code>, using the right Zig types from the table, and print the results. Name the file: <code>exercises/35-c-interop/ex1_libc.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 35, exercise 1: three libc functions by hand.
+//! Run with:  zig run -lc ex1_libc.zig
+//! Goal: declare strlen, getpid and toupper with `extern fn`, call them,
+//! and print the results. Expected output (pid differs):
+//!   strlen("Grayson Carlyle") = 15
+//!   pid = 12345 (positive: true)
+//!   toupper('m') = M
+
+const std = @import("std");
+
+extern fn strlen(s: [*:0]const u8) usize;
+extern fn getpid() c_int;
+extern fn toupper(ch: c_int) c_int;
+
+pub fn main() void {
+    const name: [*:0]const u8 = "Grayson Carlyle";
+    std.debug.print("strlen(\"{s}\") = {d}\n", .{ name, strlen(name) });
+    const pid = getpid();
+    std.debug.print("pid = {d} (positive: {})\n", .{ pid, pid &gt; 0 });
+    const up: u8 = @intCast(toupper('m'));
+    std.debug.print("toupper('m') = {c}\n", .{up});
+}</code></pre>
+  <p><code>toupper</code> takes and returns <code>int</code> in C (so it can represent EOF), hence <code>c_int</code> both ways and the <code>@intCast</code> back to a <code>u8</code> for printing with <code>{c}</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 35.2 · qsort with your comparator <span class="level">practice</span></h4>
+  <p>Sort an array of <code>i64</code> salaries with libc's <code>qsort</code> and a comparator written in Zig. Name the file: <code>exercises/35-c-interop/ex2_qsort.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 35, exercise 2: qsort with a Zig comparator.
+//! Run with:  zig run -lc ex2_qsort.zig
+//! Goal: sort an array of salaries with libc's qsort, using a comparator
+//! written in Zig with callconv(.c). Expected output:
+//!   before: { 1500, 400, 800, 640, 1500, 500 }
+//!   after:  { 400, 500, 640, 800, 1500, 1500 }
+
+const std = @import("std");
+
+const CompareFn = *const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
+extern fn qsort(base: ?*anyopaque, nmemb: usize, size: usize, compar: CompareFn) void;
+
+fn byValue(a: ?*const anyopaque, b: ?*const anyopaque) callconv(.c) c_int {
+    const x: *const i64 = @ptrCast(@alignCast(a.?));
+    const y: *const i64 = @ptrCast(@alignCast(b.?));
+    if (x.* &lt; y.*) return -1;
+    if (x.* &gt; y.*) return 1;
+    return 0;
+}
+
+pub fn main() void {
+    var salaries = [_]i64{ 1500, 400, 800, 640, 1500, 500 };
+    std.debug.print("before: {any}\n", .{salaries});
+    qsort(&amp;salaries, salaries.len, @sizeOf(i64), byValue);
+    std.debug.print("after:  {any}\n", .{salaries});
+}</code></pre>
+  <p>The element type changed from <code>c_int</code> to <code>i64</code>, so the size argument (<code>@sizeOf(i64)</code>) and the casts inside the comparator changed with it. Get either wrong and qsort will sort garbage; C checks nothing. The <code>@alignCast</code> is what lets Zig check at least the alignment in Debug builds.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 35.3 · A tiny SQLite binding <span class="level">challenge</span></h4>
+  <p>Extend the open/exec/close wrapper into a binding with prepared statements: declare <code>sqlite3_prepare_v2</code>, <code>step</code>, <code>finalize</code>, <code>reset</code>, <code>bind_int64</code>, <code>bind_text</code>, <code>column_int64</code> and <code>column_text</code>, wrap them in <code>Db</code> and <code>Stmt</code> structs that return Zig errors, insert two people and read them back. Name the file: <code>exercises/35-c-interop/ex3_sqlite.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 35, exercise 3: a tiny SQLite binding.
+//! Run with:  zig run -lc -lsqlite3 ex3_sqlite.zig
+//! Goal: declare the eight SQLite functions needed to open a database,
+//! create a table, insert rows with a prepared statement and read them
+//! back. Wrap return codes in Zig errors. Expected output:
+//!   sqlite 3.51.0
+//!   Grayson earns 1500
+//!   Clay earns 800
+//!   2 rows
+
+const std = @import("std");
+
+const Handle = opaque {};
+const StmtHandle = opaque {};
+
+extern fn sqlite3_libversion() [*:0]const u8;
+extern fn sqlite3_open(filename: [*:0]const u8, db: *?*Handle) c_int;
+extern fn sqlite3_close(db: *Handle) c_int;
+extern fn sqlite3_exec(db: *Handle, sql: [*:0]const u8, cb: ?*anyopaque, arg: ?*anyopaque, errmsg: ?*?[*:0]u8) c_int;
+extern fn sqlite3_free(p: ?*anyopaque) void;
+extern fn sqlite3_prepare_v2(db: *Handle, sql: [*]const u8, nbyte: c_int, stmt: *?*StmtHandle, tail: ?*?[*]const u8) c_int;
+extern fn sqlite3_step(stmt: *StmtHandle) c_int;
+extern fn sqlite3_finalize(stmt: *StmtHandle) c_int;
+extern fn sqlite3_reset(stmt: *StmtHandle) c_int;
+extern fn sqlite3_bind_int64(stmt: *StmtHandle, idx: c_int, v: i64) c_int;
+extern fn sqlite3_bind_text(stmt: *StmtHandle, idx: c_int, text: [*]const u8, n: c_int, destructor: ?*const anyopaque) c_int;
+extern fn sqlite3_column_int64(stmt: *StmtHandle, col: c_int) i64;
+extern fn sqlite3_column_text(stmt: *StmtHandle, col: c_int) ?[*:0]const u8;
+extern fn sqlite3_errmsg(db: *Handle) [*:0]const u8;
+
+const SQLITE_OK = 0;
+const SQLITE_ROW = 100;
+const SQLITE_DONE = 101;
+const transient: ?*const anyopaque = @ptrFromInt(std.math.maxInt(usize));
+
+pub const Error = error{SqliteError};
+
+pub const Db = struct {
+    h: *Handle,
+
+    pub fn open(path: [*:0]const u8) Error!Db {
+        var h: ?*Handle = null;
+        if (sqlite3_open(path, &amp;h) != SQLITE_OK or h == null) return error.SqliteError;
+        return .{ .h = h.? };
+    }
+
+    pub fn close(self: Db) void {
+        _ = sqlite3_close(self.h);
+    }
+
+    pub fn exec(self: Db, sql: [*:0]const u8) Error!void {
+        var err: ?[*:0]u8 = null;
+        if (sqlite3_exec(self.h, sql, null, null, &amp;err) != SQLITE_OK) {
+            if (err) |e| {
+                std.debug.print("sqlite: {s}\n", .{e});
+                sqlite3_free(e);
+            }
+            return error.SqliteError;
+        }
+    }
+
+    pub fn prepare(self: Db, sql: []const u8) Error!Stmt {
+        var s: ?*StmtHandle = null;
+        const rc = sqlite3_prepare_v2(self.h, sql.ptr, @intCast(sql.len), &amp;s, null);
+        if (rc != SQLITE_OK or s == null) {
+            std.debug.print("sqlite: {s}\n", .{sqlite3_errmsg(self.h)});
+            return error.SqliteError;
+        }
+        return .{ .h = s.? };
+    }
+};
+
+pub const Stmt = struct {
+    h: *StmtHandle,
+
+    pub fn finalize(self: Stmt) void {
+        _ = sqlite3_finalize(self.h);
+    }
+
+    pub fn bindInt(self: Stmt, idx: c_int, v: i64) Error!void {
+        if (sqlite3_bind_int64(self.h, idx, v) != SQLITE_OK) return error.SqliteError;
+    }
+
+    pub fn bindText(self: Stmt, idx: c_int, s: []const u8) Error!void {
+        if (sqlite3_bind_text(self.h, idx, s.ptr, @intCast(s.len), transient) != SQLITE_OK)
+            return error.SqliteError;
+    }
+
+    /// Run an INSERT to completion, then reset so it can be bound again.
+    pub fn run(self: Stmt) Error!void {
+        const rc = sqlite3_step(self.h);
+        if (rc != SQLITE_DONE and rc != SQLITE_ROW) return error.SqliteError;
+        _ = sqlite3_reset(self.h);
+    }
+
+    /// Advance a SELECT: true while rows remain.
+    pub fn next(self: Stmt) Error!bool {
+        const rc = sqlite3_step(self.h);
+        if (rc == SQLITE_ROW) return true;
+        if (rc == SQLITE_DONE) return false;
+        return error.SqliteError;
+    }
+
+    pub fn int(self: Stmt, col: c_int) i64 {
+        return sqlite3_column_int64(self.h, col);
+    }
+
+    /// Borrowed: valid only until the next step.
+    pub fn text(self: Stmt, col: c_int) []const u8 {
+        const p = sqlite3_column_text(self.h, col) orelse return "";
+        return std.mem.span(p);
+    }
+};
+
+pub fn main() !void {
+    std.debug.print("sqlite {s}\n", .{sqlite3_libversion()});
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE TABLE person (name TEXT, salary INTEGER)");
+
+    const ins = try db.prepare("INSERT INTO person VALUES (?1, ?2)");
+    defer ins.finalize();
+    const people = [_]struct { name: []const u8, salary: i64 }{
+        .{ .name = "Grayson", .salary = 1500 },
+        .{ .name = "Clay", .salary = 800 },
+    };
+    for (people) |p| {
+        try ins.bindText(1, p.name);
+        try ins.bindInt(2, p.salary);
+        try ins.run();
+    }
+
+    const sel = try db.prepare("SELECT name, salary FROM person");
+    defer sel.finalize();
+    var rows: u32 = 0;
+    while (try sel.next()) : (rows += 1) {
+        std.debug.print("{s} earns {d}\n", .{ sel.text(0), sel.int(1) });
+    }
+    std.debug.print("{d} rows\n", .{rows});
+}</code></pre>
+  <p>This is a two-thirds-size copy of the game's binding. The interesting declarations are <code>sqlite3_prepare_v2</code>, which takes the SQL as a pointer plus a byte count (so a Zig slice's <code>.ptr</code> and <code>.len</code> map straight onto it), and <code>sqlite3_bind_text</code>'s destructor argument, where <code>transient</code> asks SQLite to copy the bytes. <code>Stmt.next</code> turns the three-valued <code>step</code> (ROW, DONE, or an error) into <code>!bool</code>, which reads naturally in a <code>while (try sel.next())</code> loop.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 35.4 · @cImport and strtol <span class="level">practice</span></h4>
+  <p>Import <code>stdlib.h</code> with <code>@cImport</code> and wrap <code>strtol</code> in a Zig function that returns <code>error.NotANumber</code> when no digits were consumed and <code>error.TrailingGarbage</code> when the string did not end after the number. Name the file: <code>exercises/35-c-interop/ex4_cimport.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 35, exercise 4: @cImport and wrapping a C return code.
+//! Run with:  zig run -lc ex4_cimport.zig
+//! Goal: import &lt;stdlib.h&gt; and &lt;errno.h&gt; with @cImport, wrap strtol in a
+//! Zig function that returns an error instead of a sentinel, and print:
+//!   "42" -&gt; 42
+//!   "  -7" -&gt; -7
+//!   "12abc" -&gt; error.TrailingGarbage
+//!   "abc" -&gt; error.NotANumber
+
+const std = @import("std");
+const c = @cImport({
+    @cInclude("stdlib.h");
+    @cInclude("errno.h");
+});
+
+const ParseError = error{ NotANumber, TrailingGarbage };
+
+/// strtol reports failure by returning 0 and leaving `end` at the start,
+/// or by stopping early. Turn both into Zig errors.
+fn parseLong(text: [*:0]const u8) ParseError!c_long {
+    var end: [*c]u8 = undefined;
+    const v = c.strtol(text, &amp;end, 10);
+    if (end == @as([*c]u8, @constCast(text))) return error.NotANumber;
+    if (end[0] != 0) return error.TrailingGarbage;
+    return v;
+}
+
+pub fn main() void {
+    const inputs = [_][*:0]const u8{ "42", "  -7", "12abc", "abc" };
+    for (inputs) |s| {
+        if (parseLong(s)) |v| {
+            std.debug.print("\"{s}\" -&gt; {d}\n", .{ s, v });
+        } else |e| {
+            std.debug.print("\"{s}\" -&gt; {s}\n", .{ s, @errorName(e) });
+        }
+    }
+}</code></pre>
+  <p><code>strtol</code>'s second argument is a <code>char **</code> out-parameter that receives where parsing stopped. The translated type is <code>[*c][*c]u8</code>, so the local is a <code>[*c]u8</code> and we pass its address. "Nothing consumed" is <code>end == text</code>, which needs a <code>@constCast</code> because the C signature drops the <code>const</code>. "Not at the end" is <code>end[0] != 0</code>. Both sentinels become errors, which is the whole point of wrapping.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 35.5 · Sentinel strings both ways <span class="level">practice</span></h4>
+  <p>Write <code>toC(buf, s)</code>, which copies a Zig slice into a buffer and appends the zero, returning <code>[:0]u8</code> or <code>error.TooLong</code>; <code>fromC(p)</code>, which turns a <code>[*:0]const u8</code> into a slice; and an exported <code>ledger_bp</code> function. No libc is needed, so this one is a <code>zig test</code>. Name the file: <code>exercises/35-c-interop/ex5_span.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 35, exercise 5: sentinel strings both ways.
+//! Run with:  zig test ex5_span.zig
+//! Goal: implement `toC` (copy a Zig slice into a sentinel-terminated
+//! buffer for C) and `fromC` (turn a C string back into a slice) and
+//! export a C-callable `ledger_bp` function. No libc needed.
+
+const std = @import("std");
+
+/// Copy `s` into `buf` and add the terminating zero. Returns the
+/// sentinel-terminated slice, or error.TooLong if it does not fit.
+pub fn toC(buf: []u8, s: []const u8) error{TooLong}![:0]u8 {
+    if (s.len + 1 &gt; buf.len) return error.TooLong;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
+/// A C string comes back as a many-item pointer; find its length.
+pub fn fromC(p: [*:0]const u8) []const u8 {
+    return std.mem.span(p);
+}
+
+/// Exported so a C caller could use it: apply basis points to an amount.
+export fn ledger_bp(amount: i64, bp: i64) i64 {
+    return @divTrunc(amount * bp, 10_000);
+}
+
+test "toC adds the sentinel" {
+    var buf: [16]u8 = undefined;
+    const s = try toC(&amp;buf, "Clay");
+    try std.testing.expectEqual(@as(usize, 4), s.len);
+    try std.testing.expectEqual(@as(u8, 0), s[4]);
+    try std.testing.expectEqualStrings("Clay", s);
+}
+
+test "toC refuses when there is no room for the zero" {
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.TooLong, toC(&amp;buf, "Clay"));
+}
+
+test "fromC finds the length" {
+    const p: [*:0]const u8 = "Kalmar";
+    try std.testing.expectEqualStrings("Kalmar", fromC(p));
+    try std.testing.expectEqual(@as(usize, 6), fromC(p).len);
+}
+
+test "exported function is callable from Zig too" {
+    try std.testing.expectEqual(@as(i64, 1650), ledger_bp(1500, 11_000));
+}</code></pre>
+  <p>The slice syntax <code>buf[0..s.len :0]</code> produces a sentinel-terminated slice and, in Debug builds, checks that <code>buf[s.len]</code> really is zero. The length test (<code>s.len + 1 &gt; buf.len</code>) is the one C programmers forget; Zig makes you write it because the return type promises the sentinel exists.</p></details>
+</div>
+
+<h3 id="ch35-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is the Zig type for a C <code>const char *</code> that is a string, and for a <code>char *</code> that is a byte buffer with a separate length? <details class="answer"><summary>Answer</summary><code>[*:0]const u8</code> for the string (zero-terminated many-item pointer); <code>[*]u8</code> for the buffer. If either may be NULL, prefix with <code>?</code>.</details></li>
+  <li>Why declare <code>const Handle = opaque {};</code> instead of using <code>*anyopaque</code> for SQLite's database pointer? <details class="answer"><summary>Answer</summary>Both are pointers you cannot look inside, but <code>*Handle</code> and <code>*StmtHandle</code> are distinct types, so the compiler stops you passing a statement where a database belongs. <code>*anyopaque</code> would accept anything.</details></li>
+  <li>What does <code>callconv(.c)</code> do and when do you need it? <details class="answer"><summary>Answer</summary>It makes a Zig function use the C calling convention so C code can call it. You need it on callbacks you pass to C (like a qsort comparator); <code>export fn</code> implies it.</details></li>
+  <li>What is the difference between <code>-lc</code> and <code>-lsqlite3</code>, and what happens if you forget the second? <details class="answer"><summary>Answer</summary><code>-lc</code> links the C standard library; <code>-lsqlite3</code> links SQLite. Without it the compile succeeds but the linker reports <code>undefined symbol: _sqlite3_open</code> and friends.</details></li>
+  <li>Does <code>@cImport</code> work from <code>zig run</code> in 0.16? <details class="answer"><summary>Answer</summary>Yes, with <code>-lc</code>, for headers on the system include path. In <code>build.zig</code> you call <code>linkLibC()</code> and, for other headers, <code>addIncludePath</code>.</details></li>
+  <li>You receive a <code>[*:0]const u8</code> from C and want to store it in a struct for later. What two steps are needed? <details class="answer"><summary>Answer</summary><code>std.mem.span</code> to get a slice with a length, then <code>allocator.dupe(u8, slice)</code> to copy it into memory you own, because C's buffer may be freed or reused.</details></li>
+  <li>Why does IRON LEDGER wrap every <code>c_int</code> return code inside <code>sqlite.zig</code> instead of returning it? <details class="answer"><summary>Answer</summary>So the rest of the program uses <code>try</code> and Zig error sets, cannot forget to check a code, and never depends on SQLite's constants. All the C-shaped code stays in one file.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>extern fn name(args) ret;</code> declares a C function; link its library with <code>-lc</code>, <code>-lsqlite3</code>, or <code>linkSystemLibrary</code> in <code>build.zig</code>.</li>
+<li>C's types map onto <code>c_int</code>, <code>c_long</code>, <code>usize</code>, <code>[*:0]const u8</code>, <code>[*]u8</code>, <code>?*T</code>, <code>?*anyopaque</code>; add <code>?</code> wherever NULL is possible.</li>
+<li><code>opaque {}</code> is a type you can point at but never inspect: the right shape for a library handle. Out-parameters are pointers to optionals, <code>*?*Handle</code>.</li>
+<li>Callbacks C will call need <code>callconv(.c)</code>; <code>export fn</code> publishes a Zig function to C.</li>
+<li><code>std.mem.span</code> turns a C string into a slice; string literals already coerce to <code>[*:0]const u8</code>; copy anything C hands you if you keep it.</li>
+<li><code>@cImport</code> translates headers (works from <code>zig run -lc</code>); <code>std.c</code> has many POSIX functions pre-declared.</li>
+<li>Wrap return codes into Zig errors in one file per C library, and let nothing C-shaped escape it.</li>
+</ul></div>
+</section>

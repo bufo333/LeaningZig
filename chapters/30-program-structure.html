@@ -1,0 +1,421 @@
+<section id="ch30">
+<h2>30. Program structure: files, imports, modules</h2>
+<p class="goals"><strong>In this chapter</strong> you will split a program across several files and directories, learn the one rule of visibility (<code>pub</code>), discover that every file is secretly a struct, and make sure tests in every file actually run. Nothing here needs a build script yet; that comes in <a href="#ch31">Chapter 31</a>.</p>
+
+<h3 id="ch30-1">30.1 Every file is a struct</h3>
+<p>You have written <code>const std = @import("std");</code> at the top of every program. It is time to say what that line does. <code>@import</code> takes a path and returns a <em>type</em>: the struct that the file defines. A Zig source file is the body of a struct declaration with the braces left off. Its top-level <code>const</code>, <code>fn</code> and <code>test</code> are that struct's declarations. <code>std</code> is a type, and <code>std.debug.print</code> is a declaration inside a declaration inside it.</p>
+<p>Once you see this, importing your own files is obvious: <code>@import("geometry.zig")</code> is the struct defined by <code>geometry.zig</code>, and you use its public declarations with a dot. Here is a program in three files.</p>
+<p class="file">app/geometry.zig</p>
+<pre><code>//! Tiny geometry helpers for the import demo.
+const std = @import("std");
+
+pub const Point = struct { x: i32, y: i32 };
+
+pub fn manhattan(a: Point, b: Point) u32 {
+    return @abs(a.x - b.x) + @abs(a.y - b.y);
+}
+
+fn secret() u32 {
+    return 42;
+}
+
+test "manhattan" {
+    try std.testing.expectEqual(@as(u32, 7), manhattan(.{ .x = 0, .y = 0 }, .{ .x = 3, .y = 4 }));
+}</code></pre>
+<p class="file">app/domain/types.zig</p>
+<pre><code>//! Typed IDs shared by the whole program.
+pub const PersonId = enum(u32) { _ };
+pub const UnitId = enum(u32) { _ };</code></pre>
+<p class="file">app/main.zig</p>
+<pre><code>const std = @import("std");
+const geometry = @import("geometry.zig");
+const types = @import("domain/types.zig");
+
+pub fn main() void {
+    const a = geometry.Point{ .x = 1, .y = 1 };
+    const b = geometry.Point{ .x = 4, .y = 5 };
+    std.debug.print("distance {d}\n", .{geometry.manhattan(a, b)});
+    const id: types.PersonId = @enumFromInt(7);
+    std.debug.print("person {d}\n", .{@intFromEnum(id)});
+    std.debug.print("geometry is a {s}\n", .{@typeName(@TypeOf(geometry))});
+}</code></pre>
+<pre class="term">$ cd app &amp;&amp; zig run main.zig
+distance 7
+person 7
+geometry is a type</pre>
+<p>Notice that you ran <code>zig run</code> on <code>main.zig</code> alone and the other two files were found. The path in <code>@import</code> is relative to the importing file, so <code>"domain/types.zig"</code> reaches into a subdirectory. The compiler follows imports from the root file outward and compiles what it finds. There is no list of source files anywhere; the imports are the list.</p>
+<p>The last line of output is the proof of the opening claim: <code>@TypeOf(geometry)</code> is <code>type</code>. The value <code>geometry</code> is a type, and <code>geometry.Point</code> is a declaration inside it. This is also why the naming convention is what it is: a file that is used as a namespace gets a lower-case constant (<code>geometry</code>, <code>types</code>), while a file that is used as a type gets a capitalised one (section 30.5).</p>
+
+<h3 id="ch30-2">30.2 pub, and private by default</h3>
+<p>Zig has one visibility rule. A declaration is private to its file unless it is marked <code>pub</code>. There are no classes with private members, no packages, no friends, no header files. <code>geometry.zig</code> above has a function <code>secret</code> without <code>pub</code>. Try to call it:</p>
+<p class="file">priv/main.zig</p>
+<pre><code>const geometry = @import("geometry.zig");
+pub fn main() void {
+    _ = geometry.secret();
+}</code></pre>
+<pre class="term">$ zig run main.zig
+main.zig:3:17: error: 'secret' is not marked 'pub'
+    _ = geometry.secret();
+        ~~~~~~~~^~~~~~~
+geometry.zig:10:1: note: declared here
+fn secret() u32 {
+^~~~~~~~~~~~~~~</pre>
+<p>The same rule applies to constants (<code>pub const</code>), to nested types, and to the fields of a struct only in the sense that fields are always accessible; visibility is about declarations. A file's public surface is therefore easy to read: search for <code>pub</code>. Everything else is an implementation detail that you can rename or delete without looking at other files.</p>
+<div class="note"><strong>Design advice.</strong> Start with nothing <code>pub</code> and add it when another file needs the name. A file with three <code>pub</code> declarations and twenty private helpers is a well-designed file. A file where everything is <code>pub</code> has no boundary, and reflection (<a href="#ch27">Chapter 27</a>) will also see all of it.</div>
+
+<h3 id="ch30-3">30.3 Naming imports</h3>
+<p>The constant you bind an import to is your choice, and two conventions cover almost every case:</p>
+<ul>
+<li>Namespace files (functions and types grouped by topic) get a lower-case name matching the file: <code>const geometry = @import("geometry.zig");</code>, <code>const types = @import("domain/types.zig");</code>.</li>
+<li>When you only want one thing, take it directly: <code>const Point = @import("geometry.zig").Point;</code>. This is common for types used everywhere.</li>
+<li>Files that <em>are</em> a type (section 30.5) get a capitalised name: <code>const Counter = @import("Counter.zig");</code>.</li>
+</ul>
+<p>Imports are cheap to write and it is normal for a file to start with five or ten of them. Unused imports are not an error (they are lazily analysed), but <code>zig fmt</code> and code review will thank you for removing them.</p>
+
+<h3 id="ch30-4">30.4 A root file that re-exports</h3>
+<p>As a project grows past a handful of files you want one place that names the whole thing. The convention is <code>root.zig</code>: a file whose only job is to import the others and mark them <code>pub</code>. Anyone who imports <code>root.zig</code>, or the module built from it, sees the entire tree through one door.</p>
+<p class="file">tests/root.zig</p>
+<pre><code>//! Root of a small module. Tests here reference every file we want tested.
+const std = @import("std");
+pub const money = @import("money.zig");
+pub const roster = @import("roster.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}</code></pre>
+<p>This is exactly the shape of IRON LEDGER's <code>src/root.zig</code>, which the Ledger box below shows. A re-export costs nothing at run time: <code>pub const money = @import("money.zig");</code> is a compile-time alias. Directory trees follow the same idea in layers: <code>root.zig</code> imports <code>domain/types.zig</code>, <code>sim/state.zig</code>, <code>persist/store.zig</code>, and each directory groups files that change together.</p>
+<p>What about the test block at the bottom? Section 30.7 explains it. First, two smaller facts about imports.</p>
+
+<h3 id="ch30-5">30.5 Cyclic imports are fine</h3>
+<p>In many languages, file A importing file B while B imports A is either an error or a source of subtle bugs. In Zig it simply works, because imports are lazy: <code>@import</code> gives you a type, and the compiler only analyses the declarations you actually reference, when you reference them.</p>
+<p class="file">cyc/a.zig</p>
+<pre><code>const std = @import("std");
+const b = @import("b.zig");
+pub fn ping(n: u32) u32 {
+    if (n == 0) return 0;
+    return 1 + b.pong(n - 1);
+}
+pub fn main() void {
+    std.debug.print("ping(5) = {d}\n", .{ping(5)});
+}</code></pre>
+<p class="file">cyc/b.zig</p>
+<pre><code>const a = @import("a.zig");
+pub fn pong(n: u32) u32 {
+    if (n == 0) return 0;
+    return 1 + a.ping(n - 1);
+}</code></pre>
+<pre class="term">$ zig run a.zig
+ping(5) = 5</pre>
+<p>The game leans on this: <code>queries.zig</code> imports <code>commands.zig</code> in a test, and <code>commands.zig</code> imports <code>queries.zig</code> for the rating calculation. You should still avoid cycles when a clean layering is possible, because they make the code harder to read, not because the compiler minds.</p>
+
+<h3 id="ch30-6">30.6 @This() and files that are types</h3>
+<p>If a file is a struct, can it have fields? Yes. Put field declarations at the top level and the file becomes a struct type with those fields, exactly as if you had written <code>const Counter = struct { … };</code> in another file. Inside such a file you need a way to name the struct you are in, and that is <code>@This()</code>.</p>
+<p class="file">this/Counter.zig</p>
+<pre><code>//! A file that IS a struct: it has fields at the top level.
+//! Import it with a capitalised name: `const Counter = @import("Counter.zig");`
+count: u32 = 0,
+step: u32 = 1,
+
+const Counter = @This();
+
+pub fn bump(self: *Counter) void {
+    self.count += self.step;
+}
+
+pub fn init(step: u32) Counter {
+    return .{ .step = step };
+}</code></pre>
+<p class="file">this/main.zig</p>
+<pre><code>const std = @import("std");
+const Counter = @import("Counter.zig");
+
+pub fn main() void {
+    var c = Counter.init(5);
+    c.bump();
+    c.bump();
+    std.debug.print("count = {d}\n", .{c.count});
+    std.debug.print("size of Counter: {d} bytes\n", .{@sizeOf(Counter)});
+}</code></pre>
+<pre class="term">$ zig run main.zig
+count = 10
+size of Counter: 8 bytes</pre>
+<p><code>@This()</code> returns the innermost struct, enum or union being defined. In a file-as-struct it is the file's type; inside <code>const Stack = struct { … }</code> it is <code>Stack</code>, which is why the idiom <code>const Self = @This();</code> appears in so many generic types (<a href="#ch26">Chapter 26</a>) where the struct has no name yet. In <code>root.zig</code> above, <code>@This()</code> is the root file itself, handed to <code>refAllDecls</code>.</p>
+<div class="warn"><strong>Fields and top-level code do not mix well.</strong> A file with fields cannot have a <code>main</code> that makes sense as a program entry, and its field list comes first by convention. Keep files-as-types small and focused: one type, its methods, its tests.</div>
+
+<h3 id="ch30-7">30.7 Doc comments: //! and ///</h3>
+<p>Three comment forms exist and they mean different things. <code>//</code> is an ordinary comment. <code>///</code> directly above a declaration is a doc comment for that declaration; tools and editors pick it up. <code>//!</code> at the very top of a file is a doc comment for the file itself, that is, for the struct the file defines. The <code>Counter.zig</code> file above opens with a <code>//!</code> block, and the contract of this course requires one on every exercise file. A <code>///</code> that is not followed by a declaration is a compile error, which catches the common mistake of leaving a doc comment on a deleted function.</p>
+
+<h3 id="ch30-8">30.8 Test discovery across files</h3>
+<p>Here is a trap that catches every new Zig project. Run <code>zig test root_noref.zig</code> on a root file that imports two files full of tests, but never references anything in them:</p>
+<p class="file">tests/root_noref.zig</p>
+<pre><code>const std = @import("std");
+pub const money = @import("money.zig");
+pub const roster = @import("roster.zig");
+test "root only" {
+    try std.testing.expect(true);
+}</code></pre>
+<pre class="term">$ zig test root_noref.zig
+1/1 root_noref.test.root only...OK
+All 1 tests passed.</pre>
+<p>One test ran. The tests in <code>money.zig</code> and <code>roster.zig</code> were silently skipped, because of the same laziness that makes cyclic imports work: a file that is imported but never referenced is never analysed, and its tests do not exist. Now the <code>root.zig</code> from section 30.4:</p>
+<pre class="term">$ zig test root.zig
+1/3 root.test_0...OK
+2/3 money.test.money...OK
+3/3 roster.test.roster...OK
+All 3 tests passed.</pre>
+<p><code>std.testing.refAllDecls(@This())</code> is a function that, only while testing, takes the address of every public declaration of the type it is given. Referencing <code>money</code> and <code>roster</code> forces their files to be analysed, and their file-level tests join the run. The anonymous <code>test { … }</code> block gets the name <code>test_0</code>.</p>
+<p>But look again at the run: <code>roster.inner.test.inner roster</code> did not appear. <code>refAllDecls</code> goes one level deep; it referenced <code>roster</code>, and <code>roster.zig</code>'s own test ran, but a test nested inside the struct <code>inner</code> is only discovered if <code>inner</code> is referenced. Older Zig versions shipped <code>std.testing.refAllDeclsRecursive</code> for this; 0.16 does not. The recursive version is a dozen lines you can keep in your own project:</p>
+<p class="file">tests/root_recursive.zig</p>
+<pre><code>const std = @import("std");
+pub const money = @import("money.zig");
+pub const roster = @import("roster.zig");
+
+/// refAllDecls only goes one level deep. This walks nested structs too.
+fn refAllDeclsRecursive(comptime T: type) void {
+    inline for (comptime std.meta.declarations(T)) |decl| {
+        const D = @TypeOf(@field(T, decl.name));
+        if (D == type) {
+            switch (@typeInfo(@field(T, decl.name))) {
+                .@"struct", .@"enum", .@"union", .@"opaque" =&gt; refAllDeclsRecursive(@field(T, decl.name)),
+                else =&gt; {},
+            }
+        }
+        _ = &amp;@field(T, decl.name);
+    }
+}
+
+test {
+    refAllDeclsRecursive(@This());
+}</code></pre>
+<pre class="term">$ zig test root_recursive.zig
+1/4 root_recursive.test_0...OK
+2/4 money.test.money...OK
+3/4 roster.test.roster...OK
+4/4 roster.inner.test.inner roster...OK
+All 4 tests passed.</pre>
+<p>It uses <code>std.meta.declarations</code> (reflection again) to visit every public declaration; for those that are types, it recurses. In practice most projects are fine with plain <code>refAllDecls</code> in the root plus a habit of referencing nested namespaces from a file-level test. IRON LEDGER does exactly that, and <code>zig build test</code> reports several hundred tests as a result.</p>
+<div class="note"><strong>Rule of thumb.</strong> If a test you just wrote does not show up in the count, the file it lives in is not referenced. Add it to <code>root.zig</code>, or reference the containing struct from a test that does run.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The module root <code>game/src/root.zig</code> is a pure table of re-exports, grouped by directory, with the discovery test at the bottom:
+<pre><code>//! Module root for the simulation core. See ARCHITECTURE.md.
+//! The core is pure and deterministic: no I/O, no wall clock, no globals.
+
+const std = @import("std");
+
+// domain/ (entities)
+pub const types = @import("domain/types.zig");
+pub const person = @import("domain/person.zig");
+pub const unit = @import("domain/unit.zig");
+// …
+// sim/ (state, time, randomness, events, battle resolution)
+pub const state = @import("sim/state.zig");
+pub const tick = @import("sim/tick.zig");
+// …
+// persist/ (SQLite save files, Stage 11)
+pub const sqlite = @import("persist/sqlite.zig");
+pub const store = @import("persist/store.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}</code></pre>
+Every file below it opens with a <code>//!</code> block naming its MekHQ counterpart, a house rule from the project's <code>CLAUDE.md</code>. The executable in <code>game/src/main.zig</code> never imports these files by path; it writes <code>const game = @import("game");</code> and reaches <code>game.state.GameState</code>, <code>game.commands.execute</code> and so on through the root. The name <code>"game"</code> is not a file: it is a module declared in <code>build.zig</code>, which is where the next chapter begins.</div>
+
+<h3 id="ch30-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 30.1 · One program, several files <span class="level">warm-up</span></h4>
+  <p>The tree <code>exercises/30-program-structure/ex1_split/</code> has <code>main.zig</code> importing <code>domain/types.zig</code>, <code>domain/pilot.zig</code> and <code>roster.zig</code>. Finish <code>roster.zig</code> (<code>add</code>, <code>get</code>, <code>best</code>) so <code>zig build run</code> prints the best pilot and <code>zig build test</code> passes in every file.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">src/roster.zig</p>
+<pre><code>//! A fixed-capacity roster indexed by PersonId.
+const std = @import("std");
+const types = @import("domain/types.zig");
+const Pilot = @import("domain/pilot.zig").Pilot;
+
+pub const Roster = struct {
+    slots: [16]Pilot = undefined,
+    count: usize = 0,
+
+    pub fn add(self: *Roster, p: Pilot) void {
+        self.slots[self.count] = p;
+        self.count += 1;
+    }
+
+    pub fn get(self: *const Roster, id: types.PersonId) ?*const Pilot {
+        if (id.index() &gt;= self.count) return null;
+        return &amp;self.slots[id.index()];
+    }
+
+    pub fn best(self: *const Roster) ?*const Pilot {
+        if (self.count == 0) return null;
+        var top: usize = 0;
+        for (self.slots[0..self.count], 0..) |p, i| {
+            if (p.skill() &gt; self.slots[top].skill()) top = i;
+        }
+        return &amp;self.slots[top];
+    }
+};
+
+test "roster" {
+    var r = Roster{};
+    try std.testing.expect(r.best() == null);
+    r.add(Pilot.init("A", 4, 4));
+    r.add(Pilot.init("B", 2, 2));
+    try std.testing.expectEqualStrings("B", r.best().?.name);
+    try std.testing.expect(r.get(@enumFromInt(5)) == null);
+}</code></pre>
+<p class="file">src/main.zig (the test block)</p>
+<pre><code>test {
+    // Pull every file's tests into this test binary.
+    std.testing.refAllDecls(@This());
+    _ = types;
+    _ = pilot;
+    _ = roster;
+}</code></pre>
+  <p><code>roster.zig</code> imports <code>domain/pilot.zig</code> with a path relative to itself, and takes just the <code>Pilot</code> type. The test block in <code>main.zig</code> references each import so their tests are discovered; <code>_ = types;</code> is enough on its own for a plain import, and <code>refAllDecls</code> is belt and braces.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 30.2 · A file that is a struct <span class="level">practice</span></h4>
+  <p>In <code>exercises/30-program-structure/ex2_counter/</code>, <code>src/Ledger.zig</code> has fields at the top level. Finish <code>apply</code> and <code>nextDay</code> and run <code>zig build test</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">src/Ledger.zig</p>
+<pre><code>//! Chapter 30, exercise 2: a file that is a struct.
+//! This file has fields at the top level, so @import("Ledger.zig") IS the
+//! type. By convention such files are named in CapitalCase.
+const std = @import("std");
+
+funds: i64,
+day: u32 = 1,
+log: std.ArrayList(i64) = .empty,
+
+const Ledger = @This();
+
+pub fn init(funds: i64) Ledger {
+    return .{ .funds = funds };
+}
+
+pub fn deinit(self: *Ledger, gpa: std.mem.Allocator) void {
+    self.log.deinit(gpa);
+}
+
+pub fn apply(self: *Ledger, gpa: std.mem.Allocator, delta: i64) !void {
+    self.funds += delta;
+    try self.log.append(gpa, delta);
+}
+
+pub fn nextDay(self: *Ledger) void {
+    self.day += 1;
+}
+
+test "Ledger is the file" {
+    try std.testing.expect(@TypeOf(Ledger.init(0)) == Ledger);
+}</code></pre>
+  <p><code>const Ledger = @This();</code> names the file's own type so methods can take <code>*Ledger</code>. The test in <code>main.zig</code> ends with <code>_ = Ledger;</code> so the file's own test is discovered.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 30.3 · Test discovery <span class="level">practice</span></h4>
+  <p>In <code>exercises/30-program-structure/ex3_discovery/</code>, <code>zig build test --summary all</code> reports too few tests. Change only <code>src/root.zig</code> so that all four run.</p>
+  <details class="answer"><summary>Solution</summary>
+<p class="file">src/root.zig</p>
+<pre><code>//! Chapter 30, exercise 3: test discovery across a tree of files.
+//! Run with:  zig build test --summary all   (inside ex3_discovery/)
+//! Goal: make `zig build test` report 4 tests, without touching the
+//!       other files. Hint: tests only run in files that are referenced.
+const std = @import("std");
+
+pub const money = @import("sim/money.zig");
+pub const clock = @import("sim/clock.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}</code></pre>
+<pre class="term">$ zig build test --summary all
+Build Summary: 3/3 steps succeeded; 4/4 tests passed
+test success
++- run test 4 pass (4 total) 169ms MaxRSS:2M</pre>
+  <p>The nested test inside <code>Clock</code> is found because <code>clock.zig</code>'s own file-level test references <code>Clock</code>; <code>refAllDecls</code> only needed to reach the two files.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 30.4 · Namespaces inside one file <span class="level">warm-up</span></h4>
+  <p>A single file: a field-less <code>money</code> struct used as a namespace, a <code>Stack</code> using <code>const Self = @This();</code>, and <code>thisFile()</code> returning the file's own type. File: <code>exercises/30-program-structure/ex4_namespace.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 30, exercise 4: namespaces inside one file.
+//! Run with:  zig test ex4_namespace.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// A namespace: a struct with no fields, used only to group declarations.
+pub const money = struct {
+    pub const CBills = i64;
+    pub fn fromCbills(n: i64) CBills {
+        return n * 100;
+    }
+    fn hidden() void {}
+};
+
+pub const Stack = struct {
+    items: [8]u32 = undefined,
+    len: usize = 0,
+
+    const Self = @This();
+
+    pub fn push(self: *Self, v: u32) void {
+        self.items[self.len] = v;
+        self.len += 1;
+    }
+    pub fn pop(self: *Self) ?u32 {
+        if (self.len == 0) return null;
+        self.len -= 1;
+        return self.items[self.len];
+    }
+};
+
+/// The file itself is a struct too. This returns it.
+pub fn thisFile() type {
+    return @This();
+}
+
+test "namespace has no size" {
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(money));
+    try std.testing.expectEqual(@as(money.CBills, 300), money.fromCbills(3));
+}
+
+test "Self works like the type name" {
+    var s = Stack{};
+    s.push(1);
+    s.push(2);
+    try std.testing.expectEqual(@as(?u32, 2), s.pop());
+    try std.testing.expect(@TypeOf(s) == Stack);
+}
+
+test "visibility is per declaration" {
+    try std.testing.expect(@hasDecl(money, "fromCbills"));
+    try std.testing.expect(@hasDecl(money, "hidden"));
+    try std.testing.expect(!@hasDecl(money, "nope"));
+}
+
+test "the file is a struct" {
+    try std.testing.expect(@typeInfo(thisFile()) == .@"struct");
+    try std.testing.expect(@hasDecl(thisFile(), "Stack"));
+}</code></pre>
+  <p>A struct with no fields has size zero and exists only to group names. Note the third test: <code>@hasDecl</code> from inside the same file sees the private <code>hidden</code>, because visibility is about crossing file boundaries.</p></details>
+</div>
+
+<h3 id="ch30-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does <code>@import("x.zig")</code> evaluate to? <details class="answer"><summary>Answer</summary>A type: the struct whose declarations are the top-level declarations of <code>x.zig</code>.</details></li>
+  <li>How does the compiler know which files belong to a program run with <code>zig run main.zig</code>? <details class="answer"><summary>Answer</summary>It follows <code>@import</code> from the root file. There is no separate file list.</details></li>
+  <li>What is the complete visibility system of Zig? <details class="answer"><summary>Answer</summary><code>pub</code> on a declaration makes it visible to importers; without it the declaration is private to its file.</details></li>
+  <li>Is it an error for <code>a.zig</code> to import <code>b.zig</code> while <code>b.zig</code> imports <code>a.zig</code>? <details class="answer"><summary>Answer</summary>No. Imports are lazy and cycles are allowed, though a clean layering is still easier to read.</details></li>
+  <li>When would a file have fields at the top level, and what does <code>@This()</code> return there? <details class="answer"><summary>Answer</summary>When the file is one type (conventionally named in CapitalCase). <code>@This()</code> returns that type.</details></li>
+  <li>Why did <code>zig test root_noref.zig</code> run only one test? <details class="answer"><summary>Answer</summary>The imported files were never referenced, so they were never analysed and their tests did not exist. <code>refAllDecls</code> or <code>_ = money;</code> fixes it.</details></li>
+  <li>Does <code>std.testing.refAllDeclsRecursive</code> exist in 0.16? <details class="answer"><summary>Answer</summary>No. Only <code>refAllDecls</code> does; a recursive walk is a few lines with <code>std.meta.declarations</code>.</details></li>
+  <li>What is the difference between <code>//!</code> and <code>///</code>? <details class="answer"><summary>Answer</summary><code>//!</code> documents the file (the struct it defines) and goes at the top; <code>///</code> documents the declaration immediately below it.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A Zig file is a struct; <code>@import</code> returns its type; paths are relative to the importing file and may enter subdirectories.</li>
+<li><code>pub</code> is the whole visibility system; everything else is private to its file.</li>
+<li>Bind namespace imports to lower-case names, type-files to capitalised names, or take a single declaration directly.</li>
+<li><code>root.zig</code> re-exports the tree with <code>pub const x = @import("…")</code>; the executable reaches it by module name.</li>
+<li>Cyclic imports work because analysis is lazy.</li>
+<li>Files with top-level fields are types; <code>@This()</code> names the enclosing type.</li>
+<li><code>//!</code> documents a file, <code>///</code> a declaration.</li>
+<li>Tests only run in referenced files: use <code>std.testing.refAllDecls(@This())</code> in the root, and reference nested namespaces yourself.</li>
+</ul></div>
+</section>

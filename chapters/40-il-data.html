@@ -1,0 +1,369 @@
+<section id="ch40">
+<h2>40. Data: ZON files become typed tables</h2>
+<p class="goals"><strong>In this chapter</strong> you see how IRON LEDGER keeps its numbers out of its code. Every balance constant, every mek design and every planet lives in a <code>.zon</code> file that the compiler type-checks against a Zig struct at build time. You will read the mechanism end to end, from <code>build.zig</code> to a rules formula, break it on purpose to see what the compiler says, and add a knob of your own.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch28">Chapter 28</a> (ZON: a struct literal in a file, imported with <code>@import</code> and given a type by the declaration that receives it), <a href="#ch31">Chapter 31</a> (build options with <code>b.option</code>, and <code>addAnonymousImport</code>), <a href="#ch12">Chapter 12</a> (struct fields with and without defaults), and <a href="#ch27">Chapter 27</a> for the last section, where a test walks a struct's fields with <code>@typeInfo</code> and <code>inline for</code>. <a href="#ch15">Chapter 15</a>'s <code>?*const T</code> return type appears in the catalogue lookup.</div>
+
+<h3 id="ch40-1">40.1 The problem the data layer solves</h3>
+<p>A management game is mostly numbers: what a mekwarrior is paid, how far an HQ's influence reaches, how many days paperwork takes, how likely a rare part is to appear on a market. The first version of IRON LEDGER had these as constants scattered through the code with <code>// TUNE</code> comments. That is fine for a prototype and bad for a game, because balancing means changing the numbers often and a modder cannot change them at all.</p>
+<p>The obvious fix in most languages is a config file parsed at start-up: JSON, TOML, whatever. That buys flexibility and costs safety. A misspelled key becomes a default silently; a string where a number belongs becomes a crash on turn 40. Zig offers a third option that <a href="#ch28">Chapter 28</a> introduced: a data file in the language's own literal syntax, imported at compile time, type-checked against a struct. IRON LEDGER uses it for all fourteen of its tables. The rule in <code>CLAUDE.md</code> is blunt: static game data belongs in <code>data/*.zon</code>, not hardcoded.</p>
+
+<h3 id="ch40-2">40.2 One knob, end to end</h3>
+<p>Take one number and follow it. Here is the top of the tuning table:</p>
+<div class="file">data/tables/tuning.zon</div>
+<pre><code>// Tuning knobs (Stage 12.17). Typed against domain/tuning.zig `Tuning` at
+// comptime. Money in C-bills, multipliers in basis points (10_000 = ×1).
+// The formulas live beside their subsystems; this file only holds the
+// numbers they were built on, so play-testing edits land here.
+.{
+    .hq = .{
+        .influence_ly = .{ .field = 15, .regional = 60, .brigade = 90 }, // ARCH §9.2
+        .influence_per_comms_ly = 10,
+        .influence_per_spaceport_ly = 5,
+        .paperwork_base_days = 21,
+        .paperwork_min_days = 5,
+        .paperwork_days_per_admin_level = 3,
+        .upgrade_cost_per_level = .{ .mek_bay = 800_000, .warehouse = 400_000, .hospital = 500_000,
+            .mess = 150_000, .training_ground = 300_000, .hiring_hall = 200_000,
+            .comms = 600_000, .spaceport = 1_200_000 },
+        .warehouse_tons_per_level_sq = 200, // 200 / 800 / 1800 / 3200 / 5000
+        .upkeep = .{ .field = 10_000, .regional = 25_000, .brigade = 60_000 },
+        .founding_funds = 1_000_000,
+        .found_field_hq_cost = 500_000,
+        .sale_pct = 40,
+    },
+    .logistics = .{
+        .ly_per_jump = 30,
+        .recharge_days = 7,
+        // …
+    },
+    // … network, market, person, medical, battle, rating, contract …
+}</code></pre>
+<p>It is exactly the anonymous struct literal syntax you used for <code>.{ .year = 3025 }</code> in <a href="#ch12">Chapter 12</a>, with nothing around it. Comments are allowed. Underscores in numbers are allowed. Nested literals are allowed. What is <em>not</em> here is any hint of a type; the file does not know what it is describing.</p>
+<p>The type is on the Zig side:</p>
+<div class="file">src/domain/tuning.zig</div>
+<pre><code>//! Tuning tables: every balance constant the sim reads, loaded at comptime
+//! from data/tables/tuning.zon (Stage 12.17, closing the "// TUNE" debt).
+//! Mirrors MekHQ `campaign/CampaignOptions` — knobs, not rules; the
+//! formulas stay legible in the modules that use them. The ZON file is
+//! type-checked against `Tuning` at compile time: a missing or misspelled
+//! field is a build error, not a silent default.
+
+const std = @import("std");
+const types = @import("types.zig");
+
+pub const Tuning = struct {
+    hq: struct {
+        influence_ly: struct { field: u32, regional: u32, brigade: u32 },
+        influence_per_comms_ly: u32,
+        influence_per_spaceport_ly: u32,
+        paperwork_base_days: u32,
+        paperwork_min_days: u32,
+        paperwork_days_per_admin_level: u32,
+        upgrade_cost_per_level: struct { mek_bay: types.CBills, warehouse: types.CBills, /* … */ },
+        warehouse_tons_per_level_sq: u32,
+        upkeep: struct { field: types.CBills, regional: types.CBills, brigade: types.CBills },
+        founding_funds: types.CBills,
+        found_field_hq_cost: types.CBills,
+        sale_pct: u32,
+    },
+    logistics: struct {
+        ly_per_jump: u32,
+        recharge_days: u32,
+        // …
+    },
+    // …
+};
+
+/// The live table.
+pub const t: Tuning = @import("tuning_zon");</code></pre>
+<p>The last line is the whole mechanism. <code>@import("tuning_zon")</code> returns the file's value; declaring the constant as <code>: Tuning</code> forces the compiler to coerce that anonymous literal to the <code>Tuning</code> struct, field by field, at compile time. A field in the file that the struct does not have is an error. A field the struct has that the file lacks (and that has no default) is an error. A string where a <code>u32</code> belongs is an error. And they are errors with line numbers in the <code>.zon</code> file, as you will see in a moment.</p>
+<p>Then the rules code reads the value as a plain constant. Here is the founding-capital line from <code>GameState.createCommander</code> (<a href="#ch41">Chapter 41</a>), where <code>tuning</code> is <code>@import("../domain/tuning.zig").t</code>:</p>
+<pre><code>self.transferFunds(.outfit, .{ .hq = id }, tuning.hq.founding_funds, 0) catch {};</code></pre>
+<p>No lookup, no parsing, no <code>getOrDefault</code>. <code>tuning.hq.founding_funds</code> is an <code>i64</code> known at compile time, so the optimiser treats it exactly like the literal <code>1_000_000</code> it replaced.</p>
+
+<h3 id="ch40-3">40.3 What the compiler says when you get it wrong</h3>
+<p>The claim "a wrong field is a build error" is easy to make and worth checking. In your copy of the game, misspell one field in the ZON file (<code>fatigue_tired</code> to <code>fatigue_tierd</code>, say) and build:</p>
+<pre class="term">$ zig build test
+data/tables/tuning.zon:108:26: error: unexpected field 'fatigue_tierd'
+        .fatigue_tierd = 30,
+                         ^~
+src/domain/tuning.zig:398:31: note: imported here
+pub const t: Tuning = @import("tuning_zon");
+                              ^~~~~~~~~~~~</pre>
+<p>Now put a string where a number belongs (<code>.paperwork_base_days = "21"</code>):</p>
+<pre class="term">data/tables/tuning.zon:10:32: error: expected type 'u32'
+        .paperwork_base_days = "21",
+                               ^~~~</pre>
+<p>Both point at the data file, both name the field, and neither lets the game build. Compare with what a runtime config parser would do with the same two mistakes: the first would probably be ignored, the second would crash the first time the value was used. That is the trade the ZON approach makes: the data is baked into the binary (you cannot edit it without rebuilding), and in exchange the binary can never disagree with it.</p>
+
+<h3 id="ch40-4">40.4 How the file gets its name</h3>
+<p>The string <code>"tuning_zon"</code> is not a path. It is a name that <code>build.zig</code> attaches to the module, and this indirection is what makes mod support cheap:</p>
+<div class="file">build.zig</div>
+<pre><code>const data_dir = b.option([]const u8, "data", "Directory overlaying data/*.zon and data/tables/*.zon (mod support)");
+const DataFile = struct { import_name: []const u8, rel: []const u8 };
+const data_files = [_]DataFile{
+    .{ .import_name = "chassis_zon", .rel = "chassis.zon" },
+    .{ .import_name = "planets_zon", .rel = "planets.zon" },
+    .{ .import_name = "parts_zon", .rel = "parts.zon" },
+    .{ .import_name = "tuning_zon", .rel = "tables/tuning.zon" },
+    .{ .import_name = "meklab_zon", .rel = "tables/meklab.zon" },
+    .{ .import_name = "names_zon", .rel = "tables/names.zon" },
+    .{ .import_name = "ranks_zon", .rel = "tables/ranks.zon" },
+    .{ .import_name = "awards_zon", .rel = "tables/awards.zon" },
+    .{ .import_name = "abilities_zon", .rel = "tables/abilities.zon" },
+    .{ .import_name = "rat_zon", .rel = "tables/rat.zon" },
+    .{ .import_name = "factions_zon", .rel = "tables/factions.zon" },
+    .{ .import_name = "scenarios_zon", .rel = "tables/scenarios.zon" },
+    .{ .import_name = "terrain_zon", .rel = "tables/terrain.zon" },
+    .{ .import_name = "difficulty_zon", .rel = "tables/difficulty.zon" },
+};
+var overlaid = std.ArrayList([]const u8).empty;
+for (data_files) |f| {
+    var path: std.Build.LazyPath = b.path(b.fmt("data/{s}", .{f.rel}));
+    if (data_dir) |dir| {
+        const candidate = b.pathJoin(&amp;.{ dir, f.rel });
+        const exists = if (std.fs.path.isAbsolute(candidate))
+            std.Io.Dir.accessAbsolute(b.graph.io, candidate, .{})
+        else
+            b.build_root.handle.access(b.graph.io, candidate, .{});
+        if (exists) |_| {
+            path = if (std.fs.path.isAbsolute(candidate)) .{ .cwd_relative = candidate } else b.path(candidate);
+            overlaid.append(b.allocator, f.rel) catch @panic("OOM");
+        } else |_| {}
+    }
+    mod.addAnonymousImport(f.import_name, .{ .root_source_file = path });
+}
+// What the binary can say about its data (settings screen, REPL banner).
+const build_options = b.addOptions();
+build_options.addOption(?[]const u8, "data_dir", data_dir);
+build_options.addOption([]const []const u8, "data_overlays", overlaid.items);
+mod.addImport("build_options", build_options.createModule());</code></pre>
+<p>Read the loop slowly; it is ordinary Zig running inside the build script, which is itself an ordinary Zig program (<a href="#ch31">Chapter 31</a>). For each of the fourteen files it computes a path, defaulting to <code>data/…</code>. If the user passed <code>-Ddata=mymod</code> and a file exists at the same relative path under that directory, the path is swapped. Then <code>addAnonymousImport</code> binds the name to whichever path won. The simulation code says <code>@import("tuning_zon")</code> and never learns which file it got.</p>
+<p>Two smaller things to notice. The build script itself uses the 0.16 I/O API (<code>b.graph.io</code>, <code>std.Io.Dir.accessAbsolute</code>) to test for the file, because the build runner is a real program with real I/O. And the last four lines create a second tiny module, <code>build_options</code>, whose contents are values computed here: the data directory and the list of files it overlaid. <code>root.zig</code> imports it as <code>build_info</code> and uses it in <code>dataProvenance</code> to print "mod mymod: 1 file overlaid (tables/tuning.zon)" on the settings screen. That is how a binary can say where its numbers came from.</p>
+<div class="try"><strong>Try it.</strong> Run <code>zig build --help</code> in the game directory and find the two lines
+<pre class="term">  -Ddata=[string]              Directory overlaying data/*.zon and data/tables/*.zon (mod support)
+  -Dbundle-music=[bool]        Copy data/music into the install prefix (large)</pre>
+Zig generated that help text from the <code>b.option</code> calls; nobody wrote it twice.</div>
+
+<h3 id="ch40-5">40.5 A catalogue: rows with defaults</h3>
+<p>The tuning table is one big struct. The design catalogue is a slice of small ones, and it shows the other half of the idea: fields with defaults let a row leave out what does not apply to it.</p>
+<div class="file">src/domain/chassis.zig</div>
+<pre><code>pub const Chassis = struct {
+    key: []const u8, // variant designation, e.g. "SHD-2H"
+    name: []const u8, // "Shadow Hawk"
+    tonnage: u8,
+    bv: u16, // BV2 — autoresolve base strength (ARCH §7)
+    cost: types.CBills,
+    rarity: types.Rarity, // market appearance tier (ARCH §9.8)
+    /// First year the design is in service (12C.16, MekHQ `introYear`);
+    /// the market, RATs and salvage only field what exists in the campaign year.
+    intro_year: u16 = 2400,
+    kind: unit.UnitKind = .mek,
+    // Construction facts (Stage 10 MekLab; meks only, defaults for others).
+    walk_mp: u8 = 0,
+    jump_mp: u8 = 0,
+    heat_sinks: u8 = 10,
+    armor_half_tons: u16 = 0,
+    // Transport facts (Stage 12.15; dropships/jumpships only, TRO:3025).
+    mek_bays: u8 = 0,
+    asf_bays: u8 = 0,
+    vehicle_bays: u8 = 0,
+    cargo_tons: u32 = 0,
+    collars: u8 = 0,
+    loadout: []const LoadoutSlot,
+
+    pub fn engineRating(self: *const Chassis) u32 {
+        return @as(u32, self.tonnage) * self.walk_mp;
+    }
+
+    pub fn weightClass(self: *const Chassis) WeightClass {
+        return switch (self.tonnage) {
+            0...35 =&gt; .light,
+            36...55 =&gt; .medium,
+            56...75 =&gt; .heavy,
+            else =&gt; .assault,
+        };
+    }
+};
+
+pub const catalog: []const Chassis = @import("chassis_zon");
+
+pub fn find(key: []const u8) ?*const Chassis {
+    for (catalog) |*c| {
+        if (std.mem.eql(u8, c.key, key)) return c;
+    }
+    return null;
+}</code></pre>
+<p>Six fields have no default and must be present in every row: <code>key</code>, <code>name</code>, <code>tonnage</code>, <code>bv</code>, <code>cost</code>, <code>rarity</code>, plus the <code>loadout</code> slice. Everything else may be omitted, so a vehicle row need not state <code>jump_mp</code> and a mek row need not state <code>collars</code>. Here is one of the 97 rows:</p>
+<div class="file">data/chassis.zon (one row)</div>
+<pre><code>.{ .key = "SHD-2H", .name = "Shadow Hawk", .tonnage = 55, .bv = 1064, .cost = 4_672_315,
+   .rarity = .common, .walk_mp = 5, .jump_mp = 3, .heat_sinks = 12, .armor_half_tons = 19,
+   .loadout = .{
+    .{ .slot = "lt.ac5.1", .part = "ac5", .class = .weapon },
+    .{ .slot = "rt.lrm5.1", .part = "lrm5", .class = .weapon },
+    .{ .slot = "ra.mlas.1", .part = "mlas", .class = .weapon },
+    .{ .slot = "hd.srm2.1", .part = "srm2", .class = .weapon },
+    .{ .slot = "lt.ammo_ac5.1", .part = "ammo_ac5", .class = .ammo },
+    .{ .slot = "rt.ammo_lrm.1", .part = "ammo_lrm", .class = .ammo },
+    .{ .slot = "ct.ammo_srm.1", .part = "ammo_srm", .class = .ammo },
+} },</code></pre>
+<p>Note <code>.rarity = .common</code> and <code>.class = .weapon</code>: enum literals in a data file. The compiler resolves them against <code>types.Rarity</code> and <code>unit.SlotClass</code> because the struct says those are the field types, so a typo like <code>.commom</code> is a build error too. (If you compare this row with the original guide, the cost has changed; the catalogue was re-priced from the sourcebooks after the guide was written. The data moved and the code did not need to.)</p>
+<p>The lookup function <code>find</code> is the pattern from <a href="#ch15">Chapter 15</a>: it returns <code>?*const Chassis</code>, a maybe-pointer into the constant table, and <code>null</code> for an unknown key. Callers write <code>chassis.find(u.chassis_key) orelse …</code> or <code>if (chassis.find(key)) |c| …</code>. There is no error type because "not in the catalogue" is an ordinary outcome, not a failure.</p>
+
+<h3 id="ch40-6">40.6 What the type system cannot check, tests do</h3>
+<p>The compiler checks shape: fields, types, enum names. It cannot check meaning: that the part key <code>"ac5"</code> in a loadout exists in the parts catalogue, that every entry in a house's random assignment table names a mek of the stated weight class, or that a design's tonnage adds up under the construction rules. Those are cross-file facts, and the game checks them with tests that run against the data:</p>
+<div class="file">src/domain/part.zig</div>
+<pre><code>test "every chassis loadout part resolves in the part catalog" {
+    const chassis = @import("chassis.zig");
+    for (chassis.catalog) |c| {
+        for (c.loadout) |slot| {
+            try std.testing.expect(find(slot.part) != null);
+        }
+    }
+    for (component_keys) |k| try std.testing.expect(find(k) != null); // the fabrication guarantee
+}</code></pre>
+<div class="file">src/domain/rat.zig</div>
+<pre><code>test "every RAT entry names a catalogue mek of the right class; every house has all four classes" {
+    try std.testing.expect(table.len &gt;= 6);
+    for (table) |row| {
+        inline for (.{ chassis.WeightClass.light, .medium, .heavy, .assault }) |class| {
+            const pool = row.pool(class);
+            try std.testing.expect(pool.len &gt; 0);
+            for (pool) |key| {
+                const c = chassis.find(key) orelse {
+                    std.debug.print("RAT {s}: unknown design {s}\n", .{ row.faction, key });
+                    return error.TestUnexpectedResult;
+                };
+                try std.testing.expect(c.kind == .mek);
+                if (c.weightClass() != class) {
+                    std.debug.print("RAT {s}: {s} is {s}, listed as {s}\n", .{ row.faction, key, @tagName(c.weightClass()), @tagName(class) });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+    // …
+}</code></pre>
+<p>Two habits from <a href="#ch08">Chapter 8</a> appear here. A test that loops over data prints <em>which</em> row failed before returning <code>error.TestUnexpectedResult</code>, because "expect failed" on its own would send you hunting through 97 rows. And the loops are cheap: the whole catalogue is a compile-time constant, so these tests cost microseconds and nobody is tempted to skip them.</p>
+<p>This is why <code>docs/modding.md</code> tells a modder to run <code>zig build test -Ddata=mymod</code> rather than just <code>zig build</code>. The build proves the mod has the right shape; the tests prove its rows refer to each other correctly. In the exercises you will see that the tuning table has an even stronger check: a test that visits every field, however deeply nested, without naming any of them.</p>
+
+<h3 id="ch40-7">40.7 The tuning sanity test</h3>
+<p>You met this function in <a href="#ch27">Chapter 27</a> as an example of reflection. Now read it as its authors use it:</p>
+<div class="file">src/domain/tuning.zig</div>
+<pre><code>fn checkPositive(comptime T: type, value: T, comptime name: []const u8) !void {
+    switch (@typeInfo(T)) {
+        .int =&gt; |info| {
+            // Signed knobs (deltas, scores) may be zero or negative by design.
+            if (info.signedness == .signed) return;
+            if (value &lt;= 0) {
+                std.debug.print("tuning field {s} must be positive\n", .{name});
+                return error.BadTuning;
+            }
+            if (std.mem.endsWith(u8, name, "_bp") and value &gt; 100_000) {
+                std.debug.print("tuning field {s} is over 100000 basis points\n", .{name});
+                return error.BadTuning;
+            }
+        },
+        .@"struct" =&gt; |info| inline for (info.fields) |f| try checkPositive(f.type, @field(value, f.name), name ++ "." ++ f.name),
+        else =&gt; {},
+    }
+}
+
+test "every tuning value is positive and every basis-point knob is sane" {
+    try checkPositive(Tuning, t, "t");
+}
+
+test "spot checks against the values the formulas were built on" {
+    try std.testing.expectEqual(@as(u32, 60), t.hq.influence_ly.regional);
+    try std.testing.expectEqual(@as(u32, 6), t.battle.mounts_per_ammo_ton);
+    try std.testing.expectEqual(@as(types.Bp, 1_200), t.finance.loan_rate_bp);
+    try std.testing.expectEqual(@as(types.CBills, 2_000), t.logistics.freight_per_ly);
+}</code></pre>
+<p>The recursion is on types, not on values: for a struct it calls itself once per field with the field's <em>type</em>, the field's <em>value</em> (read with <code>@field</code>), and a dotted name built with <code>++</code>, all at compile time. At runtime what remains is a flat list of integer comparisons, one per unsigned knob. Add a field to <code>Tuning</code> and it is covered with no change to the test, which is exactly what the first exercise asks you to confirm.</p>
+<p>The second test is the reverse: four values pinned by hand. It exists so that a mod which changes the numbers the formulas were tuned around fails loudly under <code>zig build test -Ddata=…</code>, and so that an accidental edit to the stock file is noticed.</p>
+
+<h3 id="ch40-reading">Guided reading</h3>
+<ol>
+<li><code>build.zig</code>: the block from <code>const data_dir = b.option(</code> to <code>mod.addImport("build_options", …)</code>. Match each <code>import_name</code> to the Zig file that imports it (grep for <code>_zon"</code> under <code>src/domain</code> and <code>src/gen</code>).</li>
+<li><code>src/domain/tuning.zig</code>: skim the <code>Tuning</code> struct to see how the knobs are grouped by subsystem, then read the three declarations at the bottom: <code>t</code>, <code>checkPositive</code>, and the two tests.</li>
+<li><code>data/tables/tuning.zon</code> next to it. Pick any three knobs and grep the source for their names to find the formula that uses each. You will find that every use is a plain field access.</li>
+<li><code>src/domain/chassis.zig</code> top to bottom (186 lines). Note the four lookup helpers after <code>find</code> (<code>ofWeightClass</code>, <code>ofKind</code>, <code>scoutPool</code>, <code>availableIn</code>) and how each filters the constant slice. Then the tests: the first checks shape facts the compiler cannot (positive BV, unique keys).</li>
+<li><code>src/domain/part.zig</code>, <code>src/domain/rat.zig</code>, <code>src/domain/scenario.zig</code>, <code>src/domain/planet.zig</code>: read only the tests. Each is a cross-file check of the kind described in 40.6.</li>
+<li><code>docs/modding.md</code>: the table of files and the "Rules of the road". It is written for modders, which makes it the clearest statement of what each table holds.</li>
+</ol>
+
+<h3 id="ch40-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 40.1 · Break it on purpose <span class="level">warm-up</span></h4>
+<p>In your copy of the game, make three separate edits to <code>data/tables/tuning.zon</code>, building after each and writing down the first line of the error: (a) misspell a field name; (b) delete a field entirely; (c) change <code>.rarity_target</code>'s <code>.common</code> value to <code>"7"</code>. Undo each edit before the next.</p>
+<details class="answer"><summary>Solution</summary>
+<p>(a) <code>error: unexpected field 'fatigue_tierd'</code>, pointing at the line in the ZON file. (b) <code>data/tables/tuning.zon:92:16: error: missing field 'fatigue_tired'</code>, pointing at the opening <code>.{</code> of the <code>.person</code> block, with a note saying where the file was imported (<code>src/domain/tuning.zig:398</code>). (c) <code>error: expected type 'u8'</code> (or whatever the field's integer type is), pointing at the string. In all three cases the game does not build, which is the behaviour the design promises. Notice that (b) is reported at the struct literal rather than at the missing line, because there is no missing line to point at.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 40.2 · Add a knob <span class="level">practice</span></h4>
+<p>Add a new tuning knob <code>person.exercise_bonus_xp</code> with the value 5. It needs a field in the <code>Tuning</code> struct and a value in the ZON file. Then write a test in <code>tuning.zig</code> that reads it back. Before running the tests, predict whether <code>checkPositive</code> will cover the new field, and check your prediction by temporarily setting the value to 0.</p>
+<details class="answer"><summary>Solution</summary>
+<div class="file">src/domain/tuning.zig, inside the <code>person</code> struct</div>
+<pre><code>    person: struct {
+        weekly_hours: u16,
+        exercise_bonus_xp: u32,
+        // …</code></pre>
+<div class="file">data/tables/tuning.zon, inside <code>.person</code></div>
+<pre><code>    .person = .{
+        .weekly_hours = 40,
+        .exercise_bonus_xp = 5,
+        // …</code></pre>
+<div class="file">src/domain/tuning.zig, at the bottom</div>
+<pre><code>test "the new knob is on the table" {
+    try std.testing.expectEqual(@as(u32, 5), t.person.exercise_bonus_xp);
+}</code></pre>
+<p>With the value 0, <code>zig build test</code> prints <code>tuning field t.person.exercise_bonus_xp must be positive</code> and the sanity test fails: <code>checkPositive</code> found the new field through <code>@typeInfo</code> without anyone telling it. The dotted name in the message was built at compile time with <code>++</code>. Set it back to 5 and everything is green.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 40.3 · A cross-file check of your own <span class="level">practice</span></h4>
+<p>Add a test to <code>src/domain/chassis.zig</code> asserting that every design of kind <code>.mek</code> has at least one loadout slot of class <code>.weapon</code>. Use the pattern from 40.6: loop the constant catalogue, skip rows that do not apply, count, expect.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "every mek carries at least one weapon" {
+    for (catalog) |c| {
+        if (c.kind != .mek) continue;
+        var weapons: u32 = 0;
+        for (c.loadout) |slot| if (slot.class == .weapon) {
+            weapons += 1;
+        };
+        try std.testing.expect(weapons &gt; 0);
+    }
+}</code></pre>
+<p>It passes against the stock data. Two details: <code>c.kind</code> is a defaulted field, so rows that omit it read as <code>.mek</code>; and the one-line <code>for … |slot| if (…) { … };</code> form needs the trailing semicolon because the whole <code>for</code> is a statement whose body is an <code>if</code> expression. If you want the failure message to name the offending design, print <code>c.key</code> before returning <code>error.TestUnexpectedResult</code>, as the RAT test does.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 40.4 · A mod that changes one number <span class="level">challenge</span></h4>
+<p>Create a directory <code>mymod/tables/</code>, copy <code>tuning.zon</code> into it, and change the regional influence radius from 60 to 61 light-years. Build and test with <code>-Ddata=mymod</code>. Which test notices, and why is that the right test to notice? Then run the game's REPL with the same option and find where it reports the overlay.</p>
+<details class="answer"><summary>Solution</summary>
+<pre class="term">$ mkdir -p mymod/tables &amp;&amp; cp data/tables/tuning.zon mymod/tables/
+$ sed -i '' 's/.regional = 60, .brigade = 90/.regional = 61, .brigade = 90/' mymod/tables/tuning.zon
+$ zig build test -Ddata=mymod
+error: 'domain.tuning.test.spot checks against the values the formulas were built on' failed:
+       expected 60, found 61
+Build Summary: … 1 failed</pre>
+<p>The spot-check test is the one that notices, and it is the right one: the shape is still valid (so the build succeeds and <code>checkPositive</code> is happy), but a formula somewhere was tuned around 60, and the test exists to say so. A modder who intends the change edits or skips that test; an accidental edit gets caught. The REPL banner prints the result of <code>root.dataProvenance</code>: <code>mod mymod: 1 file overlaid (tables/tuning.zon)</code>. The values came from <code>build_options</code>, which the build script computed in the loop you read in 40.4.</p></details>
+</div>
+
+<h3 id="ch40-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>What gives a ZON file its type? <details class="answer"><summary>Answer</summary>The declaration that receives it: <code>pub const t: Tuning = @import("tuning_zon");</code> coerces the anonymous literal to <code>Tuning</code> at compile time.</details></li>
+<li>Where is the string <code>"tuning_zon"</code> connected to a real file? <details class="answer"><summary>Answer</summary>In <code>build.zig</code>, by <code>mod.addAnonymousImport(f.import_name, .{ .root_source_file = path })</code>, where <code>path</code> is either <code>data/tables/tuning.zon</code> or the same relative path under the <code>-Ddata</code> directory.</details></li>
+<li>Which mistakes in a data file does the compiler catch, and which does it not? <details class="answer"><summary>Answer</summary>It catches shape errors: unknown fields, missing fields without defaults, wrong types, unknown enum literals. It cannot catch cross-file meaning, such as a loadout naming a part that is not in <code>parts.zon</code>; tests do that.</details></li>
+<li>Why can a vehicle row omit <code>jump_mp</code>? <details class="answer"><summary>Answer</summary>Because <code>Chassis.jump_mp</code> has a default (<code>= 0</code>). Fields with defaults may be omitted from any struct literal, ZON included.</details></li>
+<li>What does <code>find</code> return for an unknown key, and why is that not an error? <details class="answer"><summary>Answer</summary><code>null</code>, because the return type is <code>?*const Chassis</code>. "Not in the catalogue" is an ordinary outcome the caller handles with <code>orelse</code> or <code>if</code>, not a failure to propagate.</details></li>
+<li>Why does <code>checkPositive</code> take <code>comptime T: type</code> rather than using <code>@TypeOf(value)</code>? <details class="answer"><summary>Answer</summary>Both would work for the top call, but the recursion needs to pass <code>f.type</code> explicitly for each field, and marking the parameter <code>comptime</code> guarantees the <code>switch (@typeInfo(T))</code> is resolved while compiling, so only the integer checks survive to runtime.</details></li>
+<li>How does the binary know which files a mod overlaid? <details class="answer"><summary>Answer</summary><code>build.zig</code> records them in a generated <code>build_options</code> module (<code>addOptions</code>), which <code>root.zig</code> imports as <code>build_info</code> and formats in <code>dataProvenance</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Every table in IRON LEDGER is a <code>.zon</code> struct literal imported by name and coerced to a Zig struct at compile time; the struct is the schema.</li>
+<li>Shape errors (unknown field, missing field, wrong type, bad enum literal) fail the build with a line number in the data file.</li>
+<li><code>build.zig</code> binds each import name to a path, which is how <code>-Ddata=&lt;dir&gt;</code> overlays files without the simulation knowing.</li>
+<li>Rows with defaulted fields let one struct describe meks, vehicles, fighters and ships.</li>
+<li>Cross-file facts are checked by tests that loop over the constant data and name the failing row; a reflective test covers every tuning knob automatically.</li>
+</ul></div>
+</section>

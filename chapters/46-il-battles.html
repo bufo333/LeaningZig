@@ -1,0 +1,285 @@
+<section id="ch46">
+<h2>46. Battles and events</h2>
+<p class="goals"><strong>In this chapter</strong> you read the two places where dice decide things: the battle resolver, which collapses an engagement into one opposed roll and then does a great deal of bookkeeping, and the event decks, which turn a monthly roll into either an automatic consequence or a decision waiting in the inbox. Both are built from tagged unions and a seeded stream, and both are tested by asserting on outcomes across many rolls rather than on any single roll.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch14">Chapter 14</a> (tagged unions with many payload types, and an exhaustive <code>switch</code> that lists every tag), <a href="#ch06">Chapter 6</a> (labeled blocks that yield a value with <code>break :blk</code>, and an <code>if … else if</code> chain as an expression), <a href="#ch34">Chapter 34</a> (seeded random draws), <a href="#ch04">Chapter 4</a> (widening with <code>@as(i32, …)</code> before adding signed and unsigned quantities), <a href="#ch15">Chapter 15</a> (optional fields as "not yet") and <a href="#ch41">Chapter 41</a> (the named RNG streams).</div>
+
+<h3 id="ch46-1">46.1 When a battle happens</h3>
+<p>A battle is not a screen and not a turn. It is a phase of the daily tick (<a href="#ch43">Chapter 43</a>) that asks each active contract whether an engagement is due:</p>
+<div class="file">src/sim/battle.zig</div>
+<pre><code>pub fn runDaily(gs: *GameState) !void {
+    var it = gs.contracts.iterator();
+    while (it.next()) |entry| {
+        const c = entry.value_ptr;
+        if (c.status != .active or c.kind.isGarrisonClass()) continue;
+        if (c.next_battle_day == null) {
+            c.next_battle_day = gs.clock.day_index + nextBattleGap(gs, c);
+            continue;
+        }
+        if (gs.clock.day_index &gt;= c.next_battle_day.?) {
+            try resolveEngagement(gs, c);
+            c.next_battle_day = gs.clock.day_index + nextBattleGap(gs, c);
+        }
+    }
+}</code></pre>
+<p>The optional field <code>next_battle_day: ?u32</code> is the "not yet" pattern from <a href="#ch15">Chapter 15</a>: null means no battle has been scheduled, so schedule one; otherwise compare the integer day and resolve when it arrives. <code>nextBattleGap</code> rolls the gap from the <code>.battle</code> stream, so the rhythm of a contract is itself seeded.</p>
+
+<h3 id="ch46-2">46.2 One roll decides the engagement</h3>
+<p><code>resolveEngagement</code> is three hundred lines and there is no map and no turns. The player's side is built by walking the company's lances, summing each hull's battle value adjusted for damage, ammunition on hand and the pilot's skill with fatigue and injury penalties, then scaling by campaign modifiers (supplies, morale, recon, air cover, support lances). The enemy is a fraction of that, set by contract kind, scenario and a variance roll. Then one roll:</p>
+<pre><code>pub fn resolveEngagement(gs: *GameState, c: *contract_mod.Contract) !void {
+    // Where and in what (12C.10): the world's ground, the day's weather.
+    const env: terrain_mod.Environment = blk: {
+        const world = planet_mod.find(c.planet_key) orelse break :blk .{};
+        const t = terrain_mod.terrainOf(world);
+        break :blk .{ .terrain = t, .weather = terrain_mod.rollWeather(&amp;gs.rng, .battle, t) };
+    };
+    var player = try playerSideIn(gs, c, env);
+    defer player.engaged.deinit(gs.allocator());
+    if (player.engaged.items.len == 0) {
+        c.score -= 2;
+        try gs.log(.battle, .{ .company = c.assigned_company, .contract = c.id }, "[AAR] {s}: no combat-effective units — objective conceded", .{@tagName(c.kind)});
+        return;
+    }
+
+    // What kind of fight this is (12C.9, AtB scenario table): it scales
+    // the enemy, tilts the roll, weights the score and decides what a
+    // held field is worth.
+    const scenario = @import("../domain/scenario.zig").roll(&amp;gs.rng, .battle, c.kind);
+
+    // Enemy: strength relative to the player's committed BV, pirate rabble
+    // to house regulars by employer's foe.
+    const variance: types.Bp = (@as(types.Bp, gs.rng.roll2d6(.battle)) - 7) * 500;
+    var enemy_bv = types.applyBp(types.applyBp(types.applyBp(player.bv, contract_mod.enemyStrengthBp(c.kind) + variance), scenario.enemy_bp), gs.diff().enemy_bp);
+    // …
+    const enemy_power = enemy_elem.effectivePower(.{});
+
+    // One opposed roll decides the engagement (rounds within are abstracted;
+    // ARCH §7 steps 3–4 collapse into the margin).
+    const scenario_mod: i32 = @as(i32, scenario.roll_mod) + (if (player.mods.recon_quality &gt; 0) @as(i32, scenario.scout_bonus) else 0) + env.rollMod();
+    // Close terrain evens the odds: numbers count for less in the woods and the streets.
+    const ratio_bonus: i32 = if (env.close()) @min(ratioBonus(player.power, enemy_power), 2) else ratioBonus(player.power, enemy_power);
+    var roll = @as(i32, gs.rng.roll2d6(.battle)) + ratio_bonus + scenario_mod;
+    // Edge (12B.6): a pilot with Edge to spend re-rolls a lost engagement once per contract.
+    var edge_used_by: ?*person_mod.Person = null;
+    if (roll &lt; 6) {
+        for (player.engaged.items) |uid| {
+            const u = gs.unit(uid) orelse continue;
+            const p = gs.person(u.pilot) orelse continue;
+            if (p.has("edge") and !p.edge_spent) {
+                p.edge_spent = true;
+                edge_used_by = p;
+                roll = @as(i32, gs.rng.roll2d6(.battle)) + ratio_bonus + scenario_mod;
+                break;
+            }
+        }
+    }
+    const outcome: autoresolve.Outcome = if (roll &gt;= 11) .decisive_victory //
+        else if (roll &gt;= 8) .victory //
+        else if (roll &gt;= 6) .draw //
+        else if (roll &gt;= 4) .defeat //
+        else .rout;
+
+    // Player losses scale with how badly it went. // TUNE
+    const hit_pct: u32 = switch (outcome) {
+        .decisive_victory =&gt; 8,
+        .victory =&gt; 15,
+        .draw =&gt; 25,
+        .defeat =&gt; 40,
+        .rout =&gt; 55,
+    };
+    // … three hundred lines of consequences …
+}</code></pre>
+<p>Several idioms you know are working together. The environment is computed in a labeled block (<a href="#ch06">Chapter 6</a>) that can bail out early with <code>break :blk .{}</code> when the planet is unknown. Every dice call names <code>.battle</code>, so the market is untouched by a fight. The variance is basis points around zero: 2d6 minus 7 gives a symmetric spread, times 500, added to a base strength multiplier, then applied with <code>applyBp</code> three times in a chain (contract kind, scenario, difficulty). The roll modifiers are widened to <code>i32</code> with <code>@as</code> before being added, because <code>roll2d6</code> returns <code>u8</code> and a modifier can be negative; <a href="#ch04">Chapter 4</a> warned that mixing signed and unsigned needs an explicit widening. The outcome is an <code>if</code> chain as an expression, producing a five-variant enum from <code>autoresolve.zig</code>, and the loss percentages are an exhaustive <code>switch</code> over it.</p>
+<p>Everything after the outcome is bookkeeping: which hulls are hit and where, who is wounded or killed, what ammunition was spent, what salvage the trucks can haul, what the contract's score and the pilots' records gain, and a multi-line after-action report written to the log with <code>gs.log(.battle, …)</code>. The function is long because the report is detailed, but it is straight-line code with no state of its own: every fact it needs is in <code>gs</code>, every change it makes is to <code>gs</code>.</p>
+
+<h3 id="ch46-3">46.3 Testing dice</h3>
+<p>You cannot assert that a particular battle is won; you can assert that stronger sides win more. The tests at the bottom of <code>battle.zig</code> have names like "battles resolve with consequences and stronger forces win more", "hard hits wound pilots: a season of fighting sends someone to the medbay", and "9B: dry mounts are silenced — ammo is combat power". Each builds a company, runs many engagements with a fixed seed, and asserts on aggregates (wins over a season, at least one wound, a power number that drops when the ammunition is gone). Because the seed is fixed the aggregates are in fact exact numbers, but the assertions are written as bounds so that a re-tuning of the loss table does not break them for no reason. That is the same discipline as the turnover test in <a href="#ch43">Chapter 43</a>.</p>
+
+<h3 id="ch46-4">46.4 Events: a union of effects</h3>
+<p>Contract events use the same tagged-union idea as commands, at a smaller scale. An event's consequence is a list of effects:</p>
+<div class="file">src/sim/events.zig</div>
+<pre><code>/// One consequence of an event option. Relative where it must scale
+/// (contract pay), absolute where flat money reads better.
+pub const Effect = union(enum) {
+    cash: types.CBills,
+    cash_monthly_pct: i16, // % of the contract's monthly_net
+    reputation: i16,
+    morale: i8, // applied to everyone in the company
+    fatigue: u8,
+    xp_all: u16,
+    score: i16, // contract success score (drives Stage 7 outcomes)
+    damage_random_units: u8, // N line-lance hulls take abstract battle wear
+    damage_convoy_units: u8, // N support-echelon vehicles (trucks, ambulances) take wear
+    parts_windfall: u8, // salvaged spares into the pool
+    supply_loss: types.CBills, // posted as a supplies expense
+    /// Standing with the contract's employer (Stage 12.22).
+    employer_standing: i16,
+    /// Stock landed in the company's field stores (munitions off the books).
+    field_stock: struct { key: []const u8, qty: u16 },
+    // Personnel effects (Stage 12.25) act on the event's `person`.
+    raise_pct: u8,
+    retention_bonus_months: u8,
+    let_go,
+    replace_from_hall,
+    // Prisoner effects (12B.7) act on the event's `person`, a POW.
+    ransom_prisoner,
+    release_prisoner,
+    recruit_prisoner,
+};
+
+pub const Option = struct {
+    label: []const u8,
+    effects: []const Effect = &amp;.{},
+};
+
+pub const Event = struct {
+    day: u32,
+    kind: EventKind,
+    contract: types.ContractId = .none,
+    company: types.ForceId = .none,
+    person: types.PersonId = .none,
+    /// Empty = auto event (applied at roll time, never queued).
+    options: []const Option = &amp;.{},
+    /// Applied automatically at the deadline if the player never answers.
+    default_choice: usize = 0,
+    deadline_day: u32 = 0,
+    chosen: ?usize = null,
+
+    pub fn needsDecision(self: *const Event) bool {
+        return self.options.len &gt; 0 and self.chosen == null;
+    }
+};</code></pre>
+<p>An <code>Effect</code> carries a small signed or unsigned integer sized to what it means: morale is <code>i8</code> because it can go down, fatigue is <code>u8</code> because an event only ever adds it. A few carry nothing, like <code>let_go</code>. The <code>Option</code> is a label and a slice of effects, and an <code>Event</code> is a slice of options with a default and a deadline. <code>options.len == 0</code> means the event is automatic and was applied when rolled; otherwise it waits.</p>
+<p>The decks themselves are functions from a 2d6 roll to an <code>Entry</code>, in <code>contract_events.zig</code>. They are ordinary Zig, not data files, because each entry's log text and effects are hand-written prose and the tables are short. Here is what happens on the first of the month:</p>
+<div class="file">src/sim/contract_events.zig</div>
+<pre><code>pub fn rollMonthly(gs: *GameState) !void {
+    var it = gs.contracts.iterator();
+    while (it.next()) |entry| {
+        const c = entry.value_ptr;
+        if (c.status != .active) continue;
+
+        const roll = gs.rng.roll2d6(.events);
+        const deck = if (c.kind.isGarrisonClass()) garrisonDeck(roll) else combatDeck(roll);
+
+        const ctx: @import("state.zig").LogCtx = .{ .company = c.assigned_company, .contract = c.id };
+        if (deck.options.len == 0) {
+            try applyEffects(gs, deck.auto_effects, c);
+            try gs.log(.contract, ctx, "[{s}] (2d6 = {d}) {s}{s}", .{ @tagName(c.kind), roll, deck.log, try effectsPlain(gs, deck.auto_effects) });
+        } else try queueDecision(gs, deck, c, roll);
+    }
+}</code></pre>
+<p>Roll from the <code>.events</code> stream, pick a deck by contract class, and either apply and log or queue. Note the two arguments the log line gets from <code>ctx</code>: the company and the contract, so the Desk's log pane can later filter "everything that happened to Alpha on this contract" (<a href="#ch41">Chapter 41</a>).</p>
+
+<h3 id="ch46-5">46.5 Decision or dice: the inbox rule</h3>
+<p>The rule that decides whether an event goes to the inbox is stated in the original guide: if none of its effects touch money, stock or damage, the sim rolls the default and logs it; otherwise it waits for the player with a deadline. In the current source that rule is not a function; it is a property of how the decks are written, and a test asserts it for every deck and every roll:</p>
+<pre><code>test "12.24: automatic events never move money, stock or hulls — those are decisions" {
+    var roll: u8 = 2;
+    while (roll &lt;= 12) : (roll += 1) {
+        const decks = [_]Entry{ garrisonDeck(roll), combatDeck(roll), weeklyDeck(true, roll), weeklyDeck(false, roll) };
+        for (decks) |e| {
+            if (e.options.len &gt; 0) continue;
+            for (e.auto_effects) |fx| switch (fx) {
+                .fatigue, .morale, .xp_all, .score, .reputation, .employer_standing =&gt; {},
+                .cash, .cash_monthly_pct, .supply_loss, .parts_windfall, .field_stock, .damage_random_units, .damage_convoy_units, .raise_pct, .retention_bonus_months, .let_go, .replace_from_hall, .ransom_prisoner, .release_prisoner, .recruit_prisoner =&gt; {
+                    std.debug.print("auto event {s} carries a player-facing effect\n", .{@tagName(e.kind)});
+                    return error.TestUnexpectedResult;
+                },
+            };
+        }
+    }
+}</code></pre>
+<p>Read the <code>switch</code>. It has no <code>else</code>, so it lists every <code>Effect</code> tag and sorts each into "harmless in an automatic event" or "must be a decision". Add an effect to the union and this test fails to compile until someone decides which side of the line it is on. That is a deliberate use of exhaustiveness as a design checklist, and Exercise 46.1 walks you through it. The loop over rolls 2 to 12 and all four decks means the property is checked for every entry that can ever be drawn.</p>
+<p>Queued decisions carry one more mechanism. If the player has answered the same kind of event the same way three times running, the game stops asking:</p>
+<pre><code>fn queueDecision(gs: *GameState, deck: Entry, c: *contract_mod.Contract, roll: u8) !void {
+    const ctx: @import("state.zig").LogCtx = .{ .company = c.assigned_company, .contract = c.id };
+    const mem = try gs.event_memory.getOrPut(gs.allocator(), deck.kind);
+    if (!mem.found_existing) mem.value_ptr.* = .{};
+    mem.value_ptr.last_day = gs.clock.day_index;
+    if (mem.value_ptr.streak &gt;= tuning.contract.standing_order_after and mem.value_ptr.last_choice &lt; deck.options.len) {
+        const opt = deck.options[mem.value_ptr.last_choice];
+        try applyEffects(gs, opt.effects, c);
+        try gs.log(.contract, ctx, "[{s}] (2d6 = {d}) {s} — standing order: \"{s}\"{s} (`sop clear {s}` to be asked again)", .{ @tagName(c.kind), roll, deck.log, opt.label, try effectsPlain(gs, opt.effects), @tagName(deck.kind) });
+        return;
+    }
+    try gs.event_queue.push(gs.allocator(), .{
+        .day = gs.clock.day_index,
+        .kind = deck.kind,
+        .contract = c.id,
+        .company = c.assigned_company,
+        .options = deck.options,
+        .default_choice = deck.default_choice,
+        .deadline_day = gs.clock.day_index + decision_window_days,
+    });
+    try gs.log(.decision, ctx, "[{s}] DECISION: {s} (inbox, {d} days to answer)", .{ @tagName(c.kind), deck.log, decision_window_days });
+}</code></pre>
+<p><code>getOrPut</code> (<a href="#ch22">Chapter 22</a>) fetches or creates the memory for this event kind in one call; the <code>found_existing</code> flag tells you which happened, and a new entry is initialised with <code>.{}</code>. The standing-order threshold comes from the tuning table (<a href="#ch40">Chapter 40</a>). The deadline is a day index; when it passes, <code>expireDue</code> in the tick applies <code>default_choice</code> and logs that the player let it default. Time never stops for an event, which is the design sentence at the top of <code>events.zig</code>.</p>
+
+<h3 id="ch46-reading">Guided reading</h3>
+<ol>
+<li><code>src/sim/autoresolve.zig</code>: <code>Element</code>, <code>effectivePower</code>, <code>CampaignMods</code> and <code>Outcome</code>. This is the arithmetic of a side's strength, all integers and basis points, and it has its own tests.</li>
+<li><code>src/sim/battle.zig</code>: <code>runDaily</code>, then <code>resolveEngagement</code> from the top to the <code>hit_pct</code> table, then skim the rest for the shape (hits, wounds, ammo, salvage, score, report). Read one test at the bottom fully.</li>
+<li><code>src/sim/events.zig</code>, all of it (149 lines).</li>
+<li><code>src/sim/contract_events.zig</code>: <code>Entry</code>, one deck function (<code>garrisonDeck</code>), <code>rollMonthly</code>, <code>queueDecision</code>, <code>resolveChoice</code>, <code>expireDue</code>, and <code>applyEffectsFor</code>, which is the exhaustive switch that turns each <code>Effect</code> into a state change.</li>
+<li>The tests "auto events apply, decisions queue with deadlines, defaults fire" and "12.24: automatic events never move money, stock or hulls".</li>
+</ol>
+
+<h3 id="ch46-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 46.1 · Add an effect and let the compiler list the switches <span class="level">practice</span></h4>
+<p>Add a variant <code>xp_pilot: u16</code> to <code>Effect</code> and build. Write down every file and line the compiler names, then remove the variant. You do not have to implement the effect; the point is to see the checklist.</p>
+<details class="answer"><summary>Solution</summary>
+<pre class="term">src/sim/queries.zig:286:23: error: switch must handle all possibilities
+src/sim/events.zig:89:5: note: unhandled enumeration value: 'xp_pilot'
+src/sim/contract_events.zig:352:9: error: switch must handle all possibilities
+src/sim/contract_events.zig:731:39: error: switch must handle all possibilities</pre>
+<p>Three switches: <code>queries.effectsText</code> (how the inbox describes an option to the player), <code>contract_events.applyEffectsFor</code> (what the effect does to the state), and the 12.24 test (which side of the decision line it is on). Those are precisely the three questions a new effect must answer: how is it shown, what does it do, and may it happen without asking. The compiler reports them across two compilations because the test binary and the executable are built separately; you may see the <code>queries.zig</code> error twice.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 46.2 · Every roll has a line <span class="level">warm-up</span></h4>
+<p>Write a test in <code>contract_events.zig</code> that, for every roll from 2 to 12, checks the garrison and combat decks return an entry with non-empty <code>log</code> text, and that any entry with options has a <code>default_choice</code> inside the option list (so that <code>expireDue</code> can never index out of bounds).</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "every monthly roll has a line for the log and a default" {
+    var roll: u8 = 2;
+    while (roll &lt;= 12) : (roll += 1) {
+        try std.testing.expect(garrisonDeck(roll).log.len &gt; 0);
+        const e = combatDeck(roll);
+        try std.testing.expect(e.log.len &gt; 0);
+        // A decision always has a default the deadline can apply.
+        if (e.options.len &gt; 0) try std.testing.expect(e.default_choice &lt; e.options.len);
+    }
+}</code></pre>
+<p>The deck functions are private (<code>fn</code>, not <code>pub fn</code>) but a test in the same file can call them. The property about <code>default_choice</code> is the kind of thing that is obviously true today and quietly stops being true when someone reorders the options of one entry; a loop over all eleven rolls costs nothing.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 46.3 · needsDecision <span class="level">warm-up</span></h4>
+<p>Write a test in <code>events.zig</code> showing that an event with options needs a decision, stops needing one once <code>chosen</code> is set, and that an event with no options never needed one.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "an answered decision stops needing one" {
+    var ev: Event = .{ .day = 1, .kind = .betrayal, .options = &amp;.{.{ .label = "Fight" }} };
+    try std.testing.expect(ev.needsDecision());
+    ev.chosen = 0;
+    try std.testing.expect(!ev.needsDecision());
+    const auto: Event = .{ .day = 1, .kind = .quiet_month };
+    try std.testing.expect(!auto.needsDecision());
+}</code></pre>
+<p><code>&amp;.{.{ .label = "Fight" }}</code> is the address of an anonymous array literal with one <code>Option</code> in it, coerced to <code>[]const Option</code>; the <code>effects</code> field takes its default of an empty slice. <code>ev</code> must be <code>var</code> because <code>chosen</code> is assigned; <code>auto</code> can be <code>const</code>.</p></details>
+</div>
+
+<h3 id="ch46-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>How does the game decide that today is a battle day for a contract? <details class="answer"><summary>Answer</summary><code>battle.runDaily</code> compares <code>day_index</code> with the contract's <code>next_battle_day</code>; if that field is <code>null</code> it schedules one with a seeded gap instead.</details></li>
+<li>Why is the outcome an <code>if … else if</code> expression rather than a lookup table? <details class="answer"><summary>Answer</summary>The thresholds are on a signed roll with modifiers that can push it far outside 2 to 12, so range comparisons are the natural form; the result is an enum so the loss tables can switch on it exhaustively.</details></li>
+<li>Why widen <code>roll2d6</code>'s result with <code>@as(i32, …)</code>? <details class="answer"><summary>Answer</summary>It returns <code>u8</code>, and the modifiers being added are signed <code>i32</code>; Zig requires an explicit widening before mixing them.</details></li>
+<li>What makes an event automatic rather than a decision? <details class="answer"><summary>Answer</summary>An <code>Entry</code> with no options is applied at roll time; one with options is queued with a deadline. A test asserts that automatic entries carry only effects that do not touch money, stock, hulls or people.</details></li>
+<li>What happens to a decision the player never answers? <details class="answer"><summary>Answer</summary>When <code>day_index</code> passes its <code>deadline_day</code>, <code>expireDue</code> applies <code>default_choice</code> and logs it; time never waits.</details></li>
+<li>What is a standing order? <details class="answer"><summary>Answer</summary>After the player has chosen the same option for the same event kind enough times in a row (a tuning knob), <code>queueDecision</code> applies that choice automatically and logs it, until <code>sop clear</code> resets the memory.</details></li>
+<li>Which three places must change when an <code>Effect</code> variant is added? <details class="answer"><summary>Answer</summary>The display switch in <code>queries.effectsText</code>, the application switch in <code>contract_events.applyEffectsFor</code>, and the classification switch in the 12.24 test.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A battle is a phase of the tick that resolves when an integer day arrives, and the engagement itself is one seeded 2d6 roll plus modifiers mapped to a five-variant outcome.</li>
+<li>Strength, variance and difficulty are all basis-point arithmetic on integers; dice come only from the <code>.battle</code> stream.</li>
+<li>Dice are tested by aggregates over many seeded rolls, with bounds rather than exact values.</li>
+<li>Events are a tagged union of effects grouped into options; no options means automatic, otherwise the inbox with a deadline and a default.</li>
+<li>An exhaustive <code>switch</code> in a test is a design checklist: every new effect must be classified before the code compiles.</li>
+</ul></div>
+</section>

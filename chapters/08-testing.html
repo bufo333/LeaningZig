@@ -1,0 +1,627 @@
+<section id="ch08">
+<h2>8. Testing as you go</h2>
+<p class="goals"><strong>In this chapter</strong> you will write your first <code>test</code> blocks, run them with <code>zig test</code>, and learn the handful of assertion functions in <code>std.testing</code> that the rest of this book relies on. You will also read a real failure message slowly, so that when your own tests fail later you know exactly where to look. From here on most exercises are test files: you fill in a function, run one command, and the file tells you whether you are done.</p>
+
+<h3 id="ch08-1">8.1 Why testing comes this early</h3>
+<p>Most books put testing near the end, as a good habit to pick up once you know the language. Zig makes the opposite order natural. A test is not a separate framework, a separate folder, or a separate runner: it is a block of code in the same file as the thing it checks, and the compiler itself knows how to run it. Writing one costs three lines.</p>
+<p>That matters for a learner more than for anyone else. Every exercise from now on is a file with a <code>// TODO</code> and a few tests at the bottom. You run <code>zig test</code>, read what fails, fix it, run it again. No printing values to eyeball, no guessing whether an edge case works. The compiler is the grader, and it is a strict one.</p>
+<p>It matters for IRON LEDGER too. The game has 224 tests spread across its modules, and its rule is simple: every module carries its own. When a rule about salaries or contracts changes, the test next to it changes in the same commit. You will read some of those tests in Part 5; today you learn to write the small ones.</p>
+
+<h3 id="ch08-2">8.2 Your first test block</h3>
+<p>A test is the keyword <code>test</code>, a name in quotes, and a block. Put it in any file, next to the function it checks.</p>
+<p class="file">first_test.zig</p>
+<pre><code>const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+test "add works" {
+    try std.testing.expect(add(2, 3) == 5);
+}</code></pre>
+<p>Notice there is no <code>main</code>. A test file does not need one. Run it with <code>zig test</code> instead of <code>zig run</code>:</p>
+<pre class="term">1/1 first_test.test.add works...OK
+All 1 tests passed.</pre>
+<p>Read the first line carefully, because you will see thousands like it. <code>1/1</code> means test one of one. <code>first_test.test.add works</code> is the full name: the file, the word <code>test</code>, then the name you wrote in quotes. Then <code>OK</code>. The last line is the summary.</p>
+<p>Inside the block, <code>std.testing.expect</code> takes a boolean. If it is <code>true</code> the function returns normally; if it is <code>false</code> it returns an error, and the <code>try</code> in front of it makes the test fail. That is all a test failure is in Zig: an error returned from the test block. This is also why every assertion line starts with <code>try</code>. Forget it and the compiler complains that you are ignoring an error value, which is Zig's usual rule for error unions (<a href="#ch16">Chapter 16</a> covers this properly).</p>
+<p>Add a second function and a second test:</p>
+<p class="file">two_tests.zig</p>
+<pre><code>const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+fn double(x: i32) i32 {
+    return x * 2;
+}
+
+test "add works" {
+    try std.testing.expect(add(2, 3) == 5);
+}
+
+test "double works" {
+    try std.testing.expectEqual(@as(i32, 8), double(4));
+}</code></pre>
+<pre class="term">1/2 two_tests.test.add works...OK
+2/2 two_tests.test.double works...OK
+All 2 tests passed.</pre>
+<p>Tests run in the order they appear in the file. Each one is independent: a failure in one does not stop the others from running.</p>
+
+<h3 id="ch08-3">8.3 What a failure looks like</h3>
+<p>Now break something on purpose. Change <code>add</code> to subtract:</p>
+<p class="file">failing.zig</p>
+<pre><code>const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a - b; // bug: should be a + b
+}
+
+test "add works" {
+    try std.testing.expectEqual(@as(i32, 5), add(2, 3));
+}</code></pre>
+<pre class="term">1/1 failing.test.add works...expected 5, found -1
+FAIL (TestExpectedEqual)
+&lt;zig&gt;/lib/std/testing.zig:118:17: in expectEqualInner__anon_36361 (test)
+                return error.TestExpectedEqual;
+                ^
+&lt;zig&gt;/lib/std/testing.zig:83:5: in expectEqual (test)
+    return expectEqualInner(T, expected, actual);
+    ^
+ch08/failing.zig:8:5: in test.add works (test)
+    try std.testing.expectEqual(@as(i32, 5), add(2, 3));
+    ^
+0 passed; 0 skipped; 1 failed.
+error: the following test command failed with exit code 1:</pre>
+<p>There is a lot of text, but only three lines matter, and they are always in the same places:</p>
+<ul>
+<li>The first line, after the test name: <code>expected 5, found -1</code>. That is the diagnostic. It tells you what the test wanted and what it got.</li>
+<li>The line naming your own file: <code>failing.zig:8:5</code>, followed by the source line. That is where the assertion is. Line 8, column 5.</li>
+<li>The summary: <code>0 passed; 0 skipped; 1 failed.</code></li>
+</ul>
+<p>Everything in between is a stack trace through <code>std/testing.zig</code>. It shows how the failure travelled up from <code>expectEqualInner</code> to your test. You can ignore those lines until you are debugging something deep; your eye should learn to skip to the line with your file name in it.</p>
+<p>Compare this with the same bug caught by plain <code>expect</code>:</p>
+<p class="file">failing_expect.zig</p>
+<pre><code>const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a - b; // bug
+}
+
+test "add works" {
+    try std.testing.expect(add(2, 3) == 5);
+}</code></pre>
+<pre class="term">1/1 failing_expect.test.add works...FAIL (TestUnexpectedResult)
+&lt;zig&gt;/lib/std/testing.zig:615:14: in expect (test)
+    if (!ok) return error.TestUnexpectedResult;
+             ^
+ch08/failing_expect.zig:8:5: in test.add works (test)
+    try std.testing.expect(add(2, 3) == 5);
+    ^
+0 passed; 0 skipped; 1 failed.
+error: the following test command failed with exit code 1:</pre>
+<p>Same failure, but the diagnostic line is gone. You know <em>that</em> <code>add(2, 3) == 5</code> was false, not what <code>add</code> actually returned. That difference is the whole reason the more specific assertion functions exist. Use <code>expect</code> for genuinely boolean questions (<em>is this even?</em>) and a more specific function whenever you are comparing two values.</p>
+
+<h3 id="ch08-4">8.4 The assertion family</h3>
+<p>You need five functions. Learn their names now; you will type them hundreds of times.</p>
+<table>
+<tr><th>Function</th><th>Use it when</th><th>On failure prints</th></tr>
+<tr><td><code>expect(ok)</code></td><td>the question is a bare boolean</td><td>nothing but the location</td></tr>
+<tr><td><code>expectEqual(expected, actual)</code></td><td>comparing numbers, booleans, enums, structs, arrays</td><td><code>expected 5, found -1</code></td></tr>
+<tr><td><code>expectEqualStrings(expected, actual)</code></td><td>comparing text</td><td>both strings, with the first difference marked</td></tr>
+<tr><td><code>expectEqualSlices(T, expected, actual)</code></td><td>comparing two slices of <code>T</code> element by element</td><td>a hex dump of both, with the index of the first difference</td></tr>
+<tr><td><code>expectError(error.X, result)</code></td><td>a call is supposed to fail a particular way</td><td>which error was expected and which appeared</td></tr>
+</table>
+<p>The argument order is always <em>expected first, actual second</em>. Nothing enforces this, but the diagnostic assumes it. Swap them and a failure reads <code>expected 3, found 4</code> when you meant the reverse, and you will spend a confused minute chasing the wrong value.</p>
+
+<p>Here is <code>expectEqualStrings</code>, with one passing and one failing test in the same file so you can see the diagnostic:</p>
+<p class="file">strings.zig</p>
+<pre><code>const std = @import("std");
+
+fn greeting(name: []const u8) []const u8 {
+    _ = name;
+    return "hello";
+}
+
+test "strings compare" {
+    try std.testing.expectEqualStrings("hello", greeting("x"));
+}
+
+test "strings fail" {
+    try std.testing.expectEqualStrings("hello, x", greeting("x"));
+}</code></pre>
+<pre class="term">1/2 strings.test.strings compare...OK
+2/2 strings.test.strings fail...
+====== expected this output: =========
+hello, x␃
+
+======== instead found this: =========
+hello␃
+
+======================================
+First difference occurs on line 1:
+expected:
+hello, x
+     ^ ('\x2c')
+found:
+hello
+     ^ (end of string)
+FAIL (TestExpectedEqual)
+&lt;zig&gt;/lib/std/testing.zig:682:9: in expectEqualStrings (test)
+        return error.TestExpectedEqual;
+        ^
+ch08/strings.zig:13:5: in test.strings fail (test)
+    try std.testing.expectEqualStrings("hello, x", greeting("x"));
+    ^
+1 passed; 0 skipped; 1 failed.
+error: the following test command failed with exit code 1:</pre>
+<p>The little <code>␃</code> marks the end of each string, so you can spot trailing spaces. The caret under the first difference is the most useful part: here it points at position 5, where the expected string has a comma and the actual one has already ended.</p>
+<p>Slices of anything else use <code>expectEqualSlices</code>, which takes the element type first:</p>
+<p class="file">slices.zig</p>
+<pre><code>const std = @import("std");
+
+fn firstThree(xs: []const u8) []const u8 {
+    return xs[0..3];
+}
+
+test "slices equal" {
+    const data = [_]u8{ 10, 20, 30, 40 };
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 10, 20, 30 }, firstThree(&amp;data));
+}
+
+test "slices fail" {
+    const data = [_]u8{ 10, 20, 30, 40 };
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 10, 20, 31 }, firstThree(&amp;data));
+}</code></pre>
+<pre class="term">1/2 slices.test.slices equal...OK
+2/2 slices.test.slices fail...slices differ. first difference occurs at index 2 (0x2)
+
+============ expected this output: =============  len: 3 (0x3)
+
+0A 14 1F                                          ␊..
+
+============= instead found this: ==============  len: 3 (0x3)
+
+0A 14 1E                                          ␊..
+
+================================================
+
+FAIL (TestExpectedEqual)
+&lt;zig&gt;/lib/std/testing.zig:379:5: in expectEqualSlices__anon_36360 (test)
+    return error.TestExpectedEqual;
+    ^
+ch08/slices.zig:14:5: in test.slices fail (test)
+    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 10, 20, 31 }, firstThree(&amp;data));
+    ^
+1 passed; 0 skipped; 1 failed.
+error: the following test command failed with exit code 1:</pre>
+<p>The dump is in hexadecimal, so <code>0A 14 1F</code> is 10, 20, 31. The message names the index of the first mismatch, which is usually all you need.</p>
+<p>Finally, <code>expectError</code>. It takes an error value and an <em>error union</em>, the kind of value a function returning <code>!T</code> gives you. It passes when the union holds exactly that error.</p>
+<p class="file">errors.zig</p>
+<pre><code>const std = @import("std");
+
+const ParseError = error{Empty};
+
+fn firstByte(s: []const u8) ParseError!u8 {
+    if (s.len == 0) return error.Empty;
+    return s[0];
+}
+
+test "empty input is an error" {
+    try std.testing.expectError(error.Empty, firstByte(""));
+}
+
+test "non-empty input works" {
+    try std.testing.expectEqual(@as(u8, 'a'), try firstByte("abc"));
+}</code></pre>
+<pre class="term">1/2 errors.test.empty input is an error...OK
+2/2 errors.test.non-empty input works...OK
+All 2 tests passed.</pre>
+<p>Note the second test: to compare the successful value you first have to unwrap it with <code>try</code>. <code>try firstByte("abc")</code> is a <code>u8</code>; <code>firstByte("abc")</code> on its own is a <code>ParseError!u8</code>, and <code>expectEqual</code> would refuse to compare a plain <code>u8</code> to that.</p>
+
+<h3 id="ch08-5">8.5 The <code>@as(T, literal)</code> convention</h3>
+<p>Look back at the tests above and you will see a pattern that looks fussy:</p>
+<pre><code>try std.testing.expectEqual(@as(i32, 8), double(4));</code></pre>
+<p>Why not just <code>expectEqual(8, double(4))</code>? In older Zig versions that did not compile: a bare <code>8</code> has the type <code>comptime_int</code>, and <code>expectEqual</code> insisted that the actual value be converted to the type of the expected one, which is impossible for a runtime <code>i32</code>. Every tutorial and most codebases, IRON LEDGER included, wrap the expected value in <code>@as(T, ...)</code> to give it a concrete type.</p>
+<p>In Zig 0.16 the function was changed to use <em>peer type resolution</em>, the same rule that decides the type of <code>if (c) 1 else x</code>. A bare literal and an <code>i32</code> now resolve to <code>i32</code>, so this compiles and passes:</p>
+<pre><code>const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+test "literal trap" {
+    try std.testing.expectEqual(5, add(2, 3));
+}</code></pre>
+<p>So why keep writing <code>@as</code>? Two reasons. First, you will read it everywhere, so you need to recognise it. Second, it still catches mistakes: if you write <code>expectEqual(300, small())</code> where <code>small</code> returns a <code>u8</code>, the compiler stops you with <code>type 'u8' cannot represent integer value '300'</code>, which is exactly the kind of bug a test is for. This book writes <code>@as(T, value)</code> in solutions so they match the style you will see in real code, and you may drop it in your own tests when the types are obvious.</p>
+<div class="warn"><strong>The real trap: <code>expectEqual</code> on strings.</strong> Two slices are "equal" to <code>expectEqual</code> when they point at the <em>same memory</em> and have the same length. It does not look at the bytes. So this fails even though both strings say <code>hi</code>:
+<pre><code>const std = @import("std");
+
+fn label(buf: []u8) []const u8 {
+    buf[0] = 'h';
+    buf[1] = 'i';
+    return buf[0..2];
+}
+
+test "expectEqual on strings compares pointers" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual("hi", label(&amp;buf));
+}
+
+test "expectEqualStrings compares contents" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", label(&amp;buf));
+}</code></pre>
+<pre class="term">1/2 slicetrap.test.expectEqual on strings compares pointers...expected slice ptr u8@10026955c, found u8@16fce9d70
+FAIL (TestExpectedEqual)
+&lt;zig&gt;/lib/std/testing.zig:133:25: in expectEqualInner__anon_36825 (test)
+                        return error.TestExpectedEqual;
+                        ^
+&lt;zig&gt;/lib/std/testing.zig:83:5: in expectEqual (test)
+    return expectEqualInner(T, expected, actual);
+    ^
+ch08/slicetrap.zig:11:5: in test.expectEqual on strings compares pointers (test)
+    try std.testing.expectEqual("hi", label(&amp;buf));
+    ^
+2/2 slicetrap.test.expectEqualStrings compares contents...OK
+1 passed; 0 skipped; 1 failed.
+error: the following test command failed with exit code 1:</pre>
+<p>The diagnostic says it plainly: <code>expected slice ptr ..., found ...</code>. Two different addresses. Whenever you compare text, use <code>expectEqualStrings</code>; whenever you compare slices, use <code>expectEqualSlices</code>. (Arrays, as opposed to slices, are compared element by element, which is why <code>expectEqual([3]u8{...}, arr)</code> works fine in later chapters.)</p></div>
+
+<h3 id="ch08-6">8.6 Naming tests and running a subset</h3>
+<p>Test names are free-form strings. Use them as sentences about behaviour, not as function names: <code>"empty input is an error"</code> tells the reader more than <code>"firstByte"</code>. A common convention is a prefix for the area, which makes the next feature useful.</p>
+<p class="file">filter.zig</p>
+<pre><code>const std = @import("std");
+
+test "math: addition" {
+    try std.testing.expect(1 + 1 == 2);
+}
+
+test "math: multiplication" {
+    try std.testing.expect(2 * 3 == 6);
+}
+
+test "text: length" {
+    try std.testing.expect("abc".len == 3);
+}</code></pre>
+<p><code>--test-filter</code> runs only the tests whose full name contains the given text:</p>
+<pre class="term">$ zig test filter.zig --test-filter math
+1/2 filter.test.math: addition...OK
+2/2 filter.test.math: multiplication...OK
+All 2 tests passed.</pre>
+<p>Notice the numbering changed to <code>1/2</code> and <code>2/2</code>: the third test was not compiled into this run at all. When a big file has one stubborn failure, filtering down to it makes the edit-run loop much faster.</p>
+
+<h3 id="ch08-7">8.7 Tests live next to the code</h3>
+<p>In Zig the normal place for a test is the same file as the function it exercises, usually right below it or gathered at the bottom. Nothing stops you from making a separate <code>_test.zig</code> file, but you then have to <code>@import</code> the code under test and mark everything <code>pub</code>, and you lose the ability to test private helpers. Same-file tests can see everything.</p>
+<p>Test blocks are only compiled by <code>zig test</code>. When you <code>zig run</code> or <code>zig build</code> the same file, they vanish. There is no runtime cost and no separate build configuration.</p>
+<p>One consequence of Zig's laziness deserves a callout. The compiler only analyses functions that something actually calls. A function nobody references can contain nonsense and still build:</p>
+<p class="file">refall_ok.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn unusedHelper(x: u32) u32 {
+    return x + "oops"; // never called, so never checked
+}
+
+test "something else" {
+    try std.testing.expect(true);
+}</code></pre>
+<pre class="term">1/1 refall_ok.test.something else...OK
+All 1 tests passed.</pre>
+<p>That is convenient while sketching, and dangerous in a library: a helper can rot for months without anyone noticing. The fix is a nameless test that <em>references every declaration</em> in the file:</p>
+<p class="file">refall.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn unusedHelper(x: u32) u32 {
+    return x + "oops"; // never called, so normally never checked
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}</code></pre>
+<pre class="term">refall.zig:4:14: error: incompatible types: 'u32' and '*const [4:0]u8'
+    return x + "oops"; // never called, so normally never checked
+           ~~^~~~~~~~
+refall.zig:4:12: note: type 'u32' here
+    return x + "oops"; // never called, so normally never checked
+           ^
+refall.zig:4:16: note: type '*const [4:0]u8' here
+    return x + "oops"; // never called, so normally never checked
+               ^~~~~~
+referenced by:
+    refAllDecls__anon_36346: &lt;zig&gt;/lib/std/testing.zig:1216:14
+    test_0: refall.zig:8:28</pre>
+<p><code>@This()</code> means "the type of the thing I am inside", which at file scope is the file itself (files are structs, as <a href="#ch30">Chapter 30</a> explains). <code>refAllDecls</code> touches every public declaration so the compiler has to type-check them. IRON LEDGER has exactly this test in its root file, and every exercise solution in this book ends with one when it has <code>pub</code> functions. A test with no name shows up in the output as <code>test_0</code>.</p>
+
+<h3 id="ch08-8">8.8 A preview: the testing allocator</h3>
+<p>You have not met allocators yet; they arrive in <a href="#ch19">Chapter 19</a>. But you will see <code>std.testing.allocator</code> in almost every test from Part 2 onward, so here is what it does in one sentence: it is an allocator that <em>fails the test if you forget to free something</em>.</p>
+<p class="file">leak.zig</p>
+<pre><code>const std = @import("std");
+
+test "leak is caught" {
+    const a = std.testing.allocator;
+    const buf = try a.alloc(u8, 16);
+    _ = buf; // forgot: a.free(buf)
+}</code></pre>
+<pre class="term">1/1 leak.test.leak is caught...OK
+[DebugAllocator] (err): memory address 0x104cc0000 leaked: 
+ch08/leak.zig:5:28: in test.leak is caught (test)
+    const buf = try a.alloc(u8, 16);
+                           ^
+&lt;zig&gt;/lib/compiler/test_runner.zig:291:25: in mainTerminal (test)
+        if (test_fn.func()) |_| {
+                        ^
+&lt;zig&gt;/lib/compiler/test_runner.zig:73:28: in main (test)
+        return mainTerminal(init);
+                           ^
+&lt;zig&gt;/lib/std/start.zig:699:88: in callMain (test)
+    if (fn_info.params[0].type.? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                       ^
+???:?:?: in start (/usr/lib/dyld)
+
+All 1 tests passed.
+1 errors were logged.
+1 tests leaked memory.
+error: the following test command failed with exit code 1:</pre>
+<p>The test body passed, and yet the run failed, with a trace pointing at the exact line that allocated the memory nobody freed. This is why IRON LEDGER tests write <code>defer gs.deinit()</code> on the line after creating a game state. When you get to Part 2, remember that the testing allocator is on your side.</p>
+
+<h3 id="ch08-9">8.9 The rhythm from here on</h3>
+<p>Every exercise from this chapter forward follows the same loop:</p>
+<ol>
+<li>Open the starter file. Read the tests at the bottom first; they are the specification.</li>
+<li>Replace each <code>// TODO</code> with code. Remove the <code>_ = x;</code> lines that were only there to keep the starter compiling.</li>
+<li>Run <code>zig test filename.zig</code>.</li>
+<li>Read the first failure. Find the line with your file name. Fix. Repeat.</li>
+</ol>
+<p>Compile errors come before test failures. If you see <code>error:</code> with a file and line but no <code>1/3</code> counter, the file did not compile and no test ran yet. Unused variables, wrong types, and missing <code>try</code> are the usual suspects at this stage.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The dice module keeps its tests directly under the type they exercise. This one checks that drawing a thousand numbers from one random stream does not disturb another, which is what makes the game's replays reproducible (<a href="#ch49">Chapter 49</a>):
+<pre><code>// src/sim/rng.zig
+test "streams are independent and deterministic" {
+    var a = Rng.init(42);
+    var b = Rng.init(42);
+
+    // Draw heavily from one stream in `a` only; another stream must still
+    // match the untouched twin exactly.
+    for (0..1000) |_| _ = a.roll2d6(.maintenance);
+    for (0..10) |_| {
+        try std.testing.expectEqual(b.roll2d6(.battle), a.roll2d6(.battle));
+    }
+}
+
+test "2d6 stays in range" {
+    var r = Rng.init(7);
+    for (0..1000) |_| {
+        const v = r.roll2d6(.events);
+        try std.testing.expect(v &gt;= 2 and v &lt;= 12);
+    }
+}</code></pre>
+<p>Note the choice of assertion in each: <code>expectEqual</code> where two values must match (a failure would print both rolls), <code>expect</code> for a range check. The root file <code>src/root.zig</code> ends with the nameless <code>refAllDecls(@This())</code> test, so that the 31,000 lines are all type-checked on every <code>zig build test</code>, even the paths no test walks.</p></div>
+
+<h3 id="ch08-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 8.1 · Your first test file <span class="level">warm-up</span></h4>
+  <p>Fill in <code>max</code> and <code>isEven</code> so that the tests pass. Then deliberately break <code>max</code> (return <code>a</code> always) and read the failure output before fixing it again. Name the file: <code>exercises/08-testing/ex1_first_tests.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 08, exercise 1: your first test file.
+//! Run with:  zig test ex1_first_tests.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Returns the larger of two integers.
+fn max(a: i32, b: i32) i32 {
+    return if (a &gt; b) a else b;
+}
+
+/// Returns true when n is even.
+fn isEven(n: i32) bool {
+    return @rem(n, 2) == 0;
+}
+
+test "max picks the larger" {
+    try std.testing.expectEqual(@as(i32, 7), max(3, 7));
+    try std.testing.expectEqual(@as(i32, 7), max(7, 3));
+    try std.testing.expectEqual(@as(i32, -1), max(-1, -5));
+}
+
+test "isEven" {
+    try std.testing.expect(isEven(0));
+    try std.testing.expect(isEven(10));
+    try std.testing.expect(!isEven(7));
+    try std.testing.expect(isEven(-4));
+}</code></pre>
+  <p><code>@rem</code> is used instead of <code>%</code> because <code>%</code> on signed integers is a compile error when the operand might be negative (<a href="#ch04">Chapter 4</a>). <code>@rem(-4, 2)</code> is 0, so the negative case passes.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 8.2 · Pick the right assertion <span class="level">warm-up</span></h4>
+  <p>Every test in the starter uses plain <code>expect</code>. Replace each one with the most specific assertion that fits, so a failure would print a useful message. The tests must still pass. Name the file: <code>exercises/08-testing/ex2_pick_assertion.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 08, exercise 2: pick the right assertion.
+//! Run with:  zig test ex2_pick_assertion.zig
+//! Goal: replace every `expect(...)` with the most specific assertion that fits,
+//! so that a failure prints a useful message. All tests must still pass.
+const std = @import("std");
+
+const ParseError = error{ Empty, NotADigit };
+
+fn digit(s: []const u8) ParseError!u8 {
+    if (s.len == 0) return error.Empty;
+    const c = s[0];
+    if (c &lt; '0' or c &gt; '9') return error.NotADigit;
+    return c - '0';
+}
+
+fn shout(buf: []u8, word: []const u8) []const u8 {
+    for (word, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
+    return buf[0..word.len];
+}
+
+fn firstTwo(xs: []const u32) []const u32 {
+    return xs[0..2];
+}
+
+test "digit parses a single digit" {
+    try std.testing.expectEqual(@as(u8, 7), try digit("7"));
+}
+
+test "digit rejects empty input" {
+    try std.testing.expectError(error.Empty, digit(""));
+}
+
+test "digit rejects letters" {
+    try std.testing.expectError(error.NotADigit, digit("x"));
+}
+
+test "shout upper-cases" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("LANCE", shout(&amp;buf, "lance"));
+}
+
+test "firstTwo slices" {
+    const data = [_]u32{ 5, 6, 7 };
+    try std.testing.expectEqualSlices(u32, &amp;[_]u32{ 5, 6 }, firstTwo(&amp;data));
+}</code></pre>
+  <p>The starter's <code>expect(digit("") == error.Empty)</code> works but says nothing useful on failure. <code>expectError</code> prints which error was actually returned. Likewise <code>expectEqualStrings</code> shows both strings with a caret at the first difference, where <code>expect(std.mem.eql(...))</code> only says "false".</p></details>
+</div>
+<div class="exercise"><h4>Exercise 8.3 · Read a failure, fix the bug <span class="level">practice</span></h4>
+  <p>This time the tests are right and the three functions are wrong. Run the file, read the first failure, find the bug, fix it, run again. Do not edit the tests. Name the file: <code>exercises/08-testing/ex3_fix_the_bug.zig</code>.</p>
+  <p>The starter fails like this (trimmed):</p>
+<pre class="term">1/3 ex3_fix_the_bug.test.triangle numbers...expected 1, found 0
+FAIL (TestExpectedEqual)
+&lt;zig&gt;/lib/std/testing.zig:118:17: in expectEqualInner__anon_36468 (test)
+                return error.TestExpectedEqual;
+                ^
+&lt;zig&gt;/lib/std/testing.zig:83:5: in expectEqual (test)
+    return expectEqualInner(T, expected, actual);
+    ^
+ch08/ex08/ex3_fix_the_bug.zig:34:5: in test.triangle numbers (test)
+    try std.testing.expectEqual(@as(u32, 1), triangle(1));
+    ^
+2/3 ex3_fix_the_bug.test.countChar...expected 3, found 0</pre>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 08, exercise 3: read a failure, fix the bug.
+//! Run with:  zig test ex3_fix_the_bug.zig
+//! Goal: the tests are correct; the functions have bugs. Read the failure output,
+//! find each bug and fix it. Do not edit the tests.
+const std = @import("std");
+
+/// Sum of the first n positive integers: 1 + 2 + ... + n.
+fn triangle(n: u32) u32 {
+    var total: u32 = 0;
+    var i: u32 = 1;
+    while (i &lt;= n) : (i += 1) total += i;
+    return total;
+}
+
+/// Number of characters in s that equal c.
+fn countChar(s: []const u8, c: u8) usize {
+    var n: usize = 0;
+    for (s) |ch| {
+        if (ch == c) n += 1;
+    }
+    return n;
+}
+
+/// Clamp x into [lo, hi].
+fn clamp(x: i32, lo: i32, hi: i32) i32 {
+    if (x &lt; lo) return lo;
+    if (x &gt; hi) return hi;
+    return x;
+}
+
+test "triangle numbers" {
+    try std.testing.expectEqual(@as(u32, 0), triangle(0));
+    try std.testing.expectEqual(@as(u32, 1), triangle(1));
+    try std.testing.expectEqual(@as(u32, 10), triangle(4));
+    try std.testing.expectEqual(@as(u32, 5050), triangle(100));
+}
+
+test "countChar" {
+    try std.testing.expectEqual(@as(usize, 3), countChar("banana", 'a'));
+    try std.testing.expectEqual(@as(usize, 0), countChar("banana", 'z'));
+    try std.testing.expectEqual(@as(usize, 0), countChar("", 'a'));
+}
+
+test "clamp" {
+    try std.testing.expectEqual(@as(i32, 5), clamp(5, 0, 10));
+    try std.testing.expectEqual(@as(i32, 0), clamp(-3, 0, 10));
+    try std.testing.expectEqual(@as(i32, 10), clamp(42, 0, 10));
+}</code></pre>
+  <p>Three classic bugs: an off-by-one in the loop condition (<code>&lt;</code> should be <code>&lt;=</code>), a stray <code>break</code> that stops the loop after the first character, and swapped return values in <code>clamp</code>. The diagnostic <code>expected 1, found 0</code> for <code>triangle(1)</code> is the hint for the first one: the loop never ran.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 8.4 · Write the tests yourself <span class="level">practice</span></h4>
+  <p>The functions are given and correct. Write at least three tests for each, including one edge case each (zero, empty string, negative numbers). Give the tests sentence-like names. Finish with a nameless <code>refAllDecls</code> test. Name the file: <code>exercises/08-testing/ex4_write_tests.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 08, exercise 4: write the tests yourself.
+//! Run with:  zig test ex4_write_tests.zig
+//! Goal: the functions are given. Write at least three tests for each, including
+//! one edge case (zero, empty, negative). Finish with a refAllDecls test.
+const std = @import("std");
+
+pub fn absDiff(a: i32, b: i32) u32 {
+    return if (a &gt; b) @intCast(a - b) else @intCast(b - a);
+}
+
+pub fn isPalindrome(s: []const u8) bool {
+    if (s.len &lt; 2) return true;
+    var i: usize = 0;
+    var j: usize = s.len - 1;
+    while (i &lt; j) : ({
+        i += 1;
+        j -= 1;
+    }) {
+        if (s[i] != s[j]) return false;
+    }
+    return true;
+}
+
+test "absDiff: ordinary values" {
+    try std.testing.expectEqual(@as(u32, 4), absDiff(7, 3));
+    try std.testing.expectEqual(@as(u32, 4), absDiff(3, 7));
+}
+
+test "absDiff: negatives and zero" {
+    try std.testing.expectEqual(@as(u32, 0), absDiff(5, 5));
+    try std.testing.expectEqual(@as(u32, 10), absDiff(-5, 5));
+    try std.testing.expectEqual(@as(u32, 2), absDiff(-7, -5));
+}
+
+test "isPalindrome: true cases" {
+    try std.testing.expect(isPalindrome("racecar"));
+    try std.testing.expect(isPalindrome("abba"));
+    try std.testing.expect(isPalindrome("x"));
+}
+
+test "isPalindrome: empty string is a palindrome" {
+    try std.testing.expect(isPalindrome(""));
+}
+
+test "isPalindrome: false cases" {
+    try std.testing.expect(!isPalindrome("lance"));
+    try std.testing.expect(!isPalindrome("ab"));
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}</code></pre>
+  <p>Edge cases are where bugs hide. <code>isPalindrome("")</code> is worth its own test because <code>s.len - 1</code> would underflow on an empty slice if the early return were missing; a test documents that the function handles it.</p></details>
+</div>
+
+<h3 id="ch08-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What <em>is</em> a test failure, in language terms? <details class="answer"><summary>Answer</summary>An error returned from the test block. The assertion functions return an error on failure, and <code>try</code> propagates it out of the test.</details></li>
+  <li>Why must every assertion line begin with <code>try</code>? <details class="answer"><summary>Answer</summary>Because the assertion functions return error unions, and Zig will not let you silently discard an error. <code>try</code> unwraps on success and returns the error on failure.</details></li>
+  <li>You see <code>expected 3, found 4</code> but you know the function should return 3. What went wrong? <details class="answer"><summary>Answer</summary>Most likely the arguments are swapped: the function returned 3 (printed as "expected") and the literal 4 was in the actual position. Expected goes first.</details></li>
+  <li>Why does <code>expectEqual("hi", someSlice)</code> fail even when <code>someSlice</code> holds <code>hi</code>? <details class="answer"><summary>Answer</summary>For slices, <code>expectEqual</code> compares the pointer and the length, not the contents. Use <code>expectEqualStrings</code> for text or <code>expectEqualSlices</code> for other element types.</details></li>
+  <li>How do you run only the tests whose names contain "parse"? <details class="answer"><summary>Answer</summary><code>zig test file.zig --test-filter parse</code>.</details></li>
+  <li>What does <code>test { std.testing.refAllDecls(@This()); }</code> catch that other tests do not? <details class="answer"><summary>Answer</summary>Type errors in declarations that nothing calls. Zig only analyses code that is referenced; this test references every public declaration in the file so all of it gets checked.</details></li>
+  <li>The output says <code>All 1 tests passed.</code> and then <code>1 tests leaked memory.</code> and the command fails. Which allocator was in use? <details class="answer"><summary>Answer</summary><code>std.testing.allocator</code>. It tracks every allocation and reports the ones never freed, failing the run even though the test body returned normally.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>test "name" { ... }</code> blocks live next to the code they check and run with <code>zig test file.zig</code>.</li>
+<li>A failure is an error returned from the block; every assertion needs <code>try</code>.</li>
+<li>Use <code>expectEqual</code>, <code>expectEqualStrings</code>, <code>expectEqualSlices</code> and <code>expectError</code> over plain <code>expect</code> so failures print what they saw. Expected value first.</li>
+<li><code>@as(T, literal)</code> gives the expected value a concrete type. Zig 0.16 no longer requires it for plain integers, but you will see it everywhere.</li>
+<li><code>expectEqual</code> on slices compares addresses, not bytes.</li>
+<li>Read a failure by finding the diagnostic line and the line with your file name; skip the <code>std/testing.zig</code> frames.</li>
+<li><code>--test-filter text</code> runs a subset. <code>refAllDecls(@This())</code> forces every declaration to be type-checked. <code>std.testing.allocator</code> fails tests that leak.</li>
+</ul></div>
+</section>

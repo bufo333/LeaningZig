@@ -1,0 +1,671 @@
+<section id="ch22">
+<h2>22. Hash maps</h2>
+<p class="goals"><strong>In this chapter</strong> you will use Zig's hash maps to look things up by key: <code>AutoHashMapUnmanaged</code> for integers and structs, <code>StringHashMapUnmanaged</code> for strings, and the <code>ArrayHashMap</code> family that remembers insertion order. You will learn <code>put</code>, <code>get</code>, <code>getPtr</code>, <code>getOrPut</code>, <code>remove</code> and the iterators, why string keys must outlive the map, which key types work automatically and which do not, and why IRON LEDGER keeps every entity in an ordered map.</p>
+
+<h3 id="ch22-1">22.1 Lookup by key</h3>
+<p>An <code>ArrayList</code> answers "what is the fifth element". A hash map answers "what is the value for <em>this key</em>", where the key can be a number, a string or a small struct. Python calls it a <code>dict</code>, JavaScript a <code>Map</code> or object, C++ an <code>unordered_map</code>. Internally the map computes a hash of the key, uses it to pick a slot in a table, and stores the key and value there. Lookups take about the same time whether the map holds ten entries or ten million.</p>
+<p>Like <code>ArrayList</code>, Zig's maps are unmanaged in 0.16. They start as <code>.empty</code>, every call that might allocate takes the allocator, and <code>deinit(gpa)</code> frees the table. The map stores its keys and values by value, in its own table. What it does <em>not</em> own is anything those values point to, which is the whole subject of 22.5.</p>
+
+<h3 id="ch22-2">22.2 AutoHashMapUnmanaged: integers in, values out</h3>
+<p class="file">a_auto.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    // key: unit id, value: tonnage
+    var tons: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer tons.deinit(gpa);
+
+    try tons.put(gpa, 7, 100); // Atlas
+    try tons.put(gpa, 3, 20); // Locust
+    try tons.put(gpa, 12, 75); // Marauder
+
+    std.debug.print("count: {d}\n", .{tons.count()});
+    std.debug.print("unit 7 weighs {?d}\n", .{tons.get(7)});
+    std.debug.print("unit 99 weighs {?d}\n", .{tons.get(99)});
+    std.debug.print("has 3? {}  has 4? {}\n", .{ tons.contains(3), tons.contains(4) });
+
+    try tons.put(gpa, 3, 25); // put on an existing key overwrites
+    std.debug.print("unit 3 now {?d}\n", .{tons.get(3)});
+
+    const removed = tons.remove(12);
+    const removed_again = tons.remove(12);
+    std.debug.print("removed: {} then {}, count {d}\n", .{ removed, removed_again, tons.count() });
+}</code></pre>
+<pre class="term">count: 3
+unit 7 weighs 100
+unit 99 weighs null
+has 3? true  has 4? false
+unit 3 now 25
+removed: true then false, count 2</pre>
+<p>The name <code>AutoHashMapUnmanaged(K, V)</code> means "a hash map whose hashing and equality for <code>K</code> are worked out automatically". The five calls you will use most:</p>
+<ul>
+<li><code>put(gpa, key, value)</code> inserts, or overwrites if the key is already there. It takes the allocator because the table may need to grow.</li>
+<li><code>get(key)</code> returns <code>?V</code>: a <em>copy</em> of the value, or <code>null</code>. Because it is an optional you print it with <code>{?d}</code> and unwrap it with <code>if</code>, <code>orelse</code> or <code>.?</code>, as in <a href="#ch15">Chapter 15</a>.</li>
+<li><code>contains(key)</code> is a bool, for when you do not need the value.</li>
+<li><code>remove(key)</code> deletes the entry and returns whether there was one. It never allocates.</li>
+<li><code>count()</code> is the number of entries.</li>
+</ul>
+<p>The map does not preserve any order, and you must not assume one. We will make this visible in 22.4.</p>
+
+<h3 id="ch22-3">22.3 getPtr and getOrPut: changing what is inside</h3>
+<p>Because <code>get</code> hands back a copy, changing that copy does nothing to the map. To modify a stored value in place you ask for a pointer.</p>
+<p class="file">b_getptr.zig</p>
+<pre><code>const std = @import("std");
+
+const Unit = struct { name: []const u8, armor: u32 };
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var units: std.AutoHashMapUnmanaged(u32, Unit) = .empty;
+    defer units.deinit(gpa);
+    try units.put(gpa, 1, .{ .name = "Atlas", .armor = 300 });
+
+    // get() returns a COPY of the value.
+    if (units.get(1)) |u| {
+        var copy = u;
+        copy.armor -= 50;
+    }
+    std.debug.print("after get:    {d}\n", .{units.get(1).?.armor});
+
+    // getPtr() returns a pointer to the value inside the map.
+    if (units.getPtr(1)) |u| u.armor -= 50;
+    std.debug.print("after getPtr: {d}\n", .{units.get(1).?.armor});
+
+    // getOrPut: one lookup, insert if missing.
+    const gop = try units.getOrPut(gpa, 2);
+    if (!gop.found_existing) gop.value_ptr.* = .{ .name = "Locust", .armor = 64 };
+    gop.value_ptr.armor += 1;
+    std.debug.print("unit 2: {s} {d} (existed before? {})\n", .{ gop.value_ptr.name, gop.value_ptr.armor, gop.found_existing });
+
+    const again = try units.getOrPut(gpa, 2);
+    std.debug.print("second getOrPut found_existing = {}\n", .{again.found_existing});
+}</code></pre>
+<pre class="term">after get:    300
+after getPtr: 250
+unit 2: Locust 65 (existed before? false)
+second getOrPut found_existing = true</pre>
+<p><code>getPtr(key)</code> returns <code>?*V</code>, a pointer into the table. Write through it and the map changes. The same warning as for lists applies: the pointer is valid only until the next <code>put</code> or <code>getOrPut</code>, because those can rehash and move every entry.</p>
+<p><code>getOrPut(gpa, key)</code> is the workhorse for "insert if missing, then update". It does one hash lookup and returns a small struct with <code>found_existing: bool</code>, <code>key_ptr</code> and <code>value_ptr</code>. If the key was not there, the slot has been reserved but <strong>the value is undefined</strong>: you must write to <code>value_ptr.*</code> before reading it, which is what the <code>if (!gop.found_existing)</code> line does. Compare the alternative, <code>if (map.get(k)) |v| put(k, v+1) else put(k, 1)</code>: two lookups and twice the code. Every counter, tally and index you build will use <code>getOrPut</code>.</p>
+
+<h3 id="ch22-4">22.4 Iterating, and why order matters</h3>
+<p>There are three iterators, and one important difference between the two map families. Let's put the same five people into an <code>AutoHashMapUnmanaged</code> and an <code>AutoArrayHashMapUnmanaged</code>.</p>
+<p class="file">c_iter.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var hashed: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer hashed.deinit(gpa);
+    var ordered: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .empty;
+    defer ordered.deinit(gpa);
+
+    const names = [_][]const u8{ "Kell", "Natasha", "Grayson", "Morgan", "Jaime" };
+    for (names, 0..) |n, i| {
+        const id: u32 = @intCast(100 + i * 37);
+        try hashed.put(gpa, id, n);
+        try ordered.put(gpa, id, n);
+    }
+
+    std.debug.print("AutoHashMap iterator:      ", .{});
+    var it = hashed.iterator();
+    while (it.next()) |e| std.debug.print("{d}={s} ", .{ e.key_ptr.*, e.value_ptr.* });
+    std.debug.print("\n", .{});
+
+    std.debug.print("AutoArrayHashMap iterator: ", .{});
+    var oit = ordered.iterator();
+    while (oit.next()) |e| std.debug.print("{d}={s} ", .{ e.key_ptr.*, e.value_ptr.* });
+    std.debug.print("\n", .{});
+
+    std.debug.print("keys() slice:              {any}\n", .{ordered.keys()});
+    std.debug.print("keyIterator on hashed:     ", .{});
+    var kit = hashed.keyIterator();
+    while (kit.next()) |k| std.debug.print("{d} ", .{k.*});
+    std.debug.print("\nvalueIterator on hashed:   ", .{});
+    var vit = hashed.valueIterator();
+    while (vit.next()) |v| std.debug.print("{s} ", .{v.*});
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">AutoHashMap iterator:      211=Morgan 174=Grayson 248=Jaime 137=Natasha 100=Kell 
+AutoArrayHashMap iterator: 100=Kell 137=Natasha 174=Grayson 211=Morgan 248=Jaime 
+keys() slice:              { 100, 137, 174, 211, 248 }
+keyIterator on hashed:     211 174 248 137 100 
+valueIterator on hashed:   Morgan Grayson Jaime Natasha Kell </pre>
+<p><code>iterator()</code> yields entries with <code>key_ptr</code> and <code>value_ptr</code> (pointers, so dereference with <code>.*</code> or write through them). <code>keyIterator()</code> and <code>valueIterator()</code> yield pointers to just one side. All three work the same on both map types.</p>
+<p>Now look at the order. The plain hash map walked the entries in the order of their hash slots, which looks random and <em>will change</em> when the table grows or when the standard library changes its hash function. The array hash map walked them in the order we inserted them. That is its defining feature: it keeps keys and values in two dense arrays, with a hash index on the side pointing into them. Because of that it also offers <code>keys()</code> and <code>values()</code> as plain slices, which you can loop over directly, sort, or hand to any function that takes a slice.</p>
+<div class="note">Use <code>AutoArrayHashMapUnmanaged</code> (or the string flavour, <code>StringArrayHashMapUnmanaged</code>) whenever the order of iteration can affect output, and reach for the plain <code>AutoHashMapUnmanaged</code> only when you know you will never iterate, or genuinely do not care. The ordered map costs a little more memory and its <code>remove</code> is slower, but "a program whose output depends on the hash function" is a bug factory. This is not a stylistic preference in IRON LEDGER; the whole determinism story of the game rests on it.</div>
+<p>Removing from an array hash map comes in two flavours that mirror the list: <code>swapRemove(key)</code> is fast and moves the last entry into the hole; <code>orderedRemove(key)</code> shifts everything down and keeps the order. There is also <code>orderedRemoveAt(index)</code> when you already have the position, for instance while walking <code>values()</code>.</p>
+
+<h3 id="ch22-5">22.5 String keys and who owns them</h3>
+<p><code>StringHashMapUnmanaged(V)</code> is a map whose keys are <code>[]const u8</code>, hashed by content. The map stores the <em>slice</em> (a pointer and a length), not a copy of the characters. If the bytes the slice points at change or disappear, the map's key silently changes or becomes garbage, and lookups start failing in ways that are very hard to debug.</p>
+<p class="file">d_strkeys.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var stock: std.StringHashMapUnmanaged(u32) = .empty;
+    defer stock.deinit(gpa);
+
+    // Literal keys live in the binary forever: safe to use directly.
+    try stock.put(gpa, "medium laser", 4);
+    try stock.put(gpa, "LRM-10 ammo", 2);
+
+    // Keys built at runtime must outlive the map. This one is on the stack...
+    var buf: [32]u8 = undefined;
+    const temp = try std.fmt.bufPrint(&amp;buf, "{s} {d}", .{ "SRM", 6 });
+    // ...so we copy it to the heap and let the MAP own the copy.
+    try stock.put(gpa, try gpa.dupe(u8, temp), 9);
+    @memset(&amp;buf, 'x'); // scribble on the stack buffer; the map does not care
+
+    std.debug.print("SRM 6: {?d}\n", .{stock.get("SRM 6")});
+    std.debug.print("medium laser: {?d}\n", .{stock.get("medium laser")});
+
+    // Free the keys we duped before the map goes away.
+    var kit = stock.keyIterator();
+    while (kit.next()) |k| {
+        if (std.mem.startsWith(u8, k.*, "SRM")) gpa.free(k.*);
+    }
+}</code></pre>
+<pre class="term">SRM 6: 9
+medium laser: 4</pre>
+<p>The literal keys are fine: string literals live in the executable for the whole run. The third key was built into a stack buffer with <code>bufPrint</code>, and that buffer is reused and overwritten a few lines later. Had we stored <code>temp</code> directly, the key would now read <code>"xxxxx"</code>. Instead we store <code>gpa.dupe(u8, temp)</code>, a heap copy that lives until we free it, and since the map is now the only thing that knows about that copy, we free it by walking the keys before <code>deinit</code>.</p>
+<div class="warn"><strong>Rule.</strong> A string key must outlive the map. Three safe sources: a string literal; a slice into a buffer that you know lives longer than the map (a file's contents you read once, for example); or a copy made with <code>allocator.dupe</code> that you free when the entry goes. When in doubt, dupe, and use an arena so the frees take care of themselves.</div>
+<p>The same rule applies to string <em>values</em>, and to any pointer or slice inside a value struct. The map copies the struct; it does not copy what the struct points at.</p>
+
+<h3 id="ch22-6">22.6 Which keys work automatically</h3>
+<p>"Auto" hashing looks at the bytes of the key. That works for integers, enums, bools and for structs and arrays built from those, so a coordinate struct is a fine key:</p>
+<p class="file">e_structkey.zig</p>
+<pre><code>const std = @import("std");
+
+const Hex = struct { q: i16, r: i16 };
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var terrain: std.AutoHashMapUnmanaged(Hex, []const u8) = .empty;
+    defer terrain.deinit(gpa);
+
+    try terrain.put(gpa, .{ .q = 0, .r = 0 }, "clear");
+    try terrain.put(gpa, .{ .q = 1, .r = -1 }, "woods");
+
+    std.debug.print("{?s} {?s} {?s}\n", .{
+        terrain.get(.{ .q = 1, .r = -1 }),
+        terrain.get(.{ .q = 0, .r = 0 }),
+        terrain.get(.{ .q = 5, .r = 5 }),
+    });
+}</code></pre>
+<pre class="term">woods clear null</pre>
+<p>What it refuses is a key that contains a slice. Hashing a slice by its bytes would hash the pointer and length, not the contents, so two equal strings at different addresses would be different keys. Rather than guess, the compiler stops you:</p>
+<p class="file">e_slicekey.zig</p>
+<pre><code>const std = @import("std");
+pub fn main() !void {
+    var m: std.AutoHashMapUnmanaged([]const u8, u32) = .empty;
+    try m.put(std.heap.page_allocator, "atlas", 100);
+}</code></pre>
+<pre class="term">&lt;zig&gt;/std/hash_map.zig:15:13: error: std.hash.autoHash does not allow slices here ([]const u8) because the intent is unclear. Consider using std.StringHashMap for hashing the contents of []const u8. Alternatively, consider using std.hash.autoHashStrat or providing your own hash function instead.
+            @compileError("std.hash.autoHash does not allow slices here (" ++
+            ^~~~~~~~~~~~~
+&lt;zig&gt;/std/hash_map.zig:56:39: note: called at comptime here
+        pub const hash = getAutoHashFn(K, @This());</pre>
+<p>The message tells you the fix: for <code>[]const u8</code> keys use <code>StringHashMapUnmanaged</code>. For anything more exotic (a struct with a string inside it, case-insensitive matching, floats) you write your own context type with <code>hash</code> and <code>eql</code> functions and use <code>std.HashMapUnmanaged(K, V, Context, load_percentage)</code> directly. You will rarely need that; in IRON LEDGER, every key is either an integer-backed enum ID or a string.</p>
+
+<h3 id="ch22-7">22.7 An ID to entity registry</h3>
+<p>Here is the pattern that the whole game is built on: entities live in an ordered map keyed by a typed ID (a non-exhaustive enum, from <a href="#ch13">Chapter 13</a>), and every other part of the program refers to them by ID, never by pointer.</p>
+<p class="file">f_registry.zig</p>
+<pre><code>const std = @import("std");
+
+const UnitId = enum(u32) { _ };
+const Unit = struct { name: []const u8, armor: u32, destroyed: bool = false };
+
+const Hangar = struct {
+    units: std.AutoArrayHashMapUnmanaged(UnitId, Unit) = .empty,
+    next_id: u32 = 1,
+
+    fn deinit(self: *Hangar, gpa: std.mem.Allocator) void {
+        self.units.deinit(gpa);
+    }
+
+    fn add(self: *Hangar, gpa: std.mem.Allocator, name: []const u8, armor: u32) !UnitId {
+        const id: UnitId = @enumFromInt(self.next_id);
+        self.next_id += 1;
+        try self.units.putNoClobber(gpa, id, .{ .name = name, .armor = armor });
+        return id;
+    }
+
+    fn unit(self: *Hangar, id: UnitId) ?*Unit {
+        return self.units.getPtr(id);
+    }
+
+    fn scrap(self: *Hangar, id: UnitId) bool {
+        return self.units.orderedRemove(id);
+    }
+};
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var h: Hangar = .{};
+    defer h.deinit(gpa);
+
+    const atlas = try h.add(gpa, "Atlas", 300);
+    const locust = try h.add(gpa, "Locust", 64);
+    _ = try h.add(gpa, "Marauder", 230);
+
+    if (h.unit(locust)) |u| u.armor = 0;
+    if (h.unit(locust)) |u| u.destroyed = u.armor == 0;
+    std.debug.print("scrapped locust? {}\n", .{h.scrap(locust)});
+    std.debug.print("scrapped again?  {}\n", .{h.scrap(locust)});
+    std.debug.print("atlas still there? {}\n", .{h.unit(atlas) != null});
+
+    // Deterministic order: insertion order, minus what was removed.
+    for (h.units.keys(), h.units.values()) |id, u| {
+        std.debug.print("  #{d} {s: &lt;9} armor {d}\n", .{ @intFromEnum(id), u.name, u.armor });
+    }
+}</code></pre>
+<pre class="term">scrapped locust? true
+scrapped again?  false
+atlas still there? true
+  #1 Atlas     armor 300
+  #3 Marauder  armor 230</pre>
+<p>Why IDs rather than pointers? Because the map can move its entries. Store a <code>*Unit</code> somewhere and it is stale after the next <code>add</code>. Store a <code>UnitId</code> and you can always ask the hangar for a fresh pointer with <code>unit(id)</code>, use it briefly, and let it go. The <code>?*Unit</code> return type also handles the case where the unit has been scrapped: you get <code>null</code>, not a crash. <code>putNoClobber</code> is <code>put</code> that asserts the key is new, which documents the intent that IDs are never reused.</p>
+<p>The final loop uses <code>keys()</code> and <code>values()</code> together in one <code>for</code>: both are slices of the same length, so the multi-object <code>for</code> from <a href="#ch06">Chapter 6</a> walks them in lockstep. That only works because this is an <em>array</em> hash map.</p>
+
+<h3 id="ch22-8">22.8 Method reference</h3>
+<table>
+<tr><th>Call</th><th>Returns</th><th>Notes</th></tr>
+<tr><td><code>put(gpa, k, v)</code></td><td><code>!void</code></td><td>Insert or overwrite.</td></tr>
+<tr><td><code>putNoClobber(gpa, k, v)</code></td><td><code>!void</code></td><td>Insert; asserts <code>k</code> is new.</td></tr>
+<tr><td><code>get(k)</code></td><td><code>?V</code></td><td>A copy.</td></tr>
+<tr><td><code>getPtr(k)</code></td><td><code>?*V</code></td><td>Valid until the next insert.</td></tr>
+<tr><td><code>getOrPut(gpa, k)</code></td><td><code>!GetOrPutResult</code></td><td><code>found_existing</code>, <code>key_ptr</code>, <code>value_ptr</code>; value undefined if new.</td></tr>
+<tr><td><code>contains(k)</code></td><td><code>bool</code></td><td></td></tr>
+<tr><td><code>remove(k)</code></td><td><code>bool</code></td><td>Hash map. Array map: <code>swapRemove</code> / <code>orderedRemove</code>.</td></tr>
+<tr><td><code>fetchRemove(k)</code></td><td><code>?KV</code></td><td>Remove and get the old pair back.</td></tr>
+<tr><td><code>count()</code></td><td><code>usize</code></td><td></td></tr>
+<tr><td><code>iterator()</code></td><td>entries</td><td><code>key_ptr</code>, <code>value_ptr</code></td></tr>
+<tr><td><code>keyIterator()</code>, <code>valueIterator()</code></td><td>pointers</td><td></td></tr>
+<tr><td><code>keys()</code>, <code>values()</code></td><td>slices</td><td>Array map only.</td></tr>
+<tr><td><code>clearRetainingCapacity()</code></td><td></td><td>Empty it, keep the table.</td></tr>
+<tr><td><code>deinit(gpa)</code></td><td></td><td>Free the table (not what keys/values point to).</td></tr>
+</table>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> <code>GameState</code> in <code>game/src/sim/state.zig</code> is mostly a set of registries exactly like 22.7:
+<pre><code>people: std.AutoArrayHashMapUnmanaged(types.PersonId, person_mod.Person) = .empty,
+units: std.AutoArrayHashMapUnmanaged(types.UnitId, unit_mod.Unit) = .empty,
+forces: std.AutoArrayHashMapUnmanaged(types.ForceId, force_mod.Force) = .empty,
+hqs: std.AutoArrayHashMapUnmanaged(types.HqId, hq_mod.Hq) = .empty,
+contracts: std.AutoArrayHashMapUnmanaged(types.ContractId, contract_mod.Contract) = .empty,</code></pre>
+They are all <em>array</em> hash maps because the daily tick iterates them, and two campaigns with the same seed must produce identical logs; a plain hash map would make the order of events depend on hash slots. String-keyed stock uses the ordered string flavour, and the console prints it with the entry iterator (<code>game/src/main.zig</code>):
+<pre><code>fn printStockLines(stock: *const std.StringArrayHashMapUnmanaged(u32)) void {
+    var it = stock.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == 0) continue;
+        std.debug.print("    {s:&lt;18} x{d:&lt;4} ({d}t)\n", .{
+            entry.key_ptr.*, entry.value_ptr.*, entry.value_ptr.* * game.part.tons(entry.key_ptr.*),
+        });
+    }
+}</code></pre>
+And the maintenance pass in <code>game/src/sim/maintenance.zig</code> is a textbook <code>getOrPut</code>: a tech's remaining hours are computed lazily the first time that tech is looked up, then decremented in place through <code>entry.value_ptr</code>.</div>
+
+<h3 id="ch22-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 22.1 · Inventory <span class="level">warm-up</span></h4>
+  <p>Complete an <code>Inventory</code> wrapping <code>AutoHashMapUnmanaged(u32, u32)</code>: <code>stock</code> adds (creating the entry with <code>getOrPut</code>), <code>take</code> removes if there is enough and deletes the key when the count reaches zero, <code>onHand</code> returns zero for unknown parts. Name the file: <code>exercises/22-hashmaps/ex1_inventory.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 22, exercise 1: a parts inventory keyed by part number.
+//! Run with:  zig test ex1_inventory.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Inventory = struct {
+    parts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+
+    fn deinit(self: *Inventory, gpa: std.mem.Allocator) void {
+        self.parts.deinit(gpa);
+    }
+
+    /// Add `n` of part `id` (creating the entry if needed).
+    fn stock(self: *Inventory, gpa: std.mem.Allocator, id: u32, n: u32) !void {
+        const gop = try self.parts.getOrPut(gpa, id);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += n;
+    }
+
+    /// Take `n` of part `id`. Returns false (and changes nothing) if there are not enough.
+    /// When the count hits zero the entry is removed.
+    fn take(self: *Inventory, id: u32, n: u32) bool {
+        const p = self.parts.getPtr(id) orelse return false;
+        if (p.* &lt; n) return false;
+        p.* -= n;
+        if (p.* == 0) _ = self.parts.remove(id);
+        return true;
+    }
+
+    fn onHand(self: Inventory, id: u32) u32 {
+        return self.parts.get(id) orelse 0;
+    }
+};
+
+test "stock and take" {
+    const a = std.testing.allocator;
+    var inv: Inventory = .{};
+    defer inv.deinit(a);
+    try inv.stock(a, 100, 3);
+    try inv.stock(a, 100, 2);
+    try inv.stock(a, 200, 1);
+    try std.testing.expectEqual(@as(u32, 5), inv.onHand(100));
+    try std.testing.expect(inv.take(100, 4));
+    try std.testing.expect(!inv.take(100, 4));
+    try std.testing.expectEqual(@as(u32, 1), inv.onHand(100));
+    try std.testing.expectEqual(@as(u32, 0), inv.onHand(999));
+}
+
+test "taking the last one removes the key" {
+    const a = std.testing.allocator;
+    var inv: Inventory = .{};
+    defer inv.deinit(a);
+    try inv.stock(a, 7, 1);
+    try std.testing.expect(inv.take(7, 1));
+    try std.testing.expect(!inv.parts.contains(7));
+    try std.testing.expectEqual(@as(u32, 0), inv.parts.count());
+}</code></pre>
+  <p><code>take</code> uses <code>getPtr</code> so it can decrement in place, and <code>orelse return false</code> handles the missing key. Note <code>onHand</code> takes <code>self</code> by value: it only reads, and <code>get</code> does not need a pointer to the map.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 22.2 · Word count <span class="level">practice</span></h4>
+  <p>Write <code>wordCounts(gpa, text)</code>: tokenize on spaces, tabs and newlines, count each word in a <code>StringHashMapUnmanaged(u32)</code>, then return an owned slice of <code>{ word, n }</code> sorted by count descending and word ascending. The words are slices into <code>text</code>, so no duping is needed here; say in a comment why that is safe. Name the file: <code>exercises/22-hashmaps/ex2_wordcount.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 22, exercise 2: count words.
+//! Run with:  zig test ex2_wordcount.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Count = struct { word: []const u8, n: u32 };
+
+/// Count each whitespace-separated word in `text`. The words are slices into `text`,
+/// so the returned array is valid as long as `text` is.
+/// Results are sorted by count descending, then word ascending.
+fn wordCounts(gpa: std.mem.Allocator, text: []const u8) ![]Count {
+    var map: std.StringHashMapUnmanaged(u32) = .empty;
+    defer map.deinit(gpa);
+
+    var it = std.mem.tokenizeAny(u8, text, " \t\n");
+    while (it.next()) |w| {
+        const gop = try map.getOrPut(gpa, w);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    var out: std.ArrayList(Count) = .empty;
+    errdefer out.deinit(gpa);
+    var mit = map.iterator();
+    while (mit.next()) |e| try out.append(gpa, .{ .word = e.key_ptr.*, .n = e.value_ptr.* });
+
+    std.mem.sort(Count, out.items, {}, struct {
+        fn lt(_: void, a: Count, b: Count) bool {
+            if (a.n != b.n) return a.n &gt; b.n;
+            return std.mem.lessThan(u8, a.word, b.word);
+        }
+    }.lt);
+    return out.toOwnedSlice(gpa);
+}
+
+test "counts" {
+    const text = "the mech the pilot the lance\nmech pilot";
+    const counts = try wordCounts(std.testing.allocator, text);
+    defer std.testing.allocator.free(counts);
+    try std.testing.expectEqual(@as(usize, 4), counts.len);
+    try std.testing.expectEqualStrings("the", counts[0].word);
+    try std.testing.expectEqual(@as(u32, 3), counts[0].n);
+    try std.testing.expectEqualStrings("mech", counts[1].word);
+    try std.testing.expectEqualStrings("pilot", counts[2].word);
+    try std.testing.expectEqualStrings("lance", counts[3].word);
+}
+
+test "empty text" {
+    const counts = try wordCounts(std.testing.allocator, "   \n ");
+    defer std.testing.allocator.free(counts);
+    try std.testing.expectEqual(@as(usize, 0), counts.len);
+}</code></pre>
+  <p>The keys point into <code>text</code>, which the caller keeps alive, so the map never owns anything and a plain <code>deinit</code> is enough. The map is only a scratch structure; the ordered result comes from copying into a list and sorting with a custom <code>lessThan</code>, which <a href="#ch24">Chapter 24</a> covers in depth.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 22.3 · Invert <span class="level">practice</span></h4>
+  <p>Given an <code>AutoArrayHashMapUnmanaged(u32, []const u8)</code> from pilot ID to callsign, build the reverse <code>StringArrayHashMapUnmanaged(u32)</code>. Return <code>error.Duplicate</code> if two pilots share a callsign, without leaking. Name the file: <code>exercises/22-hashmaps/ex3_invert.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 22, exercise 3: invert a map.
+//! Run with:  zig test ex3_invert.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Callsigns = std.AutoArrayHashMapUnmanaged(u32, []const u8); // pilot id -&gt; callsign
+const ByCallsign = std.StringArrayHashMapUnmanaged(u32); // callsign -&gt; pilot id
+
+/// Build the reverse map. If two pilots share a callsign, return error.Duplicate.
+/// The callsign strings are shared with the input map, not copied.
+fn invert(gpa: std.mem.Allocator, in: Callsigns) !ByCallsign {
+    var out: ByCallsign = .empty;
+    errdefer out.deinit(gpa);
+    var it = in.iterator();
+    while (it.next()) |e| {
+        const gop = try out.getOrPut(gpa, e.value_ptr.*);
+        if (gop.found_existing) return error.Duplicate;
+        gop.value_ptr.* = e.key_ptr.*;
+    }
+    return out;
+}
+
+test "invert" {
+    const a = std.testing.allocator;
+    var cs: Callsigns = .empty;
+    defer cs.deinit(a);
+    try cs.put(a, 1, "Widowmaker");
+    try cs.put(a, 2, "Phantom");
+    try cs.put(a, 3, "Grey");
+    var by = try invert(a, cs);
+    defer by.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 2), by.get("Phantom"));
+    try std.testing.expectEqual(@as(?u32, null), by.get("Nobody"));
+    try std.testing.expectEqual(@as(usize, 3), by.count());
+    // ArrayHashMap keeps the order we inserted in.
+    try std.testing.expectEqualStrings("Widowmaker", by.keys()[0]);
+    try std.testing.expectEqualStrings("Grey", by.keys()[2]);
+}
+
+test "duplicate callsign is an error and leaks nothing" {
+    const a = std.testing.allocator;
+    var cs: Callsigns = .empty;
+    defer cs.deinit(a);
+    try cs.put(a, 1, "Ace");
+    try cs.put(a, 2, "Ace");
+    try std.testing.expectError(error.Duplicate, invert(a, cs));
+}</code></pre>
+  <p>The <code>errdefer out.deinit(gpa)</code> is what makes the duplicate test pass under <code>std.testing.allocator</code>, which fails the test on a leak. The callsign strings are shared with the input map, so nothing needs duping.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 22.4 · Registry <span class="level">challenge</span></h4>
+  <p>Build a <code>Registry</code> like the game's: <code>AutoArrayHashMapUnmanaged(PersonId, Person)</code> with <code>hire</code> (fresh ID, <code>putNoClobber</code>), <code>person(id) ?*Person</code>, <code>mission()</code> which increments every active person's mission count in place, and <code>bury()</code> which removes every <code>kia</code> entry while keeping the order of the rest. Name the file: <code>exercises/22-hashmaps/ex4_registry.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 22, exercise 4: an ID -&gt; entity registry, like GameState.people.
+//! Run with:  zig test ex4_registry.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const PersonId = enum(u32) { _ };
+const Status = enum { active, wounded, kia };
+const Person = struct { name: []const u8, status: Status = .active, missions: u32 = 0 };
+
+const Registry = struct {
+    people: std.AutoArrayHashMapUnmanaged(PersonId, Person) = .empty,
+    next: u32 = 1,
+
+    fn deinit(self: *Registry, gpa: std.mem.Allocator) void {
+        self.people.deinit(gpa);
+    }
+
+    fn hire(self: *Registry, gpa: std.mem.Allocator, name: []const u8) !PersonId {
+        const id: PersonId = @enumFromInt(self.next);
+        self.next += 1;
+        try self.people.putNoClobber(gpa, id, .{ .name = name });
+        return id;
+    }
+
+    fn person(self: *Registry, id: PersonId) ?*Person {
+        return self.people.getPtr(id);
+    }
+
+    /// Every active person flies one mission. Returns how many flew.
+    fn mission(self: *Registry) u32 {
+        var flew: u32 = 0;
+        for (self.people.values()) |*p| {
+            if (p.status != .active) continue;
+            p.missions += 1;
+            flew += 1;
+        }
+        return flew;
+    }
+
+    /// Remove everyone with status kia, keeping the order of the rest.
+    /// Returns how many were removed.
+    fn bury(self: *Registry) u32 {
+        var removed: u32 = 0;
+        var i: usize = 0;
+        while (i &lt; self.people.count()) {
+            if (self.people.values()[i].status == .kia) {
+                self.people.orderedRemoveAt(i);
+                removed += 1;
+            } else i += 1;
+        }
+        return removed;
+    }
+};
+
+test "hire, look up, mutate" {
+    const a = std.testing.allocator;
+    var r: Registry = .{};
+    defer r.deinit(a);
+    const kell = try r.hire(a, "Kell");
+    const nat = try r.hire(a, "Natasha");
+    try std.testing.expect(r.person(kell) != null);
+    try std.testing.expect(r.person(@enumFromInt(999)) == null);
+    r.person(nat).?.status = .wounded;
+    try std.testing.expectEqual(@as(u32, 1), r.mission());
+    try std.testing.expectEqual(@as(u32, 1), r.person(kell).?.missions);
+    try std.testing.expectEqual(@as(u32, 0), r.person(nat).?.missions);
+}
+
+test "bury keeps order and ids stay valid" {
+    const a = std.testing.allocator;
+    var r: Registry = .{};
+    defer r.deinit(a);
+    const p1 = try r.hire(a, "one");
+    const p2 = try r.hire(a, "two");
+    const p3 = try r.hire(a, "three");
+    const p4 = try r.hire(a, "four");
+    r.person(p1).?.status = .kia;
+    r.person(p3).?.status = .kia;
+    try std.testing.expectEqual(@as(u32, 2), r.bury());
+    try std.testing.expectEqual(@as(usize, 2), r.people.count());
+    try std.testing.expectEqualStrings("two", r.people.values()[0].name);
+    try std.testing.expectEqualStrings("four", r.people.values()[1].name);
+    try std.testing.expect(r.person(p2) != null);
+    try std.testing.expect(r.person(p4) != null);
+    try std.testing.expect(r.person(p1) == null);
+}</code></pre>
+  <p><code>mission</code> walks <code>values()</code> by pointer, which is only possible on an array map. <code>bury</code> uses the same "do not advance after removing" loop as Exercise 21.2, with <code>orderedRemoveAt(i)</code>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 22.5 · Group by, owning the keys <span class="level">challenge</span></h4>
+  <p>Build <code>Groups</code>: a <code>StringArrayHashMapUnmanaged</code> from role to an <code>ArrayList([]const u8)</code> of names. The role passed to <code>add</code> is a temporary buffer that will be overwritten, so the map must dupe the key on first insert and free every key and list in <code>deinit</code>. Name the file: <code>exercises/22-hashmaps/ex5_groupby.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 22, exercise 5: group names by role, owning the keys.
+//! Run with:  zig test ex5_groupby.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Groups = struct {
+    map: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty,
+
+    /// Free every duped key and every list, then the map.
+    fn deinit(self: *Groups, gpa: std.mem.Allocator) void {
+        for (self.map.keys(), self.map.values()) |k, *list| {
+            gpa.free(k);
+            list.deinit(gpa);
+        }
+        self.map.deinit(gpa);
+    }
+
+    /// `role` may be a temporary; the map must own its own copy of the key.
+    fn add(self: *Groups, gpa: std.mem.Allocator, role: []const u8, name: []const u8) !void {
+        const gop = try self.map.getOrPut(gpa, role);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try gpa.dupe(u8, role);
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(gpa, name);
+    }
+
+    fn members(self: Groups, role: []const u8) []const []const u8 {
+        const list = self.map.get(role) orelse return &amp;.{};
+        return list.items;
+    }
+};
+
+test "group by role with temporary keys" {
+    const a = std.testing.allocator;
+    var g: Groups = .{};
+    defer g.deinit(a);
+
+    var buf: [16]u8 = undefined;
+    const rows = [_]struct { role: []const u8, name: []const u8 }{
+        .{ .role = "pilot", .name = "Kell" },
+        .{ .role = "tech", .name = "Sato" },
+        .{ .role = "pilot", .name = "Natasha" },
+    };
+    for (rows) |r| {
+        // Build the key in a reused buffer so it is definitely temporary.
+        const key = try std.fmt.bufPrint(&amp;buf, "{s}", .{r.role});
+        try g.add(a, key, r.name);
+        @memset(&amp;buf, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 2), g.members("pilot").len);
+    try std.testing.expectEqualStrings("Natasha", g.members("pilot")[1]);
+    try std.testing.expectEqual(@as(usize, 1), g.members("tech").len);
+    try std.testing.expectEqual(@as(usize, 0), g.members("medic").len);
+    try std.testing.expectEqualStrings("pilot", g.map.keys()[0]);
+}</code></pre>
+  <p>The trick is <code>gop.key_ptr.* = try gpa.dupe(u8, role)</code>: <code>getOrPut</code> looked the key up using the temporary, and now we replace the stored key with a copy we own. The test scribbles over the buffer after each insert to prove the map is not looking at it any more.</p></details>
+</div>
+
+<h3 id="ch22-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does <code>get</code> return, and what does that mean for changing the value? <details class="answer"><summary>Answer</summary><code>?V</code>, a copy of the value or <code>null</code>. Changing the copy does not change the map; use <code>getPtr</code> for that.</details></li>
+  <li>After <code>const gop = try map.getOrPut(gpa, k);</code> with <code>found_existing == false</code>, what is in <code>gop.value_ptr.*</code>? <details class="answer"><summary>Answer</summary>Undefined memory. You must assign to it before reading it.</details></li>
+  <li>When would you pick <code>AutoArrayHashMapUnmanaged</code> over <code>AutoHashMapUnmanaged</code>? <details class="answer"><summary>Answer</summary>Whenever you iterate and the order can affect anything observable (output, event order, determinism), or when you want <code>keys()</code>/<code>values()</code> as slices. The plain map is for pure lookup tables.</details></li>
+  <li>Why can't <code>AutoHashMapUnmanaged([]const u8, V)</code> compile? <details class="answer"><summary>Answer</summary>Auto hashing works on the key's bytes, and for a slice that is the pointer and length, not the characters. The compiler rejects it and points you to <code>StringHashMapUnmanaged</code>, which hashes contents.</details></li>
+  <li>You build a key with <code>bufPrint</code> into a stack buffer and <code>put</code> it into a string map that outlives the function. What goes wrong and how do you fix it? <details class="answer"><summary>Answer</summary>The map stores a slice pointing at the stack buffer, which is gone (or reused) after the function returns; lookups become garbage. Fix: <code>gpa.dupe(u8, key)</code> and free the copies when the entries go (or use an arena).</details></li>
+  <li>Is a pointer from <code>getPtr</code> still valid after a <code>put</code> of a different key? <details class="answer"><summary>Answer</summary>Not necessarily. The insert may grow and rehash the table, moving every entry. Re-fetch the pointer after any insert.</details></li>
+  <li>Why does IRON LEDGER pass around <code>PersonId</code> values instead of <code>*Person</code>? <details class="answer"><summary>Answer</summary>Entries in the map can move when it grows and can be removed; an ID is always safe to hold and can be turned into a fresh <code>?*Person</code> on demand, with <code>null</code> when the person is gone.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Maps are unmanaged: <code>.empty</code>, allocator on every inserting call, <code>deinit(gpa)</code> frees the table only.</li>
+<li><code>put</code>, <code>get</code> (copy, optional), <code>getPtr</code> (pointer, optional), <code>getOrPut</code> (one lookup, <code>found_existing</code>, undefined value when new), <code>remove</code>, <code>contains</code>, <code>count</code>.</li>
+<li><code>iterator</code>, <code>keyIterator</code>, <code>valueIterator</code> give pointers; array maps also give <code>keys()</code> and <code>values()</code> slices and iterate in insertion order.</li>
+<li>Plain hash maps iterate in an order you must not rely on; use the array flavour whenever order matters.</li>
+<li>String keys are slices: they must outlive the map, so dupe anything temporary and free it yourself.</li>
+<li>Auto hashing handles integers, enums and plain structs; slices need <code>StringHashMapUnmanaged</code> or a custom context.</li>
+<li>Keep entities in a map keyed by a typed ID, and hand out IDs, not pointers.</li>
+</ul></div>
+</section>

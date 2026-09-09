@@ -1,0 +1,601 @@
+<section id="ch06">
+<h2>6. Control flow: if, while, for, switch</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn Zig's four control-flow constructs and the ways they differ from what you know: <code>if</code> and <code>switch</code> are expressions that produce values, <code>while</code> has a continue expression, <code>for</code> walks ranges and arrays without an index variable, loops can be labeled and can produce values with <code>else</code>, and <code>switch</code> must be exhaustive. You will also meet <code>unreachable</code>.</p>
+
+<h3 id="ch06-1">6.1 if as a statement</h3>
+<p>An <code>if</code> tests a <code>bool</code> and runs a block. <code>else if</code> and <code>else</code> chain on as in C or JavaScript. The parentheses around the condition are required; the braces can be dropped when the body is a single statement.</p>
+<div class="file">if_stmt.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const funds: i64 = -25_000;
+    if (funds &lt; 0) {
+        std.debug.print("the company is in debt\n", .{});
+    } else if (funds == 0) {
+        std.debug.print("the company is broke\n", .{});
+    } else {
+        std.debug.print("the company is solvent\n", .{});
+    }
+    if (funds &lt; 0) std.debug.print("(one-line form works too)\n", .{});
+}</code></pre>
+<pre class="term">$ zig run if_stmt.zig
+the company is in debt
+(one-line form works too)</pre>
+<p>As <a href="#ch05">Chapter 5</a> said, the condition must be a <code>bool</code>. There is no truthiness, so <code>if (funds)</code> is an error and <code>if (funds != 0)</code> is what you write.</p>
+
+<h3 id="ch06-2">6.2 if as an expression</h3>
+<p>In Zig, <code>if</code> can also <em>be</em> a value. Each branch is an expression, and the whole thing evaluates to whichever branch ran. This replaces the <code>cond ? a : b</code> operator of C and JavaScript.</p>
+<div class="file">if_expr.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnage: u32 = 75;
+    const class = if (tonnage &lt;= 35) "light" else if (tonnage &lt;= 55) "medium" else "heavy";
+    std.debug.print("{d} tons: {s}\n", .{ tonnage, class });
+    const bonus: u32 = if (tonnage &gt; 50) 10 else 0;
+    std.debug.print("bonus {d}\n", .{bonus});
+}</code></pre>
+<pre class="term">$ zig run if_expr.zig
+75 tons: heavy
+bonus 10</pre>
+<p>An <code>if</code> expression must have an <code>else</code>, because it has to produce a value on every path, and both branches must have compatible types (peer type resolution again). The <code>bonus</code> line shows that a literal in a branch takes the annotated type. This form is used constantly in real code for small decisions inline, and it pairs with <code>const</code>: instead of declaring a <code>var</code> and assigning it in each branch, you declare a <code>const</code> and let the <code>if</code> produce it.</p>
+
+<h3 id="ch06-3">6.3 while</h3>
+<p><code>while</code> repeats a block as long as a condition holds.</p>
+<div class="file">while_basic.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var day: u32 = 1;
+    while (day &lt;= 3) {
+        std.debug.print("day {d}\n", .{day});
+        day += 1;
+    }
+    std.debug.print("after the loop, day = {d}\n", .{day});
+}</code></pre>
+<pre class="term">$ zig run while_basic.zig
+day 1
+day 2
+day 3
+after the loop, day = 4</pre>
+<p>Zig has no <code>do … while</code> and, as you will see, no C-style three-part <code>for</code>. Instead <code>while</code> takes an optional <em>continue expression</em> after a colon, which runs at the end of every iteration, including after a <code>continue</code>:</p>
+<div class="file">while_cont.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var day: u32 = 1;
+    while (day &lt;= 3) : (day += 1) {
+        std.debug.print("day {d}\n", .{day});
+    }
+
+    var i: u32 = 0;
+    var total: u32 = 0;
+    while (i &lt; 10) : (i += 1) {
+        if (i % 2 == 1) continue; // skip odd numbers; the continue expression still runs
+        total += i;
+    }
+    std.debug.print("sum of even numbers below 10: {d}\n", .{total});
+}</code></pre>
+<pre class="term">$ zig run while_cont.zig
+day 1
+day 2
+day 3
+sum of even numbers below 10: 20</pre>
+<p><code>while (day &lt;= 3) : (day += 1)</code> reads: while this holds, run the body, then do this. The increment lives in the loop header, where it cannot be forgotten and where a <code>continue</code> in the body cannot skip it. That second point is the reason the form exists: in the second loop, <code>continue</code> jumps past <code>total += i</code> but the <code>i += 1</code> still runs, so the loop cannot get stuck.</p>
+<p><code>break</code> leaves the loop immediately. A <code>while (true)</code> with a <code>break</code> inside is the idiom for "loop until something happens in the middle":</p>
+<div class="file">while_break.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var funds: i64 = 100_000;
+    var day: u32 = 0;
+    while (true) {
+        day += 1;
+        funds -= 35_000;
+        if (funds &lt; 0) break;
+    }
+    std.debug.print("ran out of money on day {d}\n", .{day});
+}</code></pre>
+<pre class="term">$ zig run while_break.zig
+ran out of money on day 3</pre>
+
+<h3 id="ch06-4">6.4 for over ranges and arrays</h3>
+<p>Zig's <code>for</code> does not count; it iterates. Give it something to walk, and a name in pipes for each element.</p>
+<div class="file">for_range.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    for (0..3) |i| {
+        std.debug.print("i = {d}\n", .{i});
+    }
+    for (1..4) |n| std.debug.print("n = {d} ", .{n});
+    std.debug.print("\n", .{});
+    for (0..3) |_| std.debug.print("tick ", .{});
+    std.debug.print("\n", .{});
+}</code></pre>
+<pre class="term">$ zig run for_range.zig
+i = 0
+i = 1
+i = 2
+n = 1 n = 2 n = 3 
+tick tick tick</pre>
+<p><code>0..3</code> is a range: 0, 1, 2. The end is exclusive, so <code>0..n</code> runs <code>n</code> times and <code>1..4</code> gives 1, 2, 3. The name between the pipes, <code>|i|</code>, is the <em>capture</em>: a fresh <code>const</code> for each iteration. If you do not need the value, capture <code>|_|</code>, since an unused capture is an error like any unused name.</p>
+<p>The type of a range capture is <code>usize</code>. That matters as soon as you try to store it somewhere narrower:</p>
+<pre class="term">$ zig run for_index_type.zig
+for_index_type.zig:6:23: error: expected type 'u8', found 'usize'
+        const x: u8 = i;
+                      ^
+for_index_type.zig:6:23: note: unsigned 8-bit int cannot represent all possible unsigned 64-bit values</pre>
+<p>Use <code>@intCast(i)</code> when you need the index as a smaller type.</p>
+<p>The same syntax walks an array. Arrays are <a href="#ch09">Chapter 9</a>, but you can read <code>[_]u32{ 20, 55, 75, 100 }</code> as "an array of four <code>u32</code>, count them for me":</p>
+<div class="file">for_array.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnages = [_]u32{ 20, 55, 75, 100 };
+    var total: u32 = 0;
+    for (tonnages) |t| {
+        total += t;
+    }
+    std.debug.print("total {d}\n", .{total});
+
+    for (tonnages, 0..) |t, i| {
+        std.debug.print("slot {d}: {d} tons\n", .{ i, t });
+    }
+
+    const names = [_][]const u8{ "Locust", "Shadow Hawk", "Marauder", "Atlas" };
+    for (names, tonnages) |name, t| {
+        std.debug.print("{s} ({d}t)\n", .{ name, t });
+    }
+}</code></pre>
+<pre class="term">$ zig run for_array.zig
+total 250
+slot 0: 20 tons
+slot 1: 55 tons
+slot 2: 75 tons
+slot 3: 100 tons
+Locust (20t)
+Shadow Hawk (55t)
+Marauder (75t)
+Atlas (100t)</pre>
+<p>Three forms appear. <code>for (tonnages) |t|</code> gives each element. <code>for (tonnages, 0..) |t, i|</code> gives each element and its index, by iterating the array and an open-ended range together. <code>for (names, tonnages) |name, t|</code> walks two arrays in step; they must have the same length, and Zig checks that in Debug builds. There is no separate "enumerate" or "zip"; you just list more things to iterate.</p>
+<p>The capture is a copy. To change the elements you iterate the array's address and capture a pointer, which is <a href="#ch18">Chapter 18</a>'s topic, but the shape is worth seeing now:</p>
+<div class="file">for_mut.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var armor = [_]u8{ 10, 20, 30 };
+    for (&amp;armor) |*a| {
+        a.* += 5;
+    }
+    std.debug.print("{any}\n", .{armor});
+}</code></pre>
+<pre class="term">$ zig run for_mut.zig
+{ 15, 25, 35 }</pre>
+<p><code>&amp;armor</code> lends the array itself, <code>|*a|</code> captures a pointer to each slot, and <code>a.*</code> is the value behind that pointer. Without the <code>&amp;</code> and the <code>*</code>, <code>a += 5</code> would be an error, because the capture is a <code>const</code>.</p>
+
+<h3 id="ch06-5">6.5 Labeled loops</h3>
+<p>A <code>break</code> or <code>continue</code> normally applies to the innermost loop. To reach an outer one, give it a label:</p>
+<div class="file">labeled.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const grid = [_][3]u8{
+        .{ 1, 5, 3 },
+        .{ 4, 9, 6 },
+        .{ 7, 8, 9 },
+    };
+    outer: for (grid, 0..) |row, r| {
+        for (row, 0..) |cell, c| {
+            if (cell == 9) {
+                std.debug.print("found 9 at row {d}, col {d}\n", .{ r, c });
+                break :outer;
+            }
+        }
+    }
+    var lines: u32 = 0;
+    rows: for (grid) |row| {
+        for (row) |cell| {
+            if (cell % 2 == 0) continue :rows; // skip rows with any even cell
+        }
+        lines += 1;
+    }
+    std.debug.print("rows with only odd cells: {d}\n", .{lines});
+}</code></pre>
+<pre class="term">$ zig run labeled.zig
+found 9 at row 1, col 1
+rows with only odd cells: 1</pre>
+<p><code>outer: for …</code> names the loop, and <code>break :outer</code> leaves it from inside the inner loop. <code>continue :rows</code> abandons the rest of the current row and moves to the next one. Without labels, the first search would need a flag variable checked after the inner loop, and the second would need to remember whether it had already seen an even cell. Labels are the same mechanism as the labeled blocks of <a href="#ch03">Chapter 3</a>; a loop is just a block that repeats.</p>
+
+<h3 id="ch06-6">6.6 Loops as expressions: else</h3>
+<p>Because loops are blocks, they can produce values too. A <code>break</code> can carry a value, and the loop can have an <code>else</code> clause that supplies the value when the loop finishes without breaking.</p>
+<div class="file">loop_else.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const roster = [_]u32{ 3, 8, 12, 27 };
+    const wanted: u32 = 12;
+    const found = for (roster, 0..) |id, i| {
+        if (id == wanted) break i;
+    } else null;
+    std.debug.print("found at: {?}\n", .{found});
+
+    var n: u32 = 91;
+    var divisor: u32 = 2;
+    const factor = while (divisor * divisor &lt;= n) : (divisor += 1) {
+        if (n % divisor == 0) break divisor;
+    } else 0;
+    n += 0;
+    std.debug.print("smallest factor of 91: {d}\n", .{factor});
+}</code></pre>
+<pre class="term">$ zig run loop_else.zig
+found at: 2
+smallest factor of 91: 7</pre>
+<p>The first loop is a search. If it finds the id, <code>break i</code> makes the loop's value the index; if it runs out of elements, the <code>else null</code> makes it <code>null</code>. The result type is <code>?usize</code>, "an index or nothing", and <code>{?}</code> prints an optional; <a href="#ch15">Chapter 15</a> is all about these. The second loop uses <code>while … else</code> the same way, with a continue expression, to find the smallest factor of a number.</p>
+<p>The <code>else</code> of a loop runs only when the condition ends the loop naturally. It is the "not found" branch, and it removes the need for a "found" flag. This is a Zig habit worth acquiring early: <em>compute the value with the loop, rather than declaring a variable and mutating it from inside the loop</em>.</p>
+
+<h3 id="ch06-7">6.7 switch</h3>
+<p><code>switch</code> compares one value against a list of cases and runs the matching arm. Unlike C's <code>switch</code> there is no fall-through and no <code>break</code>; exactly one arm runs. Like <code>if</code>, it is an expression.</p>
+<div class="file">switch_basic.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const month: u8 = 2;
+    const days: u8 = switch (month) {
+        1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+        4, 6, 9, 11 =&gt; 30,
+        2 =&gt; 28,
+        else =&gt; 0,
+    };
+    std.debug.print("month {d} has {d} days\n", .{ month, days });
+
+    const roll: u8 = 9;
+    const outcome = switch (roll) {
+        2...4 =&gt; "disaster",
+        5...8 =&gt; "setback",
+        9...11 =&gt; "success",
+        12 =&gt; "triumph",
+        else =&gt; "impossible",
+    };
+    std.debug.print("rolled {d}: {s}\n", .{ roll, outcome });
+}</code></pre>
+<pre class="term">$ zig run switch_basic.zig
+month 2 has 28 days
+rolled 9: success</pre>
+<p>Cases are written to the left of <code>=&gt;</code>. A single value: <code>12</code>. A list: <code>1, 3, 5, 7, 8, 10, 12</code>. An inclusive range: <code>2...4</code>, with three dots (a range in a <code>for</code> has two dots and an exclusive end; a range in a <code>switch</code> has three and an inclusive end; this is confusing for a week). <code>else</code> catches anything not listed. Arms are separated by commas, and each arm is an expression; when an arm needs several statements, make it a block:</p>
+<div class="file">switch_stmt.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const key: u8 = 'q';
+    switch (key) {
+        'q' =&gt; std.debug.print("quit\n", .{}),
+        'h', '?' =&gt; std.debug.print("help\n", .{}),
+        '0'...'9' =&gt; |digit| std.debug.print("digit {c}\n", .{digit}),
+        else =&gt; {
+            std.debug.print("unknown key ", .{});
+            std.debug.print("{d}\n", .{key});
+        },
+    }
+}</code></pre>
+<pre class="term">$ zig run switch_stmt.zig
+quit</pre>
+<p>This one is a statement, so its arms produce nothing; the block arm ends with a comma after its closing brace. The <code>'0'...'9' =&gt; |digit|</code> arm shows that an arm can capture the matched value, which is useful when the case is a range.</p>
+<p>Two rules make <code>switch</code> safer than its relatives in other languages. First, it must be <em>exhaustive</em>: every possible value of the type must match some arm, or there must be an <code>else</code>.</p>
+<div class="file">switch_missing.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const d: u2 = 3;
+    const name = switch (d) {
+        0 =&gt; "north",
+        1 =&gt; "east",
+        2 =&gt; "south",
+    };
+    std.debug.print("{s}\n", .{name});
+}</code></pre>
+<pre class="term">$ zig run switch_missing.zig
+switch_missing.zig:5:18: error: switch must handle all possibilities
+    const name = switch (d) {
+                 ^~~~~~</pre>
+<p>A <code>u2</code> has four values and only three are handled, so the compiler refuses. Add the fourth arm and it builds; with a small type like <code>u2</code> or <code>bool</code> you can list every case and leave out <code>else</code> entirely, which means that if the type ever grows, the compiler will find every <code>switch</code> that needs updating. This is a big part of why the game uses enums so heavily (<a href="#ch13">Chapter 13</a>).</p>
+<pre class="term">$ zig run switch_full.zig
+west
+yes</pre>
+<p>Second, cases may not overlap. Two ranges that share a value are an error, so a value can never match two arms:</p>
+<pre class="term">$ zig run switch_dup.zig
+switch_dup.zig:7:10: error: duplicate switch value
+        6...12 =&gt; "high",
+        ~^~~~~
+switch_dup.zig:6:10: note: previous value here
+        1...6 =&gt; "low",
+        ~^~~~</pre>
+
+<h3 id="ch06-8">6.8 unreachable</h3>
+<p>Sometimes a case is impossible by construction, and you want to say so instead of inventing a default value. <code>unreachable</code> is a statement that asserts control never gets here.</p>
+<div class="file">unreach.zig</div>
+<pre><code>const std = @import("std");
+
+fn daysInMonth(month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+        4, 6, 9, 11 =&gt; 30,
+        2 =&gt; 28,
+        else =&gt; unreachable, // months are always 1..12 here
+    };
+}
+
+pub fn main() void {
+    std.debug.print("{d}\n", .{daysInMonth(4)});
+    var bad: u8 = 12;
+    bad += 1;
+    std.debug.print("{d}\n", .{daysInMonth(bad)});
+}</code></pre>
+<pre class="term">$ zig run unreach.zig
+30
+thread 12345 panic: reached unreachable code
+unreach.zig:8:17: 0x10000abcd in daysInMonth (unreach)
+        else =&gt; unreachable, // months are always 1..12 here
+                ^
+unreach.zig:16:43: 0x10000abcd in main (unreach)
+    std.debug.print("{d}\n", .{daysInMonth(bad)});
+                                          ^</pre>
+<p>The first call works. The second passes 13, hits the <code>else</code>, and panics with "reached unreachable code", naming the line. In a Debug build <code>unreachable</code> is a check; in ReleaseFast it is a promise the optimiser may rely on, and breaking it is undefined behaviour. So use it for cases that truly cannot happen given how the function is called, not for cases you have not thought about yet. <code>unreachable</code> also satisfies the exhaustiveness rule, because an arm that never returns has no type to disagree with the others.</p>
+
+<h3 id="ch06-9">6.9 Putting it together</h3>
+<p>Here is a small simulation of a month's cash flow using several constructs at once, so you can see them cooperate.</p>
+<div class="file">nested.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var day: u32 = 1;
+    var funds: i64 = 120_000;
+    const daily_cost: i64 = 45_000;
+    while (day &lt;= 30) : (day += 1) {
+        funds -= daily_cost;
+        if (day % 7 == 0) funds += 200_000; // weekly contract pay
+        const status = if (funds &lt; 0) "DEBT" else "ok";
+        if (day &lt;= 8) std.debug.print("day {d:&gt;2}: {d:&gt;8} {s}\n", .{ day, funds, status });
+    }
+    std.debug.print("month end: {d}\n", .{funds});
+}</code></pre>
+<pre class="term">$ zig run nested.zig
+day  1:   +75000 ok
+day  2:   +30000 ok
+day  3:   -15000 DEBT
+day  4:   -60000 DEBT
+day  5:  -105000 DEBT
+day  6:  -150000 DEBT
+day  7:    +5000 ok
+day  8:   -40000 DEBT
+month end: -430000</pre>
+<p>A <code>while</code> with a continue expression drives the days. An <code>if</code> statement adds the weekly pay. An <code>if</code> expression picks a status word into a <code>const</code>. Another one-line <code>if</code> limits the printing. The <code>{d:&gt;8}</code> on the signed <code>funds</code> shows the plus sign that <a href="#ch02">Chapter 2</a> warned about.</p>
+<div class="try"><strong>Try it.</strong> Make the loop stop on the first day the company goes into debt, using <code>break</code>, and print the day number after the loop. Then rewrite it so the loop itself produces the day number with <code>break day</code> and <code>else 0</code>.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The calendar in <code>game/src/sim/clock.zig</code> is a <code>switch</code> on the month with list cases, an <code>if</code> expression in one arm, and an <code>unreachable</code> for the months that do not exist:
+<pre><code>pub fn daysInMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+        4, 6, 9, 11 =&gt; 30,
+        2 =&gt; if (isLeapYear(year)) @as(u8, 29) else 28,
+        else =&gt; unreachable,
+    };
+}</code></pre>
+The <code>@as(u8, 29)</code> is there because both branches of the inner <code>if</code> are literals and the outer <code>switch</code> needs one of them to have a concrete type. In <code>game/src/main.zig</code> the demo's contract hunt is a <code>while</code> with a continue expression: <code>while (pick == null and hunts &lt; 8) : (hunts += 1) { … }</code>. And the simulation's "is this person in this company" check walks up the force tree with a <code>while … else</code> expression that yields a <code>bool</code>, which you will read in Part 5.</div>
+
+<h3 id="ch06-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 6.1 · Countdown and fizzbuzz <span class="level">warm-up</span></h4>
+  <p>Print a countdown from 5 with a <code>while</code> loop and a continue expression, then a fizzbuzz line for 1 to 15 with a <code>for</code> over a range, formatted exactly as the header shows. Name the file: <code>exercises/06-control-flow/ex1_countdown.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 06, exercise 1: while, for and if together.
+//! Run with:  zig run ex1_countdown.zig
+//! Expected output (on stderr):
+//!   T-5 T-4 T-3 T-2 T-1 launch
+//!   1 2 fizz 4 buzz fizz 7 8 fizz buzz 11 fizz 13 14 fizzbuzz
+const std = @import("std");
+
+pub fn main() void {
+    var t: u32 = 5;
+    while (t &gt; 0) : (t -= 1) {
+        std.debug.print("T-{d} ", .{t});
+    }
+    std.debug.print("launch\n", .{});
+
+    for (1..16) |n| {
+        if (n % 15 == 0) {
+            std.debug.print("fizzbuzz", .{});
+        } else if (n % 3 == 0) {
+            std.debug.print("fizz", .{});
+        } else if (n % 5 == 0) {
+            std.debug.print("buzz", .{});
+        } else {
+            std.debug.print("{d}", .{n});
+        }
+        if (n == 15) {
+            std.debug.print("\n", .{});
+        } else {
+            std.debug.print(" ", .{});
+        }
+    }
+}</code></pre>
+  <p>The separator is printed by an <code>if</code> statement rather than an <code>if</code> expression inside <code>print</code>, because the format string must be known at compile time and the choice depends on a runtime <code>n</code>. That is a rule you will meet again in <a href="#ch23">Chapter 23</a>.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 6.2 · Dice, months and keys <span class="level">practice</span></h4>
+  <p>Write three <code>switch</code> expressions: the outcome of a 2d6 roll from four ranges, the days in a month from two lists and a single case, and the action for a keypress including a character range. The last returns an enum value; write those as <code>.quit</code>, <code>.help</code> and so on. Name the file: <code>exercises/06-control-flow/ex2_dice.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 06, exercise 2: switch on ranges and lists.
+//! Run with:  zig test ex2_dice.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Outcome of a 2d6 roll: 2..4 "disaster", 5..8 "setback", 9..11 "success",
+/// 12 "triumph". Anything else cannot happen with two dice.
+fn outcome(roll: u8) []const u8 {
+    return switch (roll) {
+        2...4 =&gt; "disaster",
+        5...8 =&gt; "setback",
+        9...11 =&gt; "success",
+        12 =&gt; "triumph",
+        else =&gt; unreachable,
+    };
+}
+
+/// Days in a month of the year 3025 (not a leap year).
+fn daysInMonth(month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 =&gt; 31,
+        4, 6, 9, 11 =&gt; 30,
+        2 =&gt; 28,
+        else =&gt; 0,
+    };
+}
+
+/// A single keypress in the terminal client: 'q' quits, 'h' or '?' shows
+/// help, a digit selects that slot (0..9), anything else is ignored.
+const Action = enum { quit, help, select, ignore };
+
+fn keyAction(key: u8) Action {
+    return switch (key) {
+        'q' =&gt; .quit,
+        'h', '?' =&gt; .help,
+        '0'...'9' =&gt; .select,
+        else =&gt; .ignore,
+    };
+}
+
+test "outcome" {
+    try std.testing.expectEqualStrings("disaster", outcome(2));
+    try std.testing.expectEqualStrings("disaster", outcome(4));
+    try std.testing.expectEqualStrings("setback", outcome(5));
+    try std.testing.expectEqualStrings("success", outcome(11));
+    try std.testing.expectEqualStrings("triumph", outcome(12));
+}
+
+test "daysInMonth" {
+    try std.testing.expectEqual(@as(u8, 31), daysInMonth(1));
+    try std.testing.expectEqual(@as(u8, 28), daysInMonth(2));
+    try std.testing.expectEqual(@as(u8, 30), daysInMonth(4));
+    try std.testing.expectEqual(@as(u8, 0), daysInMonth(13));
+}
+
+test "keyAction" {
+    try std.testing.expectEqual(Action.quit, keyAction('q'));
+    try std.testing.expectEqual(Action.help, keyAction('?'));
+    try std.testing.expectEqual(Action.select, keyAction('7'));
+    try std.testing.expectEqual(Action.ignore, keyAction('x'));
+}</code></pre>
+  <p>In <code>outcome</code>, the <code>else =&gt; unreachable</code> documents that two dice cannot produce 1 or 13; if you preferred a safe default you could return a string instead, and both satisfy exhaustiveness. Character literals are integers, so <code>'0'...'9'</code> is an ordinary range.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 6.3 · Loops that produce values <span class="level">practice</span></h4>
+  <p>Write <code>indexOf</code> with a <code>for … else</code> expression, <code>everyRowHasZero</code> with a labeled outer loop and <code>continue :label</code>, and <code>smallestDivisor</code> with a <code>while … else</code> and a continue expression. No flag variables in the first and third. Name the file: <code>exercises/06-control-flow/ex3_search.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 06, exercise 3: loops that produce values, and labeled loops.
+//! Run with:  zig test ex3_search.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Index of the first element equal to `wanted`, or null if absent.
+/// Use a `for ... else` expression, not a separate flag variable.
+fn indexOf(items: []const u32, wanted: u32) ?usize {
+    return for (items, 0..) |item, i| {
+        if (item == wanted) break i;
+    } else null;
+}
+
+/// True when every row of the grid contains at least one zero.
+/// Use a labeled outer loop with `continue :label`.
+fn everyRowHasZero(grid: []const [3]u8) bool {
+    var rows_with_zero: usize = 0;
+    rows: for (grid) |row| {
+        for (row) |cell| {
+            if (cell == 0) {
+                rows_with_zero += 1;
+                continue :rows;
+            }
+        }
+    }
+    return rows_with_zero == grid.len;
+}
+
+/// Smallest divisor of n greater than 1 (n itself when n is prime).
+/// Use a `while ... else` expression with a continue expression.
+fn smallestDivisor(n: u32) u32 {
+    var d: u32 = 2;
+    return while (d * d &lt;= n) : (d += 1) {
+        if (n % d == 0) break d;
+    } else n;
+}
+
+test "indexOf" {
+    const roster = [_]u32{ 3, 8, 12, 27 };
+    try std.testing.expectEqual(@as(?usize, 2), indexOf(&amp;roster, 12));
+    try std.testing.expectEqual(@as(?usize, 0), indexOf(&amp;roster, 3));
+    try std.testing.expectEqual(@as(?usize, null), indexOf(&amp;roster, 99));
+}
+
+test "everyRowHasZero" {
+    const yes = [_][3]u8{ .{ 1, 0, 2 }, .{ 0, 5, 5 }, .{ 7, 7, 0 } };
+    const no = [_][3]u8{ .{ 1, 0, 2 }, .{ 4, 5, 5 } };
+    try std.testing.expect(everyRowHasZero(&amp;yes));
+    try std.testing.expect(!everyRowHasZero(&amp;no));
+}
+
+test "smallestDivisor" {
+    try std.testing.expectEqual(@as(u32, 7), smallestDivisor(91));
+    try std.testing.expectEqual(@as(u32, 2), smallestDivisor(100));
+    try std.testing.expectEqual(@as(u32, 13), smallestDivisor(13));
+}</code></pre>
+  <p>The parameters are slices, <code>[]const u32</code>, which <a href="#ch10">Chapter 10</a> explains; for now they behave like arrays under <code>for</code>. Each function's shape matches one construct from this chapter, and the point of the exercise is to feel where each one is the natural fit.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 6.4 · A month of payroll <span class="level">challenge</span></h4>
+  <p>Simulate thirty days of costs and weekly pay following the rules in the starter's header, printing a line each payday and stopping with a DEBT line the moment funds go negative. The expected output is given exactly. Name the file: <code>exercises/06-control-flow/ex4_payroll.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 06, exercise 4: a month of payroll, day by day.
+//! Run with:  zig run ex4_payroll.zig
+//! Expected output (on stderr):
+//!   day 7: paid 200000, funds 385000
+//!   day 14: paid 200000, funds 270000
+//!   day 21: paid 200000, funds 155000
+//!   day 25: DEBT (-25000), stopping
+const std = @import("std");
+
+pub fn main() void {
+    var funds: i64 = 500_000;
+    const daily_cost: i64 = 45_000;
+    const weekly_pay: i64 = 200_000;
+    var day: u32 = 1;
+    while (day &lt;= 30) : (day += 1) {
+        funds -= daily_cost;
+        if (day % 7 == 0) {
+            funds += weekly_pay;
+            std.debug.print("day {d}: paid {d}, funds {d}\n", .{ day, weekly_pay, funds });
+        }
+        if (funds &lt; 0) {
+            std.debug.print("day {d}: DEBT ({d}), stopping\n", .{ day, funds });
+            break;
+        }
+    }
+}</code></pre>
+  <p>Order matters: the day's cost is subtracted, then pay is added and printed if it is a payday, then the debt check runs. Getting day 25 rather than day 26 depends on doing the check after the cost on the same day. The <code>break</code> leaves the <code>while</code> even though the continue expression has not run, which is exactly right.</p></details>
+</div>
+
+<h3 id="ch06-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is the difference between <code>0..n</code> in a <code>for</code> and <code>0...n</code> in a <code>switch</code>? <details class="answer"><summary>Answer</summary>Two dots is an exclusive-end range for iteration (0 to n-1); three dots is an inclusive range for a switch case (0 to n).</details></li>
+  <li>When does a <code>while</code> loop's continue expression run? <details class="answer"><summary>Answer</summary>At the end of every iteration, including after a <code>continue</code> statement; it does not run after a <code>break</code>.</details></li>
+  <li>What type does <code>|i|</code> have in <code>for (0..10) |i|</code>? <details class="answer"><summary>Answer</summary><code>usize</code>. Use <code>@intCast</code> to store it in a narrower type.</details></li>
+  <li>How do you get both the element and its index from a <code>for</code>? <details class="answer"><summary>Answer</summary>Iterate the array together with an open range: <code>for (items, 0..) |item, i|</code>.</details></li>
+  <li>When does the <code>else</code> of a loop run? <details class="answer"><summary>Answer</summary>When the loop ends because its condition became false or its items ran out, not when it ends by <code>break</code>. It supplies the loop's value in that case.</details></li>
+  <li>Why does <code>switch (x) { 0 =&gt; "a", 1 =&gt; "b" }</code> fail for <code>x: u2</code>? <details class="answer"><summary>Answer</summary>A <code>u2</code> has values 0 to 3; the switch is not exhaustive. Add arms for 2 and 3 or an <code>else</code>.</details></li>
+  <li>What happens if execution reaches <code>unreachable</code> in a Debug build? And in ReleaseFast? <details class="answer"><summary>Answer</summary>Debug: a panic, "reached unreachable code". ReleaseFast: undefined behaviour; the optimiser assumed it could not happen.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>if</code> takes a <code>bool</code> and can be an expression with a mandatory <code>else</code>.</li>
+<li><code>while (cond) : (step)</code> runs <code>step</code> after every iteration; <code>break</code> and <code>continue</code> work as expected.</li>
+<li><code>for</code> iterates ranges <code>a..b</code> and arrays, captures with <code>|x|</code>, gets an index from <code>0..</code>, and walks several things in step.</li>
+<li>Labels let <code>break :outer</code> and <code>continue :outer</code> reach an enclosing loop; loops can yield values with <code>break v</code> and <code>else</code>.</li>
+<li><code>switch</code> has values, lists, and inclusive <code>a...b</code> ranges, must be exhaustive, allows no overlap, and is an expression.</li>
+<li><code>unreachable</code> asserts a path cannot happen: a panic in Debug, a promise in release.</li>
+</ul></div>
+</section>

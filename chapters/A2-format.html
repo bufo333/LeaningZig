@@ -1,0 +1,126 @@
+<section id="appA2">
+<h2>Appendix A2. Format specifier reference</h2>
+<p class="goals"><strong>This appendix</strong> is the complete table of what can go inside <code>{…}</code> in a format string for <code>print</code>, <code>allocPrint</code>, <code>bufPrint</code> and <code>std.debug.print</code> in Zig 0.16. Every example was printed by one program (<code>a2_fmt.zig</code>, compiled and run while writing this page) and the output column is what it printed. If a placeholder is not in this table, it does not exist in 0.16.</p>
+
+<h3 id="appA2-1">A2.1 The grammar</h3>
+<p>A placeholder is</p>
+<pre><code>{[argument][specifier]:[fill][alignment][width].[precision]}</code></pre>
+<ul>
+<li><em>argument</em>: nothing (the next argument in order), a number (<code>{0}</code>, <code>{1}</code>), or a field name in square brackets (<code>{[score]}</code>) when the argument tuple is a struct literal with named fields.</li>
+<li><em>specifier</em>: one of the letters in A2.2, chosen by the type of the argument.</li>
+<li><em>fill</em>: one byte used for padding. If you give a fill you must also give an alignment, or the byte is read as a width.</li>
+<li><em>alignment</em>: <code>&lt;</code> left, <code>^</code> centre, <code>&gt;</code> right.</li>
+<li><em>width</em>: the minimum field width in bytes. Alignment is by bytes, not by displayed characters; it is only right for ASCII.</li>
+<li><em>precision</em>: for floats, the number of decimals; for <code>{s}</code>, a maximum length.</li>
+</ul>
+<p>A literal brace is doubled: <code>{{</code> prints <code>{</code> and <code>}}</code> prints <code>}</code>. That matters whenever a format string contains IRON LEDGER's <code>{g}…{/}</code> colour markup (<a href="#ch44">Chapter 44</a>).</p>
+
+<h3 id="appA2-2">A2.2 Specifiers by type</h3>
+<table>
+<tr><th>Placeholder</th><th>Applies to</th><th>Example</th><th>Output</th></tr>
+<tr><td><code>{}</code></td><td>integers, floats, bools; anything with an unambiguous default</td><td><code>{}</code> with <code>-42</code></td><td><code>-42</code></td></tr>
+<tr><td><code>{d}</code></td><td>integers and floats, decimal</td><td><code>{d}</code> with <code>-42</code>; with <code>3.14159</code></td><td><code>-42</code>; <code>3.14159</code></td></tr>
+<tr><td><code>{d:.2}</code></td><td>floats, fixed decimals</td><td><code>{d:.2}</code> with <code>3.14159</code></td><td><code>3.14</code></td></tr>
+<tr><td><code>{d:.0}</code></td><td>floats, no decimals</td><td><code>{d:.0}</code> with <code>2.71828</code></td><td><code>3</code></td></tr>
+<tr><td><code>{e}</code>, <code>{E}</code></td><td>floats, scientific</td><td><code>{e}</code>; <code>{e:.3}</code> with <code>3.14159</code></td><td><code>3.14159e0</code>; <code>3.142e0</code></td></tr>
+<tr><td><code>{x}</code>, <code>{X}</code></td><td>integers in hex; also a string as hex bytes</td><td><code>{x}</code>, <code>{X}</code> with <code>255</code>; <code>{x}</code> with <code>"iron"</code></td><td><code>ff</code>; <code>FF</code>; <code>69726f6e</code></td></tr>
+<tr><td><code>{b}</code></td><td>integers, binary</td><td><code>{b}</code> with <code>5</code></td><td><code>101</code></td></tr>
+<tr><td><code>{o}</code></td><td>integers, octal</td><td><code>{o}</code> with <code>8</code></td><td><code>10</code></td></tr>
+<tr><td><code>{c}</code></td><td>an integer of at most 8 bits as an ASCII character</td><td><code>{c}</code> with <code>'A'</code></td><td><code>A</code></td></tr>
+<tr><td><code>{u}</code></td><td>an integer of at most 21 bits as a UTF-8 code point</td><td><code>{u}</code> with <code>0x263A</code></td><td><code>☺</code></td></tr>
+<tr><td><code>{s}</code></td><td><code>[]const u8</code>, <code>[*:0]const u8</code>, or a pointer to a <code>u8</code> array</td><td><code>{s}</code> with <code>"iron"</code>; with a C string; with <code>&amp;[3]u8{'a','b','c'}</code></td><td><code>iron</code>; <code>zig</code>; <code>abc</code></td></tr>
+<tr><td><code>{t}</code></td><td>enum, tagged union or error: the tag or error name</td><td><code>{t}</code> with <code>Color.green</code>; with <code>error.Boom</code>; with a union</td><td><code>green</code>; <code>Boom</code>; <code>n</code></td></tr>
+<tr><td><code>{any}</code></td><td>anything: arrays, slices, structs, unions, optionals, in Zig literal syntax</td><td><code>{any}</code> with <code>[3]u8{1,2,3}</code>; with a struct; with a union</td><td><code>{ 1, 2, 3 }</code>; <code>.{ .x = 1, .y = 2 }</code>; <code>.{ .n = 3 }</code></td></tr>
+<tr><td><code>{?}</code>, <code>{?d}</code>, <code>{?s}</code></td><td>optionals: prints <code>null</code> or the payload with the specifier after <code>?</code></td><td><code>{?}</code> with <code>null</code> and with <code>7</code>; <code>{?s}</code> with <code>"maybe"</code></td><td><code>null</code>; <code>7</code>; <code>maybe</code></td></tr>
+<tr><td><code>{!}</code>, <code>{!s}</code></td><td>error unions: the error name, or the payload with the specifier after <code>!</code></td><td><code>{!}</code> with <code>error.Boom</code>; <code>{!s}</code> with <code>"fine"</code></td><td><code>error.Boom</code>; <code>fine</code></td></tr>
+<tr><td><code>{f}</code></td><td>a struct or union with a <code>pub fn format(self, w: *std.Io.Writer) std.Io.Writer.Error!void</code> method</td><td><code>{f}</code> with <code>Point{ .x = 1, .y = 2 }</code></td><td><code>(1, 2)</code></td></tr>
+<tr><td><code>{B}</code>, <code>{Bi}</code></td><td>an integer as a byte size, decimal or binary units</td><td><code>{B}</code>, <code>{Bi}</code> with <code>1536</code></td><td><code>1.536kB</code>; <code>1.5KiB</code></td></tr>
+<tr><td><code>{b64}</code></td><td>a string as standard base64</td><td><code>{b64}</code> with <code>"iron"</code></td><td><code>aXJvbg==</code></td></tr>
+<tr><td><code>{*}</code></td><td>a pointer: the pointee type and the address</td><td><code>{*}</code> with <code>&amp;n</code></td><td><code>i32@104f837d0</code> (varies)</td></tr>
+<tr><td><code>{{</code>, <code>}}</code></td><td>literal braces</td><td><code>{{}}</code></td><td><code>{}</code></td></tr>
+</table>
+<div class="warn"><strong>Things that do not work.</strong> <code>{}</code> on a slice or string is a compile error ("cannot format slice without a specifier (i.e. {s}, {x}, {b64}, or {any})"): you must say <code>{s}</code> or <code>{any}</code>. <code>{d}</code> on an array or slice of integers is an error too; use <code>{any}</code>. <code>{D}</code> (nanoseconds as a duration) is mentioned in the standard library's doc comment but is rejected for integers in 0.16.0 ("invalid format string 'D' for type 'u64'"); do not use it. And the old <code>format(self, comptime fmt, options, writer: anytype)</code> method signature is no longer called by <code>{}</code>; see <a href="#appA3">A3</a>.</div>
+
+<h3 id="appA2-3">A2.3 Width, alignment, fill and precision</h3>
+<table>
+<tr><th>Placeholder</th><th>Meaning</th><th>Example</th><th>Output</th></tr>
+<tr><td><code>{s:&lt;8}</code></td><td>left-align in 8</td><td>with <code>"iron"</code></td><td><code>iron    </code></td></tr>
+<tr><td><code>{s:&gt;8}</code></td><td>right-align in 8</td><td>with <code>"iron"</code></td><td><code>    iron</code></td></tr>
+<tr><td><code>{s:^8}</code></td><td>centre in 8</td><td>with <code>"iron"</code></td><td><code>  iron  </code></td></tr>
+<tr><td><code>{s:*^8}</code></td><td>centre in 8, fill with <code>*</code></td><td>with <code>"iron"</code></td><td><code>**iron**</code></td></tr>
+<tr><td><code>{d:&gt;6}</code></td><td>right-align a number in 6</td><td>with <code>-42</code></td><td><code>   -42</code></td></tr>
+<tr><td><code>{d:&lt;6}</code></td><td>left-align a number in 6</td><td>with <code>-42</code></td><td><code>-42   </code></td></tr>
+<tr><td><code>{d:0&gt;6}</code></td><td>right-align, fill with zeros</td><td>with <code>42</code></td><td><code>000042</code></td></tr>
+<tr><td><code>{x:0&gt;8}</code></td><td>hex, zero-padded to 8</td><td>with <code>255</code></td><td><code>000000ff</code></td></tr>
+<tr><td><code>{d:&gt;[1]}</code></td><td>width taken from argument 1</td><td>with <code>.{ 7, 5 }</code></td><td><code>    7</code></td></tr>
+<tr><td><code>{1s} {0s}</code></td><td>positional arguments</td><td>with <code>.{ "first", "second" }</code></td><td><code>second first</code></td></tr>
+<tr><td><code>{[b]}{[a]}</code></td><td>named arguments</td><td>with <code>.{ .a = 1, .b = 2 }</code></td><td><code>21</code></td></tr>
+</table>
+<p>The IRON LEDGER row format from <a href="#ch44">Chapter 44</a> uses these with a space after the colon, <code>{d: &lt;4}</code>, which reads as "fill with space, left, width 4"; the space is the fill byte, and it is the same as <code>{d:&lt;4}</code>.</p>
+
+<h3 id="appA2-4">A2.4 The program</h3>
+<p>For reference, the file that produced every output above. Copy it into your scratch directory and run it with <code>zig run</code>; it is a quick way to check a placeholder before using it.</p>
+<pre><code>const std = @import("std");
+const Point = struct {
+    x: i32,
+    y: i32,
+    pub fn format(self: Point, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("({d}, {d})", .{ self.x, self.y });
+    }
+};
+const Color = enum { red, green };
+pub fn main(init: std.process.Init) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+    const n: i32 = -42;
+    const f: f64 = 3.14159;
+    const s: []const u8 = "iron";
+    const opt: ?u8 = null;
+    const opt2: ?u8 = 7;
+    const eu: anyerror!u8 = error.Boom;
+    const arr = [_]u8{ 1, 2, 3 };
+    const p = Point{ .x = 1, .y = 2 };
+    try out.print("{{}}       |{}|\n", .{n});
+    try out.print("{{d}}      |{d}|\n", .{n});
+    try out.print("{{d}} f    |{d}|\n", .{f});
+    try out.print("{{d:.2}}   |{d:.2}|\n", .{f});
+    try out.print("{{e}}      |{e}|\n", .{f});
+    try out.print("{{x}}      |{x}|\n", .{@as(u32, 255)});
+    try out.print("{{x:0&gt;8}}  |{x:0&gt;8}|\n", .{@as(u32, 255)});
+    try out.print("{{c}}      |{c}|\n", .{@as(u8, 'A')});
+    try out.print("{{u}}      |{u}|\n", .{@as(u21, 0x263A)});
+    try out.print("{{s:*^8}}  |{s:*^8}|\n", .{s});
+    try out.print("{{any}}    |{any}|\n", .{arr});
+    try out.print("{{?}}      |{?}|  |{?}|\n", .{ opt, opt2 });
+    try out.print("{{!}}      |{!}|\n", .{eu});
+    try out.print("{{t}}      |{t}|\n", .{Color.green});
+    try out.print("{{f}}      |{f}|\n", .{p});
+    try out.print("{{B}}      |{B}|\n", .{@as(u64, 1536)});
+    try out.print("{{b64}}    |{b64}|\n", .{"iron"});
+    try out.print("{{1s}} {{0s}} |{1s} {0s}|\n", .{ "first", "second" });
+    try out.print("{{[b]}}{{[a]}} |{[b]}{[a]}|\n", .{ .a = 1, .b = 2 });
+    try out.print("{{d:&gt;[1]}} |{d:&gt;[1]}|\n", .{ 7, 5 });
+    try out.flush();
+}</code></pre>
+<pre class="term">{}       |-42|
+{d}      |-42|
+{d} f    |3.14159|
+{d:.2}   |3.14|
+{e}      |3.14159e0|
+{x}      |ff|
+{x:0&gt;8}  |000000ff|
+{c}      |A|
+{u}      |☺|
+{s:*^8}  |**iron**|
+{any}    |{ 1, 2, 3 }|
+{?}      |null|  |7|
+{!}      |error.Boom|
+{t}      |green|
+{f}      |(1, 2)|
+{B}      |1.536kB|
+{b64}    |aXJvbg==|
+{1s} {0s} |second first|
+{[b]}{[a]} |21|
+{d:&gt;[1]} |    7|</pre>
+</section>

@@ -1,0 +1,309 @@
+<section id="ch47">
+<h2>47. Persistence: SQLite by hand</h2>
+<p class="goals"><strong>In this chapter</strong> you read the save system: eighteen <code>extern fn</code> lines that bind the system's SQLite library, a small Zig wrapper that turns C return codes into errors, and a store that writes a campaign into forty-nine tables and reads it back so exactly that the loaded state hashes the same as the saved one. You will carry a new field through the four places it must touch, write a migration for it, and prove the round trip.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch35">Chapter 35</a> (<code>extern fn</code>, <code>opaque {}</code>, <code>c_int</code>, <code>[*:0]const u8</code>, <code>?*anyopaque</code>, and linking a system library), <a href="#ch17">Chapter 17</a> (<code>defer</code> and <code>errdefer</code> around a transaction), <a href="#ch27">Chapter 27</a> (switching on <code>@typeInfo</code> to pick a binding by type, and <code>inline for</code> over a tuple), <a href="#ch26">Chapter 26</a> (<code>anytype</code> parameters), <a href="#ch13">Chapter 13</a> (exhaustive versus non-exhaustive enums, <code>@tagName</code>, <code>std.meta.stringToEnum</code>) and <a href="#ch16">Chapter 16</a>.</div>
+
+<h3 id="ch47-1">47.1 The binding</h3>
+<p>There is no SQLite wrapper library and no <code>@cImport</code>. The whole foreign interface is declared by hand at the top of one file:</p>
+<div class="file">src/persist/sqlite.zig</div>
+<pre><code>//! Minimal hand-bound SQLite3 surface (Stage 11): open/close, exec,
+//! prepared statements with typed bind/column helpers. Just enough for
+//! save/load; no ORM ambitions.
+
+const std = @import("std");
+
+pub const Handle = opaque {};
+pub const StmtHandle = opaque {};
+
+extern fn sqlite3_open(filename: [*:0]const u8, db: *?*Handle) c_int;
+extern fn sqlite3_close(db: *Handle) c_int;
+extern fn sqlite3_exec(db: *Handle, sql: [*:0]const u8, cb: ?*anyopaque, arg: ?*anyopaque, errmsg: ?*?[*:0]u8) c_int;
+extern fn sqlite3_free(p: ?*anyopaque) void;
+extern fn sqlite3_prepare_v2(db: *Handle, sql: [*]const u8, nbyte: c_int, stmt: *?*StmtHandle, tail: ?*?[*]const u8) c_int;
+extern fn sqlite3_step(stmt: *StmtHandle) c_int;
+extern fn sqlite3_reset(stmt: *StmtHandle) c_int;
+extern fn sqlite3_finalize(stmt: *StmtHandle) c_int;
+extern fn sqlite3_bind_int64(stmt: *StmtHandle, idx: c_int, v: i64) c_int;
+extern fn sqlite3_bind_null(stmt: *StmtHandle, idx: c_int) c_int;
+extern fn sqlite3_bind_text(stmt: *StmtHandle, idx: c_int, text: [*]const u8, n: c_int, destructor: ?*const anyopaque) c_int;
+extern fn sqlite3_bind_blob(stmt: *StmtHandle, idx: c_int, data: [*]const u8, n: c_int, destructor: ?*const anyopaque) c_int;
+extern fn sqlite3_column_int64(stmt: *StmtHandle, col: c_int) i64;
+extern fn sqlite3_column_text(stmt: *StmtHandle, col: c_int) ?[*:0]const u8;
+extern fn sqlite3_column_blob(stmt: *StmtHandle, col: c_int) ?*const anyopaque;
+extern fn sqlite3_column_bytes(stmt: *StmtHandle, col: c_int) c_int;
+extern fn sqlite3_column_type(stmt: *StmtHandle, col: c_int) c_int;
+extern fn sqlite3_errmsg(db: *Handle) [*:0]const u8;
+
+const SQLITE_OK = 0;
+const SQLITE_ROW = 100;
+const SQLITE_DONE = 101;
+const SQLITE_NULL = 5;
+/// SQLITE_TRANSIENT: "copy the data, the caller's buffer won't outlive
+/// the call" — encoded by SQLite as the destructor pointer (void*)-1.
+const transient: ?*const anyopaque = @ptrFromInt(std.math.maxInt(usize));</code></pre>
+<p>Eighteen declarations (the original guide said eleven; the surface grew with blobs and column types) and two <code>opaque</code> types. Every C type from <a href="#ch35">Chapter 35</a> is here with its honest Zig spelling: <code>c_int</code> for <code>int</code>; <code>[*:0]const u8</code> for a C string; <code>[*]const u8</code> plus a length for text that is not zero-terminated; <code>*?*Handle</code> for an out-parameter that C fills with a pointer or leaves null; <code>?*anyopaque</code> for <code>void*</code>; <code>?[*:0]const u8</code> for a returned C string that may be null. The linker finds the symbols because <code>build.zig</code> said <code>linkSystemLibrary("sqlite3")</code>.</p>
+<p>The last constant is the kind of thing a binding must know and a tutorial never mentions: SQLite's <code>SQLITE_TRANSIENT</code> is not a function but the pointer value <code>-1</code>, meaning "copy this buffer, it will not outlive the call". Zig has no implicit integer-to-pointer conversion, so it is written as <code>@ptrFromInt(std.math.maxInt(usize))</code> with a comment. Every text bind passes it, because the Zig strings being bound live in an arena that may be reset before SQLite finishes.</p>
+
+<h3 id="ch47-2">47.2 The wrapper</h3>
+<p>Above the raw functions sit two small structs, <code>Db</code> and <code>Stmt</code>, that the rest of the program uses. They turn return codes into errors and pointers into slices, so nothing outside this file ever sees a <code>c_int</code>. The binding of a tuple of values is the part worth reading closely, and you met it in <a href="#ch27">Chapter 27</a>:</p>
+<pre><code>/// Bind a tuple of values to ?1..?N. Ints, bools, enums (as their tag
+/// name), strings, and optionals of those (null → NULL).
+pub fn bindAll(self: Stmt, args: anytype) Error!void {
+    inline for (args, 1..) |arg, i| try self.bind(@intCast(i), arg);
+}
+
+pub fn bind(self: Stmt, idx: c_int, value: anytype) Error!void {
+    const T = @TypeOf(value);
+    const rc = switch (@typeInfo(T)) {
+        .int, .comptime_int =&gt; sqlite3_bind_int64(self.h, idx, @intCast(value)),
+        .bool =&gt; sqlite3_bind_int64(self.h, idx, @intFromBool(value)),
+        .@"enum" =&gt; blk: {
+            if (@typeInfo(T).@"enum".is_exhaustive) {
+                const name = @tagName(value);
+                break :blk sqlite3_bind_text(self.h, idx, name.ptr, @intCast(name.len), transient);
+            }
+            break :blk sqlite3_bind_int64(self.h, idx, @intCast(@intFromEnum(value)));
+        },
+        .optional =&gt; if (value) |v| return self.bind(idx, v) else sqlite3_bind_null(self.h, idx),
+        .pointer =&gt; |p| blk: {
+            const s: []const u8 = value;
+            _ = p;
+            break :blk sqlite3_bind_text(self.h, idx, s.ptr, @intCast(s.len), transient);
+        },
+        .null =&gt; sqlite3_bind_null(self.h, idx),
+        else =&gt; @compileError("unsupported bind type " ++ @typeName(T)),
+    };
+    if (rc != SQLITE_OK) return error.SqliteError;
+}</code></pre>
+<p><code>inline for</code> over the tuple unrolls at compile time, so each element gets its own <code>bind</code> call specialised for its own type. Inside <code>bind</code>, the switch on <code>@typeInfo(T)</code> is resolved at compile time too; a call with an <code>i64</code> compiles to one <code>sqlite3_bind_int64</code> and nothing else. The <code>else</code> arm is a <code>@compileError</code> with the type's name in it, so binding a float or a struct fails at build time with a message saying which type.</p>
+<p>The enum arm encodes a rule that shapes the whole save format. An <em>exhaustive</em> enum (a role, a status, a category) is stored as its tag name, text, so the save file is readable in any SQLite browser and survives someone reordering the enum. A <em>non-exhaustive</em> enum (every typed ID, <a href="#ch13">Chapter 13</a>) is stored as its integer. Reading back mirrors it: <code>enumValue</code> uses <code>std.meta.stringToEnum</code> for names, and a helper <code>toId</code> uses <code>@enumFromInt</code> for IDs. You can see the whole family in one line of the store: <code>try st.bindAll(.{ cid, c.name, c.origin, c.profession });</code> binds an integer, a string and two exhaustive enums.</p>
+<p>Column access is the other half: <code>st.int(col)</code>, <code>st.optInt(col)</code>, <code>st.text(col, alloc)</code>, <code>st.optText</code>, <code>st.blob</code>, <code>st.enumValue(E, col)</code>. The text helpers <em>copy</em> the bytes into the caller's allocator, because SQLite's own buffer dies on the next <code>step</code>; the doc comment says so. The one test at the bottom of the file opens an in-memory database, creates a table, inserts a row through <code>bindAll</code> and reads it back, which is enough to prove the library links and the marshalling works.</p>
+
+<h3 id="ch47-3">47.3 The store: schema and migrations</h3>
+<p><code>store.zig</code> owns the schema as a string constant of forty-nine <code>CREATE TABLE IF NOT EXISTS</code> statements, one row per entity and child tables for list-valued fields (skills, injuries, awards, force children, unit slots). Opening a store runs that DDL, then reconciles the schema version:</p>
+<div class="file">src/persist/store.zig</div>
+<pre><code>pub const schema_version = 19;
+
+/// One schema step (Stage 12.17): the version it brings the store to,
+/// and the column it adds. `CREATE TABLE IF NOT EXISTS` in `ddl` covers
+/// new tables; columns on existing tables are the only thing SQLite
+/// makes us migrate by hand. Steps are idempotent (column-guarded) so a
+/// store that predates the version key still upgrades cleanly.
+pub const Migration = struct { version: u32, table: []const u8, column: []const u8, sql: [*:0]const u8 };
+pub const migrations = [_]Migration{
+    .{ .version = 2, .table = "campaign", .column = "player_id", .sql = "ALTER TABLE campaign ADD COLUMN player_id INTEGER NOT NULL DEFAULT 0" },
+    .{ .version = 3, .table = "person", .column = "admitted", .sql = "ALTER TABLE person ADD COLUMN admitted INTEGER NOT NULL DEFAULT 0" },
+    // …
+    .{ .version = 15, .table = "person", .column = "shares", .sql = "ALTER TABLE person ADD COLUMN shares INTEGER NOT NULL DEFAULT 0" },
+    .{ .version = 16, .table = "person", .column = "born_day", .sql = "ALTER TABLE person ADD COLUMN born_day INTEGER" },
+    .{ .version = 17, .table = "person", .column = "last_raise_day", .sql = "ALTER TABLE person ADD COLUMN last_raise_day INTEGER" },
+    .{ .version = 17, .table = "person", .column = "last_award_day", .sql = "ALTER TABLE person ADD COLUMN last_award_day INTEGER" },
+    // v18 adds the `rating_snapshot` table (created by ddl) and the stats meta ints.
+    .{ .version = 19, .table = "listing", .column = "black", .sql = "ALTER TABLE listing ADD COLUMN black INTEGER NOT NULL DEFAULT 0" },
+};
+
+/// Adopt an open database: create what's missing, migrate what's old.
+pub fn fromDb(db: sqlite.Db) !Store {
+    try db.exec(ddl);
+    const store: Store = .{ .db = db };
+    const stored: u32 = @intCast(@max(1, store.getSetting("schema_version", 1)));
+    if (stored &gt; schema_version) return error.StoreNewerThanGame;
+    try db.exec("BEGIN");
+    errdefer db.exec("ROLLBACK") catch {};
+    for (migrations) |m| {
+        if (m.version &lt;= stored) continue;
+        if (!try hasColumnRt(db, m.table, m.column)) try db.exec(m.sql);
+    }
+    try store.setSetting("schema_version", schema_version);
+    try db.exec("COMMIT");
+    return store;
+}</code></pre>
+<p>You read <code>fromDb</code> in the original guide as an example of <code>errdefer</code>; now read it as a design. New tables need no migration because the DDL says <code>IF NOT EXISTS</code>. Columns on existing tables are the one thing SQLite cannot add idempotently, so each is a row in a table of migrations guarded by "does the column exist yet" (<code>hasColumnRt</code> runs <code>PRAGMA table_info</code>). The guard makes every step safe to re-run, which matters for a store that predates the version key. All steps run inside one transaction; if any fails, the <code>errdefer</code> rolls back and the <code>catch {}</code> on the rollback says there is nothing more to do if even that fails. And a store from a newer version of the game is refused with a named error rather than misread.</p>
+<p>Data fixes that need Zig logic run after load in <code>upgradeCampaign(gs, from_version)</code>: when birthdays were added at version 16, every person in an older save was given one by rolling age from the <code>.generation</code> stream, which keeps even the upgrade deterministic.</p>
+
+<h3 id="ch47-4">47.4 Save and load</h3>
+<p>Saving is one transaction that deletes the campaign's rows and inserts them afresh. Here is the beginning and the person block:</p>
+<pre><code>pub fn save(self: Store, gs: *GameState) !void {
+    try self.db.exec("BEGIN");
+    errdefer self.db.exec("ROLLBACK") catch {};
+
+    var date_buf: [16]u8 = undefined;
+    const d = gs.clock.date;
+    const date = try std.fmt.bufPrint(&amp;date_buf, "{d}-{d:0&gt;2}-{d:0&gt;2}", .{ d.year, d.month, d.day });
+    const cmdr_name: []const u8 = if (gs.commander) |c| c.name else "";
+
+    if (gs.campaign_id == 0) {
+        const ins = try self.db.prepare("INSERT INTO campaign (name, commander, day, date, schema_version, save_seq, player_id) VALUES (?1, ?2, ?3, ?4, ?5, (SELECT COALESCE(MAX(save_seq), 0) + 1 FROM campaign), ?6)");
+        defer ins.finalize();
+        try ins.bindAll(.{ gs.outfit_name, cmdr_name, @as(i64, gs.clock.day_index), date, @as(i64, schema_version), self.player_id });
+        try ins.run();
+        const q = try self.db.prepare("SELECT last_insert_rowid()");
+        defer q.finalize();
+        _ = try q.next();
+        gs.campaign_id = q.int(0);
+    } else {
+        // … UPDATE campaign SET … WHERE id = ?6 …
+    }
+    // … DELETE this campaign's rows from every table …
+
+    // People.
+    {
+        const st = try self.db.prepare("INSERT INTO person VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)");
+        defer st.finalize();
+        const sk = try self.db.prepare("INSERT INTO person_skill VALUES (?1, ?2, ?3, ?4)");
+        defer sk.finalize();
+        // … awards, abilities, injuries …
+        var it = gs.people.iterator();
+        var ord: i64 = 0;
+        while (it.next()) |entry| : (ord += 1) {
+            const p = entry.value_ptr;
+            try st.bindAll(.{
+                cid, ord, @intFromEnum(p.id),
+                p.first_name, p.last_name, p.callsign,
+                p.role, @as(i64, p.xp), p.status,
+                @as(i64, p.fatigue), @as(i64, p.morale), @as(i64, p.recruited_day),
+                p.salary_override, @intFromEnum(p.assigned_force), @intFromEnum(p.posted_hq),
+                // … twenty more …
+                p.last_raise_day, p.last_award_day,
+            });
+            try st.run();
+            var skit = p.skills.iterator();
+            while (skit.next()) |s| {
+                try sk.bindAll(.{ cid, @intFromEnum(p.id), s.key_ptr.*, @as(i64, s.value_ptr.*) });
+                try sk.run();
+            }
+            // …
+        }
+    }
+    // … units, forces, HQs, contracts, ledger, … COMMIT
+}</code></pre>
+<p>Every prepared statement is paired with <code>defer st.finalize()</code> on the next line, the <a href="#ch17">Chapter 17</a> habit. Each person becomes one <code>bindAll</code> with thirty-five values, and the types do the marshalling: <code>p.role</code> (exhaustive enum) becomes text, <code>@intFromEnum(p.assigned_force)</code> (a typed ID) becomes an integer, <code>p.callsign</code> (an optional string) becomes text or NULL, <code>@as(i64, p.xp)</code> widens a <code>u32</code> explicitly. The <code>ord</code> column records insertion order, and loading reads <code>ORDER BY ord</code> and re-inserts into the ordered map in that order, which is why the loaded state hashes the same as the saved one (<a href="#ch41">Chapter 41</a>).</p>
+<p>Loading is the mirror image: <code>GameState.init(gpa, .{})</code>, then a <code>SELECT … WHERE cid = ?1 ORDER BY ord</code> per table, each row rebuilt as a struct literal with <code>st.int</code>, <code>st.text(col, alloc)</code> and <code>st.enumValue</code>, and inserted with <code>gs.people.put(alloc, p.id, p)</code>. The allocator is the new state's arena, so loaded strings live exactly as long as generated ones.</p>
+
+<h3 id="ch47-5">47.5 The round trip</h3>
+<p>The test that guards all of this is worth reading in full in the source; here is its shape:</p>
+<pre><code>test "save → load → identical hash, and the loaded campaign keeps playing" {
+    const commands = @import("../sim/commands.zig");
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 1101 });
+    defer gs.deinit();
+    _ = try commands.execute(&amp;gs, .{ .create_commander = .{ .name = "Erik Kalmar", .origin = .CC, .profession = .quartermaster } });
+    // … a company, a contract, policies, forty days of play, a few hand-set fields …
+    const before = gs.hash();
+
+    const store = try Store.open(":memory:");
+    defer store.close();
+    try store.save(&amp;gs);
+    try std.testing.expect(gs.campaign_id &gt; 0);
+
+    var loaded = try store.load(std.testing.allocator, gs.campaign_id);
+    defer loaded.deinit();
+    try std.testing.expectEqual(before, loaded.hash());
+    // … thirty more assertions on individual fields …
+
+    // Determinism survives the round trip: both worlds evolve identically.
+    _ = try commands.execute(&amp;gs, .{ .advance_days = 30 });
+    _ = try commands.execute(&amp;loaded, .{ .advance_days = 30 });
+    try std.testing.expectEqual(gs.hash(), loaded.hash());
+}</code></pre>
+<p>Three properties in one test: the hash survives the trip; specific fields survive it (each added when the field was); and, most telling, the loaded campaign and the original evolve identically for thirty more days, which means the RNG state itself was saved and restored exactly (it is a blob in the <code>rng</code> table). <code>":memory:"</code> is SQLite's in-memory database, so the test touches no file.</p>
+<p>The guide records a trap from the project's history that this test caught: the binding of a new column to the <code>INSERT</code> was once lost when the formatter reflowed a long argument list and an edit missed the new shape, so a value saved as NULL. "Add a field" has four places to touch (struct, DDL, insert, select) plus a migration, and a test that checks the fourth is worth more than care at the first three. The first exercise makes you touch all five.</p>
+
+<h3 id="ch47-reading">Guided reading</h3>
+<ol>
+<li><code>src/persist/sqlite.zig</code>, all of it (193 lines). Read the externs, then <code>Db.open</code>, <code>Db.exec</code>, <code>Db.prepare</code>, then <code>Stmt.bind</code>, <code>run</code>, <code>next</code>, <code>text</code>, <code>enumValue</code>, then the test.</li>
+<li><code>src/persist/store.zig</code>: <code>schema_version</code>, the <code>ddl</code> string (skim; find the <code>person</code> table), <code>migrations</code>, <code>fromDb</code>, <code>hasColumnRt</code>, <code>getSetting</code>/<code>setSetting</code>.</li>
+<li><code>save</code> from the top through the people block, then <code>load</code> from the top through the people block. Put them side by side and match column 7 in the INSERT with column 7 in the SELECT.</li>
+<li><code>upgradeCampaign</code>, and the four tests at the bottom, especially "12.17: a v5 store upgrades in place", which inserts a hand-written old-schema row and opens it.</li>
+<li><code>docs/schema.sql</code>, which is the DDL laid out for humans.</li>
+</ol>
+
+<h3 id="ch47-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 47.1 · A field through all four places, plus a migration <span class="level">challenge</span></h4>
+<p>Add <code>commendations: u32 = 0</code> to <code>Person</code> and persist it: a column in the DDL, a migration to version 20 (bump <code>schema_version</code>), a 36th placeholder and bind in the INSERT, a column and a read in the SELECT. Then write a round-trip test that sets the field on one person and reads it back.</p>
+<details class="answer"><summary>Solution</summary>
+<div class="file">src/domain/person.zig</div>
+<pre><code>    outstanding_tours: u32 = 0,
+    /// Commendations in dispatches.
+    commendations: u32 = 0,</code></pre>
+<div class="file">src/persist/store.zig (five edits)</div>
+<pre><code>pub const schema_version = 20;
+// in ddl, the person table, before PRIMARY KEY:
+//   … last_award_day INTEGER, commendations INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (cid, id));
+// in migrations, after the v19 row:
+    .{ .version = 20, .table = "person", .column = "commendations", .sql = "ALTER TABLE person ADD COLUMN commendations INTEGER NOT NULL DEFAULT 0" },
+// in save: "… ?34,?35,?36)" and, as the last bound value:
+                p.last_raise_day, p.last_award_day, @as(i64, p.commendations),
+// in load: "… last_raise_day, last_award_day, commendations FROM person …" and
+                    .last_award_day = optU32(st.optInt(32)),
+                    .commendations = @intCast(st.int(33)),</code></pre>
+<pre><code>test "a new person field survives the round trip" {
+    var gs = GameState.init(std.testing.allocator, .{ .seed = 5 });
+    defer gs.deinit();
+    const id = try gs.hirePerson("Lori", "Kalmar", .mekwarrior);
+    gs.person(id).?.commendations = 3;
+    const store = try Store.open(":memory:");
+    defer store.close();
+    try store.save(&amp;gs);
+    var loaded = try store.load(std.testing.allocator, gs.campaign_id);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), loaded.person(id).?.commendations);
+}</code></pre>
+<p>Column indices in the SELECT are zero-based, so the 34th column is index 33. The existing "v5 store upgrades in place" test still passes: its hand-written old row has 22 columns, and the migrations add the rest, now including yours. If you forget the migration, an existing save file opens with a <code>person</code> table lacking the column and the INSERT fails at runtime with an SQLite error logged by <code>Stmt.run</code>; the in-memory tests would not catch that, because they always start from a fresh DDL. That is the argument for the "v5 fixture" test.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 47.2 · Names, not numbers <span class="level">warm-up</span></h4>
+<p>Write a test in <code>sqlite.zig</code> that declares a two-variant exhaustive enum, binds one of its values into a <code>TEXT</code> column, reads the column back as text, and asserts it is the tag name. Then read it back with <code>enumValue</code>.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "an exhaustive enum is stored as its name" {
+    const Role = enum { pilot, tech };
+    const db = try Db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE TABLE t (role TEXT)");
+    const ins = try db.prepare("INSERT INTO t VALUES (?1)");
+    defer ins.finalize();
+    try ins.bindAll(.{Role.tech});
+    try ins.run();
+    const sel = try db.prepare("SELECT role FROM t");
+    defer sel.finalize();
+    try std.testing.expect(try sel.next());
+    const s = try sel.text(0, std.testing.allocator);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("tech", s);
+    try std.testing.expectEqual(Role.tech, sel.enumValue(Role, 0).?);
+}</code></pre>
+<p>The enum can be declared inside the test; types are values (<a href="#ch26">Chapter 26</a>). <code>sel.text</code> allocates a copy with the testing allocator, hence the <code>defer free</code>. Had <code>Role</code> been declared <code>enum(u8) { pilot, tech, _ }</code>, <code>bind</code> would have stored <code>1</code> instead, by the rule in 47.2.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 47.3 · A store from the future <span class="level">practice</span></h4>
+<p>Write a test proving <code>Store.fromDb</code> refuses a database whose stored <code>schema_version</code> is greater than the game's. You will need to create the <code>setting</code> table by hand and insert a large version before calling <code>fromDb</code>.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "a store from the future is refused" {
+    const db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE TABLE setting (key TEXT PRIMARY KEY, value INTEGER NOT NULL)");
+    try db.exec("INSERT INTO setting VALUES ('schema_version', 999)");
+    try std.testing.expectError(error.StoreNewerThanGame, Store.fromDb(db));
+}</code></pre>
+<p><code>fromDb</code> runs the DDL first (harmless, the table exists), reads the setting, and returns the error before <code>BEGIN</code>, so nothing is written. The <code>Store</code> is never constructed, which is why the test closes the raw <code>Db</code> itself. There is a parallel check in <code>load</code> (<code>error.SaveNewerThanGame</code>) for an individual campaign row, because one store can hold campaigns saved by different builds.</p></details>
+</div>
+
+<h3 id="ch47-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>What does <code>opaque {}</code> express, and why is it the right type for a SQLite handle? <details class="answer"><summary>Answer</summary>A type you can point to but never look inside; a C library's handle is exactly that, so <code>*Handle</code> is a pointer with no Zig-visible contents.</details></li>
+<li>Why is <code>transient</code> defined as <code>@ptrFromInt(maxInt(usize))</code>? <details class="answer"><summary>Answer</summary>SQLite encodes <code>SQLITE_TRANSIENT</code> as the destructor pointer value <code>-1</code>; Zig has no implicit int-to-pointer conversion, so the constant must be built explicitly, and it tells SQLite to copy the buffer.</details></li>
+<li>How does <code>bind</code> decide between text and integer for an enum? <details class="answer"><summary>Answer</summary>By <code>@typeInfo(T).@"enum".is_exhaustive</code>: exhaustive enums are stored by <code>@tagName</code>, non-exhaustive ones (typed IDs) by <code>@intFromEnum</code>.</details></li>
+<li>Why do new tables need no migration but new columns do? <details class="answer"><summary>Answer</summary>The DDL uses <code>CREATE TABLE IF NOT EXISTS</code>, which is idempotent; SQLite has no "add column if not exists", so each column is a guarded migration row.</details></li>
+<li>What does the <code>ord</code> column achieve? <details class="answer"><summary>Answer</summary>It records insertion order so that loading can rebuild the ordered maps in the same order, which makes the loaded state hash identically.</details></li>
+<li>What three properties does the round-trip test assert? <details class="answer"><summary>Answer</summary>The hash is unchanged by save and load; specific fields survive; and the loaded campaign evolves identically for thirty more days, proving the RNG state was restored.</details></li>
+<li>Which mistake did the round-trip test catch in the project's history? <details class="answer"><summary>Answer</summary>A new column whose bind was dropped when a long argument list was reformatted, so the value saved as NULL.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>SQLite is bound with eighteen hand-written <code>extern fn</code> lines and two opaque types; a small wrapper turns codes into errors and pointers into slices.</li>
+<li><code>bindAll</code> unrolls a tuple with <code>inline for</code> and picks a binding per type with <code>@typeInfo</code>; exhaustive enums are saved as names, typed IDs as integers.</li>
+<li>The schema is idempotent DDL plus a guarded list of column migrations, applied in one transaction with <code>errdefer ROLLBACK</code>; newer stores are refused.</li>
+<li>Saving deletes and re-inserts a campaign's rows with an order column; loading rebuilds the ordered maps so the hash matches.</li>
+<li>A new field touches struct, DDL, INSERT, SELECT and a migration; the round-trip test is the safety net.</li>
+</ul></div>
+</section>

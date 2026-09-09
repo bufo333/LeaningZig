@@ -1,0 +1,406 @@
+<section id="ch03">
+<h2>3. Variables, constants and types</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn how Zig names values with <code>const</code> and <code>var</code>, when you must write a type and when the compiler works it out, and what <code>undefined</code> means. You will meet four compile errors that every Zig beginner hits in their first hour, with the exact text the compiler prints, and learn the one-line fix for each.</p>
+
+<h3 id="ch03-1">3.1 const and var</h3>
+<p>A name is introduced with one of two keywords. <code>const</code> binds a name to a value that will never change. <code>var</code> declares a variable that can be assigned again later.</p>
+<div class="file">constvar.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const company_name = "Grey Death Legion";
+    var funds: i64 = 1_000_000;
+    funds -= 250_000;
+    std.debug.print("{s} has {d} C-bills\n", .{ company_name, funds });
+}</code></pre>
+<pre class="term">$ zig run constvar.zig
+Grey Death Legion has 750000 C-bills</pre>
+<p>The company name never changes, so it is a <code>const</code>. The funds go down, so they are a <code>var</code>. <code>funds -= 250_000</code> is short for <code>funds = funds - 250_000</code>, and the same shorthand exists for <code>+=</code>, <code>*=</code>, and the other operators.</p>
+<p>Try to change a <code>const</code> and the compiler refuses:</p>
+<div class="file">assign_const.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const funds: i64 = 1_000_000;
+    funds -= 250_000;
+    std.debug.print("{d}\n", .{funds});
+}</code></pre>
+<pre class="term">$ zig run assign_const.zig
+assign_const.zig:5:5: error: cannot assign to constant
+    funds -= 250_000;
+    ^~~~~</pre>
+<p>The habit to build is the reverse of what most languages teach: <strong>start with <code>const</code>, and only write <code>var</code> when you have a line that assigns to the name a second time</strong>. This is not just style. The compiler enforces it, as you will see in section 3.5, and it makes code easier to read, because every <code>var</code> is a promise that the value changes somewhere below.</p>
+
+<h3 id="ch03-2">3.2 Type annotations and inference</h3>
+<p>Every value in Zig has a type, and the type is fixed for the life of the name. You can write the type after a colon, or you can leave it out and let the compiler infer it from the value.</p>
+<div class="file">annot.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const a: u8 = 200; // annotated
+    const b = a; // inferred: b is also u8
+    const c: i64 = a; // u8 fits inside i64, so this is allowed
+    const d: f64 = 2.5; // a float literal needs a home too
+    std.debug.print("{d} {d} {d} {d}\n", .{ a, b, c, d });
+    std.debug.print("{s} {s} {s} {s}\n", .{
+        @typeName(@TypeOf(a)), @typeName(@TypeOf(b)),
+        @typeName(@TypeOf(c)), @typeName(@TypeOf(d)),
+    });
+}</code></pre>
+<pre class="term">$ zig run annot.zig
+200 200 200 2.5
+u8 u8 i64 f64</pre>
+<p><code>@TypeOf(x)</code> is a builtin that gives the type of an expression, and <code>@typeName</code> turns a type into a printable string; together they let a program report what the compiler decided. Here <code>b</code> was declared with no annotation and got <code>u8</code> because it was initialised from a <code>u8</code>. <code>c</code> was annotated <code>i64</code> and the <code>u8</code> value was <em>coerced</em> to the wider type, which is allowed because every <code>u8</code> value fits in an <code>i64</code>. The reverse, putting an <code>i64</code> into a <code>u8</code>, is refused, and <a href="#ch04">Chapter 4</a> covers the rules.</p>
+<p>So when do you need the annotation? Inference works whenever the right-hand side already has a concrete type: another variable, a function's return value, an expression of typed values. It does not work, or works differently from what you meant, in two common cases.</p>
+
+<h3 id="ch03-3">3.3 Number literals are comptime_int</h3>
+<p>Write <code>const x = 42;</code> and ask for its type.</p>
+<div class="file">comptime_int.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const x = 42;
+    std.debug.print("{s}\n", .{@typeName(@TypeOf(x))});
+    const big = 1_000_000_000_000_000_000_000; // does not fit in u64
+    std.debug.print("{d}\n", .{big});
+    const y: u8 = x; // fine: 42 fits in a u8
+    std.debug.print("{d}\n", .{y});
+}</code></pre>
+<pre class="term">$ zig run comptime_int.zig
+comptime_int
+1000000000000000000000
+42</pre>
+<p>The type is <code>comptime_int</code>: an integer known at compile time, with no fixed width. It can be as large as you like, which is why the thousand-billion-billion literal printed without complaint, and it silently becomes whatever concrete type it is used as, which is why <code>const y: u8 = x</code> worked. A <code>comptime_int</code> is more like a number written on paper than a number stored in memory. Float literals are the same: <code>2.5</code> has type <code>comptime_float</code>.</p>
+<p>This is convenient right up until you try to change one at runtime:</p>
+<div class="file">var_needs_type.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var count = 0;
+    count += 1;
+    std.debug.print("{d}\n", .{count});
+}</code></pre>
+<pre class="term">$ zig run var_needs_type.zig
+var_needs_type.zig:4:9: error: variable of type 'comptime_int' must be const or comptime
+    var count = 0;
+        ^~~~~
+var_needs_type.zig:4:9: note: to modify this variable at runtime, it must be given an explicit fixed-size number type</pre>
+<p>The note tells you the fix. A <code>var</code> lives in memory and memory has a fixed size, so the compiler needs to know how many bytes to set aside. Write <code>var count: u32 = 0;</code> and the program builds. <strong>Rule: a <code>var</code> initialised from a bare number literal always needs a type annotation.</strong> A <code>const</code> initialised from a literal does not, and stays a <code>comptime_int</code> until it is used somewhere with a concrete type.</p>
+<div class="note"><strong>Why not just default to i32 or i64?</strong> C does, and the result is that <code>1 &lt;&lt; 40</code> is silently zero on many compilers because the literal was an <code>int</code>. Zig's literal type is exact and unbounded; only when it meets a concrete type does it get a width, and if it does not fit you get an error at that spot rather than wrong bits.</div>
+
+<h3 id="ch03-4">3.4 Four errors you will hit today</h3>
+<p>Zig refuses to build code that contains things which are almost always mistakes. Other languages emit warnings for these; Zig emits errors, on the grounds that a warning everyone ignores is worth nothing. Here are the four you will meet first, each with its real message and its fix.</p>
+<p><strong>Unused local.</strong> Declare something and never use it:</p>
+<div class="file">unused.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnage: u32 = 100;
+    std.debug.print("ready\n", .{});
+}</code></pre>
+<pre class="term">$ zig run unused.zig
+unused.zig:4:11: error: unused local constant
+    const tonnage: u32 = 100;
+          ^~~~~~~</pre>
+<p>Usually the fix is to delete the declaration or to use it. Sometimes you genuinely want a name you do not use yet, for example while writing a function one piece at a time; then you <em>discard</em> it by assigning it to the underscore:</p>
+<div class="file">discard.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnage: u32 = 100;
+    _ = tonnage;
+    std.debug.print("ready\n", .{});
+}</code></pre>
+<pre class="term">$ zig run discard.zig
+ready</pre>
+<p><code>_ = tonnage;</code> tells the compiler "I know, and I mean it." The same applies to function parameters (<a href="#ch07">Chapter 7</a>) and to return values you choose to ignore. The exercise starters in this book use it constantly, so that a half-finished function still compiles. Using a name after discarding it is itself an error ("pointless discard"), so remove the underscore line when you fill the function in.</p>
+<p><strong>Never-mutated var.</strong> Declare a <code>var</code> and never assign to it again:</p>
+<div class="file">never_mutated.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var tonnage: u32 = 100;
+    std.debug.print("{d}\n", .{tonnage});
+}</code></pre>
+<pre class="term">$ zig run never_mutated.zig
+never_mutated.zig:4:9: error: local variable is never mutated
+    var tonnage: u32 = 100;
+        ^~~~~~~
+never_mutated.zig:4:9: note: consider using 'const'</pre>
+<p>The fix is in the note: change <code>var</code> to <code>const</code>. This is the rule that makes the "start with const" habit mandatory rather than optional.</p>
+<p><strong>Shadowing.</strong> Reuse a name that is already visible:</p>
+<div class="file">shadow.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const count: u32 = 1;
+    {
+        const count: u32 = 2;
+        std.debug.print("{d}\n", .{count});
+    }
+    std.debug.print("{d}\n", .{count});
+}</code></pre>
+<pre class="term">$ zig run shadow.zig
+shadow.zig:6:15: error: local constant 'count' shadows local constant from outer scope
+        const count: u32 = 2;
+              ^~~~~
+shadow.zig:4:11: note: previous declaration here
+    const count: u32 = 1;
+          ^~~~~</pre>
+<p>In most languages the inner <code>count</code> would quietly hide the outer one inside the braces. Zig forbids it, because a reader scanning the function sees one name and expects one meaning. The fix is a different name. The rule applies to every kind of declaration, including the standard-library import at the top of the file:</p>
+<div class="file">shadow_std.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const std = 5;
+    _ = std;
+}</code></pre>
+<pre class="term">$ zig run shadow_std.zig
+shadow_std.zig:4:11: error: local constant shadows declaration of 'std'
+    const std = 5;
+          ^~~
+shadow_std.zig:1:1: note: declared here
+const std = @import("std");
+^~~~~~~~~~~~~~~~~~~~~~~~~~</pre>
+<p><strong>Assigning to a const</strong> you met in section 3.1: <code>error: cannot assign to constant</code>. The fix is <code>var</code>, if the value really changes.</p>
+<div class="warn"><strong>Trap: the errors come one at a time.</strong> When a file has several problems the compiler often reports only the first, because it stops analysing a function at its first error. Fix it, run again, and the next one appears. This is normal and not a sign that you have made things worse.</div>
+
+<h3 id="ch03-5">3.5 undefined</h3>
+<p>Every declaration needs an initial value. When you have nothing meaningful to put there yet, because the value will be filled in before it is read, you write <code>undefined</code>:</p>
+<div class="file">undef.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var total: u32 = undefined;
+    total = 10;
+    total += 5;
+    std.debug.print("{d}\n", .{total});
+}</code></pre>
+<pre class="term">$ zig run undef.zig
+15</pre>
+<p><code>undefined</code> is a promise: "I will assign this before I read it." The compiler reserves the memory and does not initialise it. You saw <code>var buf: [1024]u8 = undefined;</code> in <a href="#ch02">Chapter 2</a>, where a 1024-byte buffer was declared for a writer to fill; zeroing it first would be wasted work.</p>
+<p>Break the promise and you get garbage, not an error:</p>
+<div class="file">undef_read.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var total: u32 = undefined;
+    total += 5;
+    std.debug.print("{d}\n", .{total});
+}</code></pre>
+<pre class="term">$ zig run undef_read.zig
+2863311535</pre>
+<p>In a debug build Zig fills undefined memory with the byte <code>0xAA</code>, which is why the number is 2863311535 (<code>0xAAAAAAAA</code>) plus five. That pattern is a deliberate tell: if you ever see 43690, 2863311535, or a string of <code>AA</code> bytes in a value, you read something you never set. In a release build the memory holds whatever was there before, and the bug is silent. Use <code>undefined</code> only when the assignment is a line or two away, and prefer a real initial value whenever one makes sense.</p>
+
+<h3 id="ch03-6">3.6 Block scope</h3>
+<p>A pair of braces is a block, and a name declared inside a block exists only until the closing brace.</p>
+<div class="file">block.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const outer: u32 = 1;
+    {
+        const inner: u32 = 2;
+        std.debug.print("inside: {d} {d}\n", .{ outer, inner });
+    }
+    std.debug.print("outside: {d}\n", .{outer});
+    std.debug.print("outside: {d}\n", .{inner});
+}</code></pre>
+<pre class="term">$ zig run block.zig
+block.zig:10:41: error: use of undeclared identifier 'inner'
+    std.debug.print("outside: {d}\n", .{inner});
+                                        ^~~~~</pre>
+<p>The outer name is visible inside the block; the inner name is gone after it. Function bodies, loop bodies, and the branches of an <code>if</code> are all blocks. You can also open a bare block anywhere just to limit how long a name lives, which the first example did.</p>
+<p>A block can also produce a value. Give it a label, and <code>break :label value</code> leaves the block with that value as its result:</p>
+<div class="file">block_value.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnage: u32 = 55;
+    const weight_class = blk: {
+        if (tonnage &lt;= 35) break :blk "light";
+        if (tonnage &lt;= 55) break :blk "medium";
+        if (tonnage &lt;= 75) break :blk "heavy";
+        break :blk "assault";
+    };
+    std.debug.print("{d} tons is {s}\n", .{ tonnage, weight_class });
+}</code></pre>
+<pre class="term">$ zig run block_value.zig
+55 tons is medium</pre>
+<p>The label <code>blk:</code> goes before the opening brace; the name is yours to choose. Each <code>break :blk</code> ends the block and supplies the value for <code>weight_class</code>. This is how Zig writes "compute a value in several steps, right here" without a helper function or a mutable temporary, and IRON LEDGER uses it often. <a href="#ch06">Chapter 6</a> shows that <code>if</code> and loops can produce values in the same spirit.</p>
+
+<h3 id="ch03-7">3.7 Top-level declarations</h3>
+<p>So far every name was declared inside <code>main</code>. Names can also be declared at the top of the file, outside any function, where they are visible to every function in the file.</p>
+<div class="file">globals.zig</div>
+<pre><code>const std = @import("std");
+
+const max_lance_size = 4;
+var battles_fought: u32 = 0;
+
+pub fn main() void {
+    battles_fought += 1;
+    battles_fought += 1;
+    std.debug.print("lance size {d}, battles {d}\n", .{ max_lance_size, battles_fought });
+}</code></pre>
+<pre class="term">$ zig run globals.zig
+lance size 4, battles 2</pre>
+<p>Top-level <code>const</code> is common and good: it is how a file names its constants, imports, and types. Top-level <code>var</code> is a global variable, which every function can change from anywhere; it is legal, occasionally useful, and generally avoided for the same reasons as in any language. IRON LEDGER's simulation core has no global variables at all, by design, and <a href="#ch41">Chapter 41</a> explains why that matters for a game that must replay identically from a seed.</p>
+<p>One difference from local declarations: the order of top-level declarations does not matter. <code>main</code> can use <code>max_lance_size</code> even if it were declared below it, and a function can call another declared further down the file.</p>
+
+<h3 id="ch03-8">3.8 Naming</h3>
+<p><code>zig fmt</code> does not police names, but the standard library and nearly all Zig code follow one convention, and this book does too:</p>
+<ul>
+<li><code>snake_case</code> for variables, constants, and struct fields: <code>company_name</code>, <code>max_lance_size</code>.</li>
+<li><code>camelCase</code> for functions: <code>applyBp</code>, <code>daysInMonth</code>.</li>
+<li><code>TitleCase</code> for types: <code>GameState</code>, <code>Date</code>. A function that returns a type is also TitleCase (<a href="#ch26">Chapter 26</a>).</li>
+</ul>
+<p>Constants are not shouted in capitals; <code>max_lance_size</code>, not <code>MAX_LANCE_SIZE</code>. Names can contain digits and underscores but not start with a digit. If you truly need a name that is a keyword or contains odd characters, <code>@"…"</code> quoting exists, and you will see it in <a href="#ch27">Chapter 27</a>.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game's <code>main</code> opens with a run of <code>var</code> declarations for its command-line flags, each with an explicit initial value, followed by a loop that sets them (<code>game/src/main.zig</code>):
+<pre><code>var repl = false;
+var tui = false;
+var ascii = false;
+var no_splash = false;
+var no_music = false;
+var data_dir: ?[]const u8 = null;</code></pre>
+The first five need no annotation because <code>false</code> has a concrete type, <code>bool</code>. The last one must be annotated because <code>null</code> alone does not say what kind of thing might be there; <code>?[]const u8</code> means "either a string or nothing" (<a href="#ch15">Chapter 15</a>). Each of these is a <code>var</code> because the loop below assigns to it; if the loop stopped assigning to one, the build would fail with "local variable is never mutated". And further down <code>game/src/main.zig</code> you will find <code>var stdin_buf: [4096]u8 = undefined;</code>, a buffer declared exactly the way Chapter 2's output buffer was.</div>
+
+<h3 id="ch03-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 3.1 · Make the compiler happy <span class="level">warm-up</span></h4>
+  <p>The starter contains four compile errors of the kinds shown in this chapter: an unused local, a never-mutated <code>var</code>, a shadowed name, and an assignment to a <code>const</code>. Fix each in the smallest way that keeps the program's meaning, running <code>zig run</code> after each fix to see the next error. Do not delete the print at the bottom. Name the file: <code>exercises/03-variables/ex1_fix_errors.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 03, exercise 1: make the compiler happy.
+//! Run with:  zig run ex1_fix_errors.zig
+//! Expected output (on stderr):
+//!   4 units, 250 tons, avg 62
+const std = @import("std");
+
+pub fn main() void {
+    const units: u32 = 4;
+    const total: u32 = 250; // was var, never mutated
+    const commander = "Carlyle";
+    _ = commander; // was unused
+    const average = total / units;
+    {
+        const inner_average = 0; // was shadowing `average`
+        _ = inner_average;
+    }
+    // `units = 4;` removed: you cannot assign to a const
+    std.debug.print("{d} units, {d} tons, avg {d}\n", .{ units, total, average });
+}</code></pre>
+  <p>The compiler reports the shadowing first and the others one at a time as you fix them. Notice that the unused name is fixed with a discard rather than a deletion, which is what you do when the name is part of a design you have not finished.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 3.2 · Name the types <span class="level">warm-up</span></h4>
+  <p>Four top-level constants are declared without types. The tests below them check the type of each with <code>@TypeOf</code>. Add the annotation each test asks for, and nothing else. Run with <code>zig test</code>. Name the file: <code>exercises/03-variables/ex2_types.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 03, exercise 2: give each value the type the tests expect.
+//! Run with:  zig test ex2_types.zig
+//! Goal: make every test pass by changing only the declarations marked TODO.
+const std = @import("std");
+
+const seats: u8 = 4;
+const tonnage: u32 = 55;
+const ratio: f64 = 0.5;
+const funds: i64 = 1_000_000;
+
+test "seats is a u8" {
+    try std.testing.expectEqual(u8, @TypeOf(seats));
+}
+
+test "tonnage is a u32" {
+    try std.testing.expectEqual(u32, @TypeOf(tonnage));
+}
+
+test "ratio is an f64" {
+    try std.testing.expectEqual(f64, @TypeOf(ratio));
+}
+
+test "funds is an i64 and can go negative" {
+    try std.testing.expectEqual(i64, @TypeOf(funds));
+    const after: i64 = funds - 2_000_000;
+    try std.testing.expect(after &lt; 0);
+}</code></pre>
+  <p>Without annotations the four constants are <code>comptime_int</code> and <code>comptime_float</code>, and <code>expectEqual(u8, @TypeOf(seats))</code> fails because the types differ. Types are values in Zig, so a test can compare them like numbers; <a href="#ch26">Chapter 26</a> makes much of this.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 3.3 · A value from a block <span class="level">practice</span></h4>
+  <p>Write <code>weightClass</code> so that it computes its result with a labeled block and <code>break :blk</code>, without early returns, then returns that value. The tests define the boundaries. Name the file: <code>exercises/03-variables/ex3_block_value.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 03, exercise 3: compute a value with a labeled block.
+//! Run with:  zig test ex3_block_value.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// Return the weight class name for a BattleMech tonnage:
+/// up to 35 "light", up to 55 "medium", up to 75 "heavy", otherwise "assault".
+fn weightClass(tonnage: u32) []const u8 {
+    const class = blk: {
+        if (tonnage &lt;= 35) break :blk "light";
+        if (tonnage &lt;= 55) break :blk "medium";
+        if (tonnage &lt;= 75) break :blk "heavy";
+        break :blk "assault";
+    };
+    return class;
+}
+
+test "light" {
+    try std.testing.expectEqualStrings("light", weightClass(20));
+    try std.testing.expectEqualStrings("light", weightClass(35));
+}
+
+test "medium" {
+    try std.testing.expectEqualStrings("medium", weightClass(36));
+    try std.testing.expectEqualStrings("medium", weightClass(55));
+}
+
+test "heavy and assault" {
+    try std.testing.expectEqualStrings("heavy", weightClass(75));
+    try std.testing.expectEqualStrings("assault", weightClass(100));
+}</code></pre>
+  <p>Every path through the block must reach a <code>break :blk</code>; the final one has no condition so that the block always produces something. If you forget it the compiler complains that the block's value is <code>void</code> where a string was expected.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 3.4 · Swap <span class="level">practice</span></h4>
+  <p>The starter declares <code>a</code>, <code>b</code> and <code>swaps</code> as constants and then tries to swap the first two and count the swap. Change the declarations that must change, and only those, then write the swap with a single temporary. Name the file: <code>exercises/03-variables/ex4_swap.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 03, exercise 4: swap two variables and count mutations.
+//! Run with:  zig run ex4_swap.zig
+//! Expected output (on stderr):
+//!   before: a=3 b=7
+//!   after:  a=7 b=3
+//!   swaps: 1
+const std = @import("std");
+
+pub fn main() void {
+    var a: u32 = 3;
+    var b: u32 = 7;
+    var swaps: u32 = 0;
+    std.debug.print("before: a={d} b={d}\n", .{ a, b });
+    const tmp = a;
+    a = b;
+    b = tmp;
+    swaps += 1;
+    std.debug.print("after:  a={d} b={d}\n", .{ a, b });
+    std.debug.print("swaps: {d}\n", .{swaps});
+}</code></pre>
+  <p>All three become <code>var</code> because all three are assigned again. The temporary is a <code>const</code> because it is set once. If you had made <code>tmp</code> a <code>var</code>, the compiler would have told you it is never mutated.</p></details>
+</div>
+
+<h3 id="ch03-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What is the type of <code>x</code> in <code>const x = 42;</code>? <details class="answer"><summary>Answer</summary><code>comptime_int</code>: an exact compile-time integer with no fixed width. It becomes a concrete type when used as one.</details></li>
+  <li>Why does <code>var count = 0;</code> fail to compile? <details class="answer"><summary>Answer</summary>A runtime variable needs a fixed size, and a <code>comptime_int</code> has none. Write <code>var count: u32 = 0;</code> (or another concrete type).</details></li>
+  <li>You declared <code>var total: u32 = 5;</code> and the compiler says "local variable is never mutated". What is the fix? <details class="answer"><summary>Answer</summary>Change <code>var</code> to <code>const</code>. Nothing assigns to <code>total</code> after its declaration.</details></li>
+  <li>How do you keep an unused variable without deleting it? <details class="answer"><summary>Answer</summary>Discard it: <code>_ = name;</code>. Remove the discard once you start using the name, or you get a "pointless discard" error.</details></li>
+  <li>Is it legal to declare <code>const i</code> inside a loop body when a <code>const i</code> exists outside the loop? <details class="answer"><summary>Answer</summary>No. Shadowing is a compile error in Zig; pick a different name.</details></li>
+  <li>What value does a <code>var x: u32 = undefined;</code> hold if you read it before assigning? <details class="answer"><summary>Answer</summary>In a debug build, the byte pattern <code>0xAA</code> repeated (2863311535 for a u32); in a release build, whatever was in that memory. Either way it is a bug.</details></li>
+  <li>How does a block produce a value? <details class="answer"><summary>Answer</summary>Label it, <code>blk: { … }</code>, and leave it with <code>break :blk value;</code>. The block expression evaluates to that value.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>const</code> never changes; <code>var</code> can be reassigned. Start with <code>const</code>; the compiler rejects a <code>var</code> that is never mutated.</li>
+<li>Types come after a colon and are usually inferred, but a <code>var</code> initialised from a bare literal must be annotated because literals are <code>comptime_int</code> / <code>comptime_float</code>.</li>
+<li>Unused locals, never-mutated vars, shadowing, and assigning to a const are compile errors; the fixes are delete or <code>_ =</code>, <code>const</code>, rename, and <code>var</code>.</li>
+<li><code>undefined</code> reserves memory without initialising it; read it only after assigning.</li>
+<li>Braces make a scope; a labeled block can yield a value with <code>break :label value</code>.</li>
+<li>Top-level declarations are visible file-wide in any order; names are snake_case, camelCase for functions, TitleCase for types.</li>
+</ul></div>
+</section>

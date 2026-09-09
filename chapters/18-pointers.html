@@ -1,0 +1,618 @@
+<section id="ch18">
+<h2>18. Pointers</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn what a pointer is, how to take one with <code>&amp;</code> and follow it with <code>.*</code>, and why a function that needs to change its argument takes a pointer. You will meet the four pointer shapes Zig distinguishes, the difference between a constant pointer and a pointer to a constant, function pointers, and the two classic pointer bugs, one of which the 0.16 compiler now catches for you.</p>
+
+<h3 id="ch18-1">18.1 A pointer is an address</h3>
+<p>Every variable lives somewhere in memory, at a numbered location called its address. A pointer is a value that holds such an address. Instead of holding a morale score, it holds "where the morale score is". Through the pointer you can read the score, and, if the pointer allows it, change it. That indirection is the whole idea; everything else in this chapter is about the rules Zig puts around it so that it stays safe.</p>
+<p>If you come from Python or JavaScript you have used pointers without the name: when you pass a list to a function and the function appends to it, the caller sees the change, because the "list" you passed was really a reference to the list. Zig makes that reference explicit and gives it a type. If you come from C, Zig's pointers are C's pointers with the dangerous operations removed: no arithmetic on single-item pointers, no implicit null, no silent casts.</p>
+<p class="file">ptr1.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var morale: u8 = 50;
+    const p: *u8 = &amp;morale; // p holds the address of morale
+
+    std.debug.print(&quot;morale = {d}\n&quot;, .{morale});
+    std.debug.print(&quot;p.*    = {d}\n&quot;, .{p.*});
+
+    p.* += 10; // write through the pointer
+    std.debug.print(&quot;after p.* += 10, morale = {d}\n&quot;, .{morale});
+
+    morale = 5; // write to the variable directly
+    std.debug.print(&quot;after morale = 5, p.* = {d}\n&quot;, .{p.*});
+
+    std.debug.print(&quot;type of p: {s}\n&quot;, .{@typeName(@TypeOf(p))});
+}</code></pre>
+<pre class="term">morale = 50
+p.*    = 50
+after p.* += 10, morale = 60
+after morale = 5, p.* = 5
+type of p: *u8</pre>
+<p>Three pieces of syntax. <code>*u8</code> is the type "pointer to a <code>u8</code>". <code>&amp;morale</code> takes the address of <code>morale</code>, producing a value of that type. <code>p.*</code> follows the pointer, and can appear on either side of an assignment: <code>p.* += 10</code> writes through it, <code>p.*</code> in a print reads through it. Because <code>p</code> and <code>morale</code> name the same byte of memory, changing one changes what you see through the other.</p>
+<p>Note that <code>p</code> itself is declared <code>const</code>. That is because the pointer <em>value</em> never changes: it always points at <code>morale</code>. What it points <em>at</em> changes freely, because the type is <code>*u8</code>, a pointer to a mutable byte. Section 18.6 comes back to this distinction.</p>
+
+<h3 id="ch18-2">18.2 <code>*const T</code>: look but do not touch</h3>
+<p>A pointer type can promise not to write. <code>*const u8</code> is a pointer through which you may only read. Trying to assign through it is a compile error.</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var morale: u8 = 50;
+    const view: *const u8 = &amp;morale; // may read, may not write
+    std.debug.print(&quot;{d}\n&quot;, .{view.*});
+    view.* = 60;
+}</code></pre>
+<pre class="term">ptr2.zig:7:9: error: cannot assign to constant
+    view.* = 60;
+    ~~~~^~
+referenced by:
+…</pre>
+<p>A <code>*T</code> coerces to a <code>*const T</code> automatically (giving up the right to write is always safe), never the reverse. This is why so many function parameters in Zig are <code>*const Something</code>: the function is saying "I need to see the whole thing without copying it, and I promise not to change it". Taking the address of a <code>const</code> variable gives you a <code>*const</code> pointer; you cannot get a mutable pointer to something that was declared constant.</p>
+
+<h3 id="ch18-3">18.3 Passing a pointer to mutate</h3>
+<p>Function arguments in Zig are passed by value: the function gets its own copy and changes to the copy are invisible to the caller. To let a function change the caller's variable, pass a pointer to it. This is the same rule you saw for <code>self</code> in <a href="#ch12">Chapter 12</a>: methods that mutate take <code>self: *T</code>, methods that only read take <code>self: T</code> or <code>self: *const T</code>.</p>
+<p class="file">ptr3.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Pilot = struct { name: []const u8, morale: u8, missions: u32 };
+
+// Takes a copy. Changes stay inside this function.
+fn cheerCopy(p: Pilot) void {
+    var local = p;
+    local.morale += 10;
+}
+
+// Takes a pointer. Changes reach the caller&#x27;s variable.
+fn cheer(p: *Pilot) void {
+    p.morale += 10; // no arrow, no (*p).morale: field access auto-derefs
+    p.missions += 1;
+}
+
+fn describe(p: *const Pilot) void {
+    std.debug.print(&quot;{s}: morale {d}, {d} missions\n&quot;, .{ p.name, p.morale, p.missions });
+}
+
+pub fn main() void {
+    var ada = Pilot{ .name = &quot;Ada&quot;, .morale = 50, .missions = 0 };
+    cheerCopy(ada);
+    describe(&amp;ada);
+    cheer(&amp;ada);
+    describe(&amp;ada);
+    cheer(&amp;ada);
+    describe(&amp;ada);
+}</code></pre>
+<pre class="term">Ada: morale 50, 0 missions
+Ada: morale 60, 1 missions
+Ada: morale 70, 2 missions</pre>
+<p><code>cheerCopy</code> did nothing visible: it cheered a copy and the copy was thrown away. <code>cheer</code> took <code>*Pilot</code> and its changes stuck. Two conveniences make pointer code read cleanly. First, field access through a pointer needs no arrow: <code>p.morale</code> works whether <code>p</code> is a <code>Pilot</code> or a <code>*Pilot</code>; the compiler inserts the dereference. Second, when you call a method on a variable, Zig takes the address for you: <code>ada.cheer()</code> would work as well as <code>cheer(&amp;ada)</code>. You only write <code>&amp;</code> explicitly when passing the pointer as an ordinary argument, as here.</p>
+<div class="note"><strong>When to take a pointer, and when not to.</strong> Take <code>*T</code> when you must mutate. Take <code>*const T</code> when the struct is large and you only read it. Take a plain <code>T</code> for small structs you only read; the compiler is free to pass them however is cheapest. Do not take a pointer "for speed" on a two-field struct; it makes the call site noisier for nothing.</div>
+
+<h3 id="ch18-4">18.4 Pointers to elements, to whole arrays, and to many items</h3>
+<p>Zig has four pointer shapes, and the type spells out which one you have.</p>
+<table>
+<tr><th>Type</th><th>Points at</th><th>Can index?</th><th>Knows its length?</th></tr>
+<tr><td><code>*T</code></td><td>exactly one <code>T</code></td><td>no</td><td>n/a</td></tr>
+<tr><td><code>*[N]T</code></td><td>an array of <code>N</code> items</td><td>yes</td><td>yes, at compile time</td></tr>
+<tr><td><code>[]T</code> (slice)</td><td><code>len</code> items</td><td>yes</td><td>yes, at run time</td></tr>
+<tr><td><code>[*]T</code></td><td>some unknown number of items</td><td>yes</td><td>no</td></tr>
+</table>
+<p class="file">ptr4.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var hp = [_]u8{ 10, 20, 30, 40 };
+
+    // pointer to one element
+    const second: *u8 = &amp;hp[1];
+    second.* = 25;
+
+    // iterate by pointer to modify in place
+    for (&amp;hp) |*h| h.* += 1;
+
+    // pointer to the whole array, and coercion to a slice
+    const whole: *[4]u8 = &amp;hp;
+    const sl: []u8 = whole; // *[N]T coerces to []T
+    std.debug.print(&quot;{any} len {d}\n&quot;, .{ sl, sl.len });
+    std.debug.print(&quot;{s}\n&quot;, .{@typeName(@TypeOf(&amp;hp))});
+
+    // many-item pointer: no length, indexable, used at C boundaries
+    const many: [*]u8 = &amp;hp;
+    std.debug.print(&quot;many[0] = {d}, many[3] = {d}\n&quot;, .{ many[0], many[3] });
+    std.debug.print(&quot;back to a slice: {any}\n&quot;, .{many[0..4]});
+}</code></pre>
+<pre class="term">{ 11, 26, 31, 41 } len 4
+*[4]u8
+many[0] = 11, many[3] = 41
+back to a slice: { 11, 26, 31, 41 }</pre>
+<p><code>&amp;hp[1]</code> is a single-item pointer to the second element. <code>for (&amp;hp) |*h|</code> iterates the array by pointer, so <code>h.* += 1</code> changes each element in place; you met this in <a href="#ch09">Chapter 9</a>. <code>&amp;hp</code> on the whole array is a <code>*[4]u8</code>, a pointer to an array, and it coerces to a slice <code>[]u8</code> whenever a slice is wanted, which is why you can pass <code>&amp;array</code> to any function that takes a slice. This coercion is the most common way slices come into existence.</p>
+<p>The many-item pointer <code>[*]T</code> is the odd one out: it can be indexed, but carries no length, so nothing stops you indexing past the end. Zig keeps it for one reason: it is what a C pointer is. You will see <code>[*]u8</code> and its zero-terminated cousin <code>[*:0]const u8</code> at the boundary with C libraries and almost nowhere else. Whenever you get one, turn it back into a slice as soon as you know the length, as the last line does with <code>many[0..4]</code>.</p>
+
+<h3 id="ch18-5">18.5 Alignment, <code>*anyopaque</code> and <code>@ptrCast</code></h3>
+<p>Every type has an <em>alignment</em>: an address it may live at must be a multiple of that number. A <code>u32</code> lives at a multiple of 4, a <code>u64</code> at a multiple of 8. Structs take the largest alignment of their fields. You rarely think about this, because the compiler and allocators handle it, but the numbers are visible and pointer types carry them.</p>
+<p class="file">ptr5.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Unit = struct { tonnage: u8, armour: u16 };
+
+pub fn main() void {
+    std.debug.print(&quot;u8   size {d} align {d}\n&quot;, .{ @sizeOf(u8), @alignOf(u8) });
+    std.debug.print(&quot;u16  size {d} align {d}\n&quot;, .{ @sizeOf(u16), @alignOf(u16) });
+    std.debug.print(&quot;u32  size {d} align {d}\n&quot;, .{ @sizeOf(u32), @alignOf(u32) });
+    std.debug.print(&quot;u64  size {d} align {d}\n&quot;, .{ @sizeOf(u64), @alignOf(u64) });
+    std.debug.print(&quot;Unit size {d} align {d}\n&quot;, .{ @sizeOf(Unit), @alignOf(Unit) });
+
+    var u = Unit{ .tonnage = 55, .armour = 120 };
+
+    // Erase the type: any pointer can become *anyopaque.
+    const opaque_ptr: *anyopaque = &amp;u;
+
+    // Recover it: @ptrCast changes the pointee type, @alignCast asserts alignment.
+    const back: *Unit = @ptrCast(@alignCast(opaque_ptr));
+    back.armour += 1;
+    std.debug.print(&quot;armour via round trip: {d}\n&quot;, .{u.armour});
+}</code></pre>
+<pre class="term">u8   size 1 align 1
+u16  size 2 align 2
+u32  size 4 align 4
+u64  size 8 align 8
+Unit size 4 align 2
+armour via round trip: 121</pre>
+<p><code>*anyopaque</code> is the pointer that has forgotten its type: "an address, of something". It is Zig's spelling of C's <code>void*</code>. Any single-item pointer coerces to it. To get the type back you use <code>@ptrCast</code>, and because <code>*anyopaque</code> has an alignment of 1 while <code>*Unit</code> requires 2, you also need <code>@alignCast</code>, which asserts (checked in Debug) that the address really is suitably aligned. The pair <code>@ptrCast(@alignCast(p))</code> is the standard incantation, and the destination type is taken from the declared type of the variable you assign to. This is exactly how the allocator interface works: <code>std.mem.Allocator</code> stores a <code>*anyopaque</code> to "whatever the concrete allocator is" and each implementation casts it back to itself. You will write that cast yourself in <a href="#ch20">Chapter 20</a>.</p>
+
+<h3 id="ch18-6">18.6 Constant pointer versus pointer to constant</h3>
+<p>Two different things can be constant: the pointer, or what it points at. They are independent.</p>
+<p class="file">ptr7.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var a: u8 = 1;
+    var b: u8 = 2;
+
+    // A pointer to a mutable value; the variable p itself can be re-pointed.
+    var p: *u8 = &amp;a;
+    p.* = 10;
+    p = &amp;b;
+    p.* = 20;
+
+    // A constant pointer to a mutable value: q always points at a,
+    // but a may still be changed through it.
+    const q: *u8 = &amp;a;
+    q.* += 1;
+
+    // A pointer to a constant: r may be re-pointed, but never written through.
+    var r: *const u8 = &amp;a;
+    r = &amp;b;
+
+    std.debug.print(&quot;a={d} b={d} r.*={d}\n&quot;, .{ a, b, r.* });
+}</code></pre>
+<pre class="term">a=11 b=20 r.*=20</pre>
+<ul>
+<li><code>var p: *u8</code>: both may change. You can re-point <code>p</code> and write through it.</li>
+<li><code>const q: *u8</code>: the pointer is fixed, the target is writable. This is the common case for a local you take once.</li>
+<li><code>var r: *const u8</code>: the pointer may be re-pointed, but never written through.</li>
+<li><code>const s: *const u8</code>: neither, the fully read-only view.</li>
+</ul>
+<p>Read the type from right to left: <code>*const u8</code> is "pointer to (const u8)". The <code>const</code> or <code>var</code> at the front of the declaration is about the variable holding the pointer, as for any other variable.</p>
+
+<h3 id="ch18-7">18.7 Optional pointers</h3>
+<p><a href="#ch15">Chapter 15</a> promised that <code>?*T</code> is free, and it is the shape every "find or fail" function returns. Combine it with a capture and you can mutate what you found.</p>
+<p class="file">ptr8.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Pilot = struct { name: []const u8, skill: u8 };
+
+var roster = [_]Pilot{
+    .{ .name = &quot;Ada&quot;, .skill = 4 },
+    .{ .name = &quot;Bo&quot;, .skill = 6 },
+};
+
+fn find(name: []const u8) ?*Pilot {
+    for (&amp;roster) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    return null;
+}
+
+pub fn main() void {
+    if (find(&quot;Bo&quot;)) |p| {
+        p.skill -= 1; // train: lower is better in this ruleset
+        std.debug.print(&quot;{s} now skill {d}\n&quot;, .{ p.name, p.skill });
+    }
+    const missing = find(&quot;Cy&quot;);
+    std.debug.print(&quot;Cy found? {}\n&quot;, .{missing != null});
+    std.debug.print(&quot;?*Pilot is {d} bytes, same as *Pilot ({d})\n&quot;, .{ @sizeOf(?*Pilot), @sizeOf(*Pilot) });
+}</code></pre>
+<pre class="term">Bo now skill 5
+Cy found? false
+?*Pilot is 8 bytes, same as *Pilot (8)</pre>
+<p>A plain pointer in Zig can never be null; that is what allows the optimisation and what makes <code>p.*</code> always safe on a <code>*T</code>. The compiler is strict about it even at the lowest level:</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    const p: *u32 = @ptrFromInt(0x0);
+    std.debug.print(&quot;{d}\n&quot;, .{p.*});
+}</code></pre>
+<pre class="term">ptr11.zig:4:33: error: pointer type &#x27;*u32&#x27; does not allow address zero
+    const p: *u32 = @ptrFromInt(0x0);
+                                ^~~
+…</pre>
+
+<h3 id="ch18-8">18.8 Function pointers</h3>
+<p>Functions have addresses too, so you can store one in a variable and call it later. The type is <code>*const fn (Args) Ret</code>, and a plain function name coerces to it. A table of function pointers is how you build a dispatcher, a pipeline, or a callback.</p>
+<p class="file">ptr6.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn double(x: i32) i32 {
+    return x * 2;
+}
+fn negate(x: i32) i32 {
+    return -x;
+}
+
+const Op = *const fn (i32) i32;
+
+fn applyAll(ops: []const Op, start: i32) i32 {
+    var v = start;
+    for (ops) |op| v = op(v);
+    return v;
+}
+
+pub fn main() void {
+    const f: Op = double;
+    std.debug.print(&quot;double(21) = {d}\n&quot;, .{f(21)});
+
+    const pipeline = [_]Op{ double, negate, double };
+    std.debug.print(&quot;pipeline(3) = {d}\n&quot;, .{applyAll(&amp;pipeline, 3)});
+    std.debug.print(&quot;{s}\n&quot;, .{@typeName(Op)});
+}</code></pre>
+<pre class="term">double(21) = 42
+pipeline(3) = -12
+*const fn (i32) i32</pre>
+<p>The <code>const</code> in <code>*const fn</code> is required: you cannot write through a pointer into code. Calling through a function pointer looks exactly like calling a function, <code>op(v)</code>. In the standard library, this is how sorting takes its comparison function and how the allocator's vtable holds its four operations.</p>
+
+<h3 id="ch18-9">18.9 The two classic pointer bugs</h3>
+<p>A pointer is only as good as the memory behind it. Two mistakes produce a pointer to memory that is no longer what you think it is. Both are called <em>dangling</em> pointers, and using one is undefined behaviour: the program might crash, might print garbage, or might appear to work until the day it does not.</p>
+<p><strong>Bug 1: a pointer to a local that has ended.</strong> Local variables live in the function's stack frame, which is discarded when the function returns. A pointer to one of them is meaningless afterwards. In C this compiles silently. In Zig 0.16, the simple case is a compile error:</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+// DO NOT DO THIS. `n` lives in makeCounter&#x27;s stack frame, which is gone
+// the moment the function returns. The pointer now points at garbage.
+fn makeCounter() *u32 {
+    var n: u32 = 0;
+    return &amp;n;
+}
+
+pub fn main() void {
+    const c = makeCounter();
+    c.* += 1;
+    std.debug.print(&quot;{d}\n&quot;, .{c.*});
+}</code></pre>
+<pre class="term">ptr9.zig:7:13: error: returning address of expired local variable &#x27;n&#x27;
+    return &amp;n;
+            ^
+ptr9.zig:6:9: note: declared runtime-known here
+    var n: u32 = 0;
+…</pre>
+<p>The compiler cannot catch every variation, for instance storing <code>&amp;local</code> into a struct that outlives the function, so keep the rule in your head: never let a pointer to a local escape the block the local was declared in. If a value must outlive the function that made it, put it on the heap (<a href="#ch19">Chapter 19</a>) or return it by value and let the caller store it.</p>
+<p><strong>Bug 2: a pointer into a container that grew.</strong> A growable list keeps its items in one buffer. When it runs out of room, it allocates a bigger buffer, copies the items across, and frees the old one. Any pointer you took into the old buffer now points at freed memory. This one the compiler cannot see, because whether the buffer moves depends on run-time sizes.</p>
+<p class="file">ptr10.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main(init: std.process.Init) !void {
+    const a = init.gpa;
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(a);
+
+    try list.append(a, 7);
+    const first: *u32 = &amp;list.items[0]; // pointer into the list&#x27;s buffer
+    std.debug.print(&quot;before growth, first -&gt; {d}\n&quot;, .{first.*});
+
+    // Grow the list a lot. Sooner or later it must move its buffer.
+    var i: u32 = 0;
+    while (i &lt; 10_000) : (i += 1) try list.append(a, i);
+
+    const still_same = (first == &amp;list.items[0]);
+    std.debug.print(&quot;buffer still at the old address? {}\n&quot;, .{still_same});
+    std.debug.print(&quot;safe way: re-fetch, items[0] = {d}\n&quot;, .{list.items[0]});
+    // Reading first.* here would be use-after-free. We do not.
+}</code></pre>
+<pre class="term">before growth, first -&gt; 7
+buffer still at the old address? false
+safe way: re-fetch, items[0] = 7</pre>
+<p>The program compares addresses rather than reading through the stale pointer, because reading it would be undefined behaviour and no output from it could be trusted. The comparison shows the buffer moved. The rule that follows: <em>do not hold a pointer into a list or map across an operation that can grow it</em>. Hold an index or a key instead, and re-fetch the pointer after the insert. The IRON LEDGER box has the game's own version of this lesson.</p>
+<div class="warn"><strong>Trap.</strong> The dangerous thing about dangling pointers is that they often work. The old buffer's bytes may still be there for a while, so a test passes, and the bug appears weeks later when an allocator reuses that memory. In Debug builds the <code>DebugAllocator</code> helps, because it never hands freed memory back out and unmaps it where it can, so a stale read usually crashes immediately with a trace. Run your tests in Debug.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> Every command handler is a function on <code>gs: *GameState</code>, and every lookup returns an optional pointer into the state's maps: <code>gs.person(id)</code>, <code>gs.unit(id)</code>, <code>gs.force(id)</code> are all <code>?*T</code>. The RNG bag in <code>game/src/sim/rng.zig</code> seeds its array of generators by iterating with pointers so it can assign through them:
+<pre><code>for (&amp;self.prngs, 0..) |*prng, i| {
+    prng.* = std.Random.DefaultPrng.init(seed ^ (0x9E3779B97F4A7C15 *% (i + 1)));
+}</code></pre>
+The stale-pointer bug from section 18.9 is one the project hit for real. From the original guide: "If you hold <code>*Force</code> from a hash map and then insert into that map, the map may reallocate and your pointer now points at freed memory. The fix is to re-fetch after any insert." That is why you will see <code>gs.force(id)</code> called again a few lines after a <code>createForce</code>, rather than a pointer kept across it, and why the domain code passes typed IDs around instead of pointers wherever a value must survive a tick.</div>
+
+<h3 id="ch18-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 18.1 · Swap through pointers <span class="level">warm-up</span></h4>
+  <p>Write <code>swap(a: *i32, b: *i32)</code>, <code>bump(p: *u32, by: u32)</code> and <code>twice(p: *const u32) u32</code>. File: <code>exercises/18-pointers/ex1_swap.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 18, exercise 1: swap through pointers.
+//! Run with:  zig test ex1_swap.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// Exchange the values behind the two pointers.
+fn swap(a: *i32, b: *i32) void {
+    const tmp = a.*;
+    a.* = b.*;
+    b.* = tmp;
+}
+
+/// Add `by` to the value behind `p`.
+fn bump(p: *u32, by: u32) void {
+    p.* += by;
+}
+
+/// Read-only: a pointer to const may be read but never written through.
+fn twice(p: *const u32) u32 {
+    return p.* * 2;
+}
+
+test &quot;swap&quot; {
+    var x: i32 = 1;
+    var y: i32 = 2;
+    swap(&amp;x, &amp;y);
+    try std.testing.expectEqual(@as(i32, 2), x);
+    try std.testing.expectEqual(@as(i32, 1), y);
+}
+
+test &quot;bump and twice&quot; {
+    var n: u32 = 5;
+    bump(&amp;n, 3);
+    try std.testing.expectEqual(@as(u32, 8), n);
+    try std.testing.expectEqual(@as(u32, 16), twice(&amp;n));
+    const frozen: u32 = 21;
+    try std.testing.expectEqual(@as(u32, 42), twice(&amp;frozen));
+}</code></pre>
+  <p><code>twice</code> takes <code>*const u32</code>, which is why the test can pass <code>&amp;frozen</code>, the address of a constant. Try changing its parameter to <code>*u32</code> and see the compile error.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 18.2 · Mutate a struct through a pointer <span class="level">practice</span></h4>
+  <p>Implement <code>survive(p: *Pilot)</code>, which updates fields in place, <code>rating(p: *const Pilot)</code>, and <code>surviveAll(pilots: []Pilot)</code>, which iterates by pointer. File: <code>exercises/18-pointers/ex2_mutate.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 18, exercise 2: mutate a struct through a pointer.
+//! Run with:  zig test ex2_mutate.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const Pilot = struct {
+    name: []const u8,
+    gunnery: u8,
+    piloting: u8,
+    missions: u32 = 0,
+};
+
+/// One mission survived: missions + 1; every 3rd mission improves
+/// gunnery by one (lower is better, minimum 0).
+fn survive(p: *Pilot) void {
+    p.missions += 1;
+    if (p.missions % 3 == 0 and p.gunnery &gt; 0) p.gunnery -= 1;
+}
+
+/// Sum of both skills. Takes a pointer to const: it only reads.
+fn rating(p: *const Pilot) u8 {
+    return p.gunnery + p.piloting;
+}
+
+/// Apply `survive` to every pilot in the slice, in place.
+fn surviveAll(pilots: []Pilot) void {
+    for (pilots) |*p| survive(p);
+}
+
+test &quot;survive mutates the caller&#x27;s pilot&quot; {
+    var ada = Pilot{ .name = &quot;Ada&quot;, .gunnery = 4, .piloting = 5 };
+    survive(&amp;ada);
+    survive(&amp;ada);
+    try std.testing.expectEqual(@as(u32, 2), ada.missions);
+    try std.testing.expectEqual(@as(u8, 4), ada.gunnery);
+    survive(&amp;ada);
+    try std.testing.expectEqual(@as(u8, 3), ada.gunnery);
+    try std.testing.expectEqual(@as(u8, 8), rating(&amp;ada));
+}
+
+test &quot;surviveAll&quot; {
+    var lance = [_]Pilot{
+        .{ .name = &quot;A&quot;, .gunnery = 4, .piloting = 5, .missions = 2 },
+        .{ .name = &quot;B&quot;, .gunnery = 0, .piloting = 5, .missions = 2 },
+    };
+    surviveAll(&amp;lance);
+    try std.testing.expectEqual(@as(u8, 3), lance[0].gunnery);
+    try std.testing.expectEqual(@as(u8, 0), lance[1].gunnery);
+    try std.testing.expectEqual(@as(u32, 3), lance[1].missions);
+}</code></pre>
+  <p>Inside <code>surviveAll</code>, <code>for (pilots) |*p|</code> gives a <code>*Pilot</code> for each element, which is exactly what <code>survive</code> wants. Without the star you would get copies and the array would not change.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 18.3 · Arrays, elements and many items <span class="level">practice</span></h4>
+  <p>Four functions, one per pointer shape: a slice to double in place, a <code>*[4]u8</code> to fill, a <code>?*u32</code> pointing at the largest element, and a <code>[*]const u32</code> summed with an explicit length. File: <code>exercises/18-pointers/ex3_arrays.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 18, exercise 3: pointers to arrays, elements and many items.
+//! Run with:  zig test ex3_arrays.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// Double every element in place.
+fn doubleAll(items: []u32) void {
+    for (items) |*x| x.* *= 2;
+}
+
+/// Pointer to a fixed-size array: set every element to `v`.
+fn fill4(arr: *[4]u8, v: u8) void {
+    for (arr) |*x| x.* = v;
+}
+
+/// Pointer to the largest element, or null for an empty slice.
+fn largest(items: []u32) ?*u32 {
+    if (items.len == 0) return null;
+    var best: *u32 = &amp;items[0];
+    for (items[1..]) |*x| if (x.* &gt; best.*) {
+        best = x;
+    };
+    return best;
+}
+
+/// A many-item pointer has no length, so the caller passes one.
+fn sumMany(p: [*]const u32, n: usize) u32 {
+    var total: u32 = 0;
+    var i: usize = 0;
+    while (i &lt; n) : (i += 1) total += p[i];
+    return total;
+}
+
+test &quot;doubleAll&quot; {
+    var hp = [_]u32{ 1, 2, 3 };
+    doubleAll(&amp;hp); // *[3]u32 coerces to []u32
+    try std.testing.expectEqualSlices(u32, &amp;.{ 2, 4, 6 }, &amp;hp);
+}
+
+test &quot;fill4&quot; {
+    var buf: [4]u8 = undefined;
+    fill4(&amp;buf, &#x27;x&#x27;);
+    try std.testing.expectEqualStrings(&quot;xxxx&quot;, &amp;buf);
+}
+
+test &quot;largest points into the slice&quot; {
+    var hp = [_]u32{ 5, 9, 2 };
+    const p = largest(&amp;hp).?;
+    p.* = 0; // writing through the pointer changes the array
+    try std.testing.expectEqualSlices(u32, &amp;.{ 5, 0, 2 }, &amp;hp);
+    var none = [_]u32{};
+    try std.testing.expect(largest(&amp;none) == null);
+}
+
+test &quot;sumMany&quot; {
+    const hp = [_]u32{ 1, 2, 3, 4 };
+    const many: [*]const u32 = &amp;hp;
+    try std.testing.expectEqual(@as(u32, 10), sumMany(many, 4));
+    try std.testing.expectEqual(@as(u32, 3), sumMany(many, 2));
+}</code></pre>
+  <p><code>largest</code> returns a pointer into the caller's slice, and the test proves it by writing zero through the pointer and checking the array. <code>sumMany</code> has to be told the length; that is the price of a many-item pointer, and why you convert to a slice as soon as you can.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 18.4 · A dispatch table of function pointers <span class="level">challenge</span></h4>
+  <p>Build a table mapping names to <code>*const fn (i32) i32</code>, a <code>lookup</code> returning <code>?Op</code>, an <code>apply</code> that combines lookup and call, and a <code>pipeline</code>. File: <code>exercises/18-pointers/ex4_fnptr.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 18, exercise 4: a dispatch table of function pointers.
+//! Run with:  zig test ex4_fnptr.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const Op = *const fn (i32) i32;
+
+fn double(x: i32) i32 {
+    return x * 2;
+}
+fn negate(x: i32) i32 {
+    return -x;
+}
+fn square(x: i32) i32 {
+    return x * x;
+}
+
+const Entry = struct { name: []const u8, op: Op };
+
+const table = [_]Entry{
+    .{ .name = &quot;double&quot;, .op = double },
+    .{ .name = &quot;negate&quot;, .op = negate },
+    .{ .name = &quot;square&quot;, .op = square },
+};
+
+/// Look up the operation by name, or null if unknown.
+fn lookup(name: []const u8) ?Op {
+    for (table) |e| if (std.mem.eql(u8, e.name, name)) return e.op;
+    return null;
+}
+
+/// Apply the named operation, or return null if the name is unknown.
+fn apply(name: []const u8, x: i32) ?i32 {
+    const op = lookup(name) orelse return null;
+    return op(x);
+}
+
+/// Run every op in `ops` left to right, starting from `start`.
+fn pipeline(ops: []const Op, start: i32) i32 {
+    var v = start;
+    for (ops) |op| v = op(v);
+    return v;
+}
+
+test &quot;apply by name&quot; {
+    try std.testing.expectEqual(@as(?i32, 10), apply(&quot;double&quot;, 5));
+    try std.testing.expectEqual(@as(?i32, -5), apply(&quot;negate&quot;, 5));
+    try std.testing.expectEqual(@as(?i32, 25), apply(&quot;square&quot;, 5));
+    try std.testing.expectEqual(@as(?i32, null), apply(&quot;cube&quot;, 5));
+}
+
+test &quot;pipeline&quot; {
+    const ops = [_]Op{ double, square, negate };
+    try std.testing.expectEqual(@as(i32, -36), pipeline(&amp;ops, 3));
+    try std.testing.expectEqual(@as(i32, 7), pipeline(&amp;.{}, 7));
+}</code></pre>
+  <p>Function names coerce to the pointer type when placed in the table. <code>apply</code> uses <code>orelse return null</code> so that an unknown name becomes a <code>null</code> result rather than a crash.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 18.5 · Do not keep a pointer across a growth <span class="level">challenge</span></h4>
+  <p>Implement <code>recruit</code>, which appends a pilot to an <code>ArrayList</code> and then links the new pilot and the previous one as wingmen. The list grows five thousand times in the test, so any pointer taken before the <code>append</code> is unsafe afterwards. Use indices. File: <code>exercises/18-pointers/ex5_stale.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 18, exercise 5: do not keep a pointer across a growth.
+//! Run with:  zig test ex5_stale.zig
+//! Goal: make every test pass without changing the tests. `recruit`
+//! must never read through a pointer that may have gone stale.
+const std = @import(&quot;std&quot;);
+
+const Pilot = struct { name: []const u8, wingman: ?usize = null };
+
+/// Add `name`, then pair the new pilot with the previous one as wingmen.
+/// Returns the index of the new pilot. Hold INDICES, not pointers,
+/// across the append: appending may move the whole buffer.
+fn recruit(a: std.mem.Allocator, list: *std.ArrayList(Pilot), name: []const u8) !usize {
+    const new_index = list.items.len;
+    try list.append(a, .{ .name = name });
+    if (new_index &gt; 0) {
+        const prev = new_index - 1;
+        list.items[new_index].wingman = prev;
+        list.items[prev].wingman = new_index;
+    }
+    return new_index;
+}
+
+test &quot;pairing survives many reallocations&quot; {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(Pilot) = .empty;
+    defer list.deinit(a);
+
+    var i: usize = 0;
+    while (i &lt; 5000) : (i += 1) {
+        const idx = try recruit(a, &amp;list, &quot;pilot&quot;);
+        try std.testing.expectEqual(i, idx);
+    }
+    try std.testing.expectEqual(@as(?usize, 1), list.items[0].wingman);
+    try std.testing.expectEqual(@as(?usize, 2), list.items[1].wingman);
+    try std.testing.expectEqual(@as(?usize, 4999), list.items[4998].wingman);
+    try std.testing.expectEqual(@as(?usize, 4998), list.items[4999].wingman);
+}</code></pre>
+  <p>The tempting wrong version takes <code>const prev = &amp;list.items[len - 1];</code> before the append and writes <code>prev.wingman</code> after it. It may even pass a small test. Indices survive reallocation because they are re-resolved against <code>list.items</code> every time.</p></details>
+</div>
+
+<h3 id="ch18-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What do <code>&amp;x</code> and <code>p.*</code> do? <details class="answer"><summary>Answer</summary><code>&amp;x</code> produces a pointer to <code>x</code>; <code>p.*</code> follows a pointer to read or write the value it points at.</details></li>
+  <li>Why must a function that changes its argument take a pointer? <details class="answer"><summary>Answer</summary>Arguments are passed by value, so the function gets a copy. A pointer lets it reach the caller's original.</details></li>
+  <li>What is the difference between <code>*[4]u8</code>, <code>[]u8</code> and <code>[*]u8</code>? <details class="answer"><summary>Answer</summary>Pointer to an array of exactly 4 (length known at compile time); slice (pointer plus run-time length); many-item pointer (no length at all, for C boundaries).</details></li>
+  <li>Is <code>const p: *u8 = &amp;x;</code> a pointer you can write through? <details class="answer"><summary>Answer</summary>Yes. <code>const</code> fixes the pointer variable; the type <code>*u8</code> allows writing through it. <code>*const u8</code> would not.</details></li>
+  <li>What does <code>@ptrCast(@alignCast(p))</code> do to a <code>*anyopaque</code>? <details class="answer"><summary>Answer</summary><code>@alignCast</code> asserts the address has the alignment the target type needs; <code>@ptrCast</code> changes the pointee type to the one being assigned to.</details></li>
+  <li>Why is returning <code>&amp;local</code> from a function wrong, and what does Zig 0.16 do about it? <details class="answer"><summary>Answer</summary>The local's stack frame is gone after return, so the pointer dangles. The compiler rejects the direct case with "returning address of expired local variable".</details></li>
+  <li>You take a pointer to an element of an <code>ArrayList</code>, then <code>append</code>. What should you assume? <details class="answer"><summary>Answer</summary>That the pointer is invalid. The buffer may have moved. Keep an index and re-fetch after the append.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>*T</code> holds an address; <code>&amp;x</code> makes one; <code>p.*</code> follows it; field access through a pointer needs no arrow.</li>
+<li><code>*const T</code> may only be read through; <code>*T</code> coerces to it, not the reverse.</li>
+<li>Pass <code>*T</code> to mutate, <code>*const T</code> to read a large struct, plain <code>T</code> for small read-only values.</li>
+<li>Four shapes: <code>*T</code>, <code>*[N]T</code> (coerces to a slice), <code>[]T</code>, <code>[*]T</code> (C boundary only).</li>
+<li><code>*anyopaque</code> is the untyped pointer; recover the type with <code>@ptrCast(@alignCast(p))</code>.</li>
+<li>Pointers can be null only as <code>?*T</code>; function pointers are <code>*const fn (…) R</code>.</li>
+<li>Never let a pointer to a local escape, and never hold a pointer into a container across a growth.</li>
+</ul></div>
+</section>

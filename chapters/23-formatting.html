@@ -1,0 +1,616 @@
+<section id="ch23">
+<h2>23. Formatting and parsing text</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn the whole of Zig's format-string grammar: every specifier, width, alignment, fill and precision, positional and named arguments, and how to escape braces. You will see where formatted text can go (the heap, a buffer, a writer, or the compiler itself), how to turn text back into numbers with <code>parseInt</code> and <code>parseFloat</code> and handle their errors, and how to give your own types a <code>format</code> method.</p>
+
+<h3 id="ch23-1">23.1 The grammar</h3>
+<p>You have been writing <code>{d}</code> and <code>{s}</code> since <a href="#ch02">Chapter 2</a>. Here is the full shape of a placeholder:</p>
+<pre><code>{[argument]specifier:[fill][alignment][width][.precision]}</code></pre>
+<p>Everything except the braces is optional. <code>argument</code> is a position (<code>0</code>, <code>1</code>) or a field name in square brackets. <code>specifier</code> is a short letter code saying how to render the value. After a colon come the layout options: a <code>fill</code> character, an <code>alignment</code> (<code>&lt;</code> left, <code>^</code> centre, <code>&gt;</code> right), a <code>width</code> in characters and a <code>.precision</code> for floats. Format strings are checked at compile time against the argument tuple: a missing argument, an extra one, or a specifier that does not fit the type is a compile error, never a runtime surprise.</p>
+
+<h3 id="ch23-2">23.2 Every specifier</h3>
+<p class="file">a_specs.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const n: u32 = 42;
+    const neg: i32 = -7;
+    const f: f64 = 3.14159;
+    const s: []const u8 = "Atlas";
+    const c: u8 = 'K';
+    const opt: ?u32 = null;
+    const eu: anyerror!u32 = error.NoFuel;
+
+    std.debug.print("{{d}}   -&gt; {d}  {d}\n", .{ n, neg });
+    std.debug.print("{{x}}   -&gt; {x}    {{X}} -&gt; {X}\n", .{ n, n });
+    std.debug.print("{{b}}   -&gt; {b}  {{o}} -&gt; {o}\n", .{ n, n });
+    std.debug.print("{{c}}   -&gt; {c}   {{u}} -&gt; {u}\n", .{ c, @as(u21, 0x2694) });
+    std.debug.print("{{s}}   -&gt; {s}\n", .{s});
+    std.debug.print("{{d}}   -&gt; {d}   {{e}} -&gt; {e}\n", .{ f, f });
+    std.debug.print("{{?}}   -&gt; {?}  {{?d}} -&gt; {?d}\n", .{ opt, @as(?u32, 5) });
+    std.debug.print("{{!}}   -&gt; {!}  {{!d}} -&gt; {!d}\n", .{ eu, @as(anyerror!u32, 9) });
+    std.debug.print("{{any}} -&gt; {any}\n", .{[_]u8{ 1, 2, 3 }});
+    std.debug.print("{{*}}   -&gt; {*}\n", .{&amp;n});
+    std.debug.print("{{}}    -&gt; {}  {}\n", .{ true, n });
+}</code></pre>
+<pre class="term">{d}   -&gt; 42  -7
+{x}   -&gt; 2a    {X} -&gt; 2A
+{b}   -&gt; 101010  {o} -&gt; 52
+{c}   -&gt; K   {u} -&gt; ⚔
+{s}   -&gt; Atlas
+{d}   -&gt; 3.14159   {e} -&gt; 3.14159e0
+{?}   -&gt; null  {?d} -&gt; 5
+{!}   -&gt; error.NoFuel  {!d} -&gt; 9
+{any} -&gt; { 1, 2, 3 }
+{*}   -&gt; u32@102a234c0
+{}    -&gt; true  42</pre>
+<table>
+<tr><th>Spec</th><th>Works on</th><th>Output</th></tr>
+<tr><td><code>{d}</code></td><td>integers, floats</td><td>Decimal.</td></tr>
+<tr><td><code>{x}</code> <code>{X}</code></td><td>integers, byte slices</td><td>Hex, lower or upper case.</td></tr>
+<tr><td><code>{b}</code> <code>{o}</code></td><td>integers</td><td>Binary, octal.</td></tr>
+<tr><td><code>{c}</code></td><td><code>u8</code></td><td>One ASCII character.</td></tr>
+<tr><td><code>{u}</code></td><td><code>u21</code></td><td>One Unicode code point, UTF-8 encoded.</td></tr>
+<tr><td><code>{s}</code></td><td><code>[]const u8</code>, <code>[*:0]const u8</code></td><td>The bytes as text.</td></tr>
+<tr><td><code>{e}</code></td><td>floats</td><td>Scientific notation.</td></tr>
+<tr><td><code>{?}</code> <code>{?d}</code></td><td>optionals</td><td><code>null</code> or the payload with the spec after <code>?</code>.</td></tr>
+<tr><td><code>{!}</code> <code>{!d}</code></td><td>error unions</td><td><code>error.Name</code> or the payload with the spec after <code>!</code>.</td></tr>
+<tr><td><code>{any}</code></td><td>anything</td><td>A debug rendering: arrays, structs, enums, whatever.</td></tr>
+<tr><td><code>{*}</code></td><td>pointers</td><td>Type and address.</td></tr>
+<tr><td><code>{f}</code></td><td>types with a <code>format</code> method</td><td>Calls it (23.8).</td></tr>
+<tr><td><code>{t}</code></td><td>enums, error sets</td><td>The tag name, like <code>@tagName</code>.</td></tr>
+<tr><td><code>{}</code></td><td>bools, integers</td><td>Default rendering. Not allowed on slices, which must say <code>{s}</code>, <code>{x}</code> or <code>{any}</code>.</td></tr>
+</table>
+<p>The <code>?</code> and <code>!</code> prefixes compose: <code>{?d}</code> is "an optional integer, print the integer in decimal if present". They save you an <code>if</code> when debugging. Slices are the one place Zig refuses a bare <code>{}</code>: a <code>[]const u8</code> might be text or bytes, so you have to say which with <code>{s}</code> or <code>{x}</code>.</p>
+
+<h3 id="ch23-3">23.3 Width, alignment, fill and precision</h3>
+<p class="file">b_width.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const name: []const u8 = "Locust";
+    const tons: u32 = 20;
+    const f: f64 = 2.0 / 3.0;
+
+    std.debug.print("[{s: &lt;10}] left in 10\n", .{name});
+    std.debug.print("[{s: &gt;10}] right in 10\n", .{name});
+    std.debug.print("[{s:^10}] centred in 10\n", .{name});
+    std.debug.print("[{s:.^10}] centred, fill '.'\n", .{name});
+    std.debug.print("[{d: &gt;6}] right in 6\n", .{tons});
+    std.debug.print("[{d:0&gt;6}] zero-padded to 6\n", .{tons});
+    std.debug.print("[{d:&lt;6}] left in 6 (default fill is space)\n", .{tons});
+    std.debug.print("[{d:.2}] two decimals\n", .{f});
+    std.debug.print("[{d:8.3}] width 8, three decimals\n", .{f});
+    std.debug.print("[{x:0&gt;8}] hex, zero-padded to 8\n", .{@as(u32, 0xBEEF)});
+
+    // A table: the format string is the layout.
+    const rows = [_]struct { n: []const u8, t: u32, bv: u32 }{
+        .{ .n = "Atlas", .t = 100, .bv = 1897 },
+        .{ .n = "Marauder", .t = 75, .bv = 1363 },
+        .{ .n = "Locust", .t = 20, .bv = 432 },
+    };
+    std.debug.print("{s: &lt;10} {s: &gt;5} {s: &gt;6}\n", .{ "name", "tons", "bv" });
+    for (rows) |r| std.debug.print("{s: &lt;10} {d: &gt;5} {d: &gt;6}\n", .{ r.n, r.t, r.bv });
+}</code></pre>
+<pre class="term">[Locust    ] left in 10
+[    Locust] right in 10
+[  Locust  ] centred in 10
+[..Locust..] centred, fill '.'
+[    20] right in 6
+[000020] zero-padded to 6
+[20    ] left in 6 (default fill is space)
+[0.67] two decimals
+[   0.667] width 8, three decimals
+[0000beef] hex, zero-padded to 8
+name        tons     bv
+Atlas        100   1897
+Marauder      75   1363
+Locust        20    432</pre>
+<p>Read <code>{s: &lt;10}</code> as: specifier <code>s</code>, then after the colon a fill character (space), an alignment (<code>&lt;</code>), a width (10). The fill is any single character, and it is only recognised if an alignment character follows it, which is why <code>{d:0&gt;6}</code> means "fill with zeros, right-align, width 6" and not "width 06". Numbers align right by default and text aligns... also right, which surprises people; put an explicit <code>&lt;</code> on string columns. Precision for floats is <code>.N</code> and rounds; width and precision combine as <code>{d:8.3}</code>.</p>
+<p>The table at the end is the whole trick of text user interfaces: pick a format string once, use it for the header and every row, and the columns line up. IRON LEDGER's screens are hundreds of lines exactly like it.</p>
+<div class="warn"><strong>A 0.16 surprise: signed integers grow a plus sign when given a width.</strong>
+<p class="file">c_sign.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const unsigned: u32 = 42;
+    const signed: i32 = 42;
+    std.debug.print("[{d}] [{d}]      no width: same\n", .{ unsigned, signed });
+    std.debug.print("[{d: &gt;5}] [{d: &gt;5}]  with width: signed gets a '+'\n", .{ unsigned, signed });
+    std.debug.print("[{d: &gt;5}]          negative is what you expect\n", .{@as(i32, -42)});
+}</code></pre>
+<pre class="term">[42] [42]      no width: same
+[   42] [  +42]  with width: signed gets a '+'
+[  -42]          negative is what you expect</pre>
+The rule inside the standard library is: for a signed type with a non-zero width, print the sign always. With no width, positive numbers print bare. If you want <code>   42</code> from an <code>i32</code>, cast to unsigned first when you know it is not negative (<code>@as(u32, @intCast(v))</code>), or format the number into a small buffer with <code>{d}</code> and then align that string with <code>{s: &gt;5}</code>.</div>
+
+<h3 id="ch23-4">23.4 Positional and named arguments, and literal braces</h3>
+<p class="file">d_positional.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    // Positional: {0} is the first argument, {1} the second.
+    std.debug.print("{1s} weighs {0d} tons; yes, {0d}.\n", .{ 100, "Atlas" });
+
+    // Named: the argument is a struct, and {[field]} picks a field.
+    std.debug.print("{[name]s}: gunnery {[gun]d}, piloting {[pil]d}\n", .{
+        .name = "Natasha", .gun = 1, .pil = 2,
+    });
+
+    // Literal braces are doubled.
+    std.debug.print("markup looks like {{g}}{s}{{/}}\n", .{"active"});
+}</code></pre>
+<pre class="term">Atlas weighs 100 tons; yes, 100.
+Natasha: gunnery 1, piloting 2
+markup looks like {g}active{/}</pre>
+<p>Positional indices let you reuse an argument or reorder them. Named placeholders take a struct instead of a tuple, and <code>{[name]s}</code> reads the field <code>name</code>. Both are rare in everyday code but useful for message templates. The doubled brace is essential: <code>{{</code> prints <code>{</code>. You will see this constantly in the game, because its colour markup uses braces.</p>
+
+<h3 id="ch23-5">23.5 Where the text goes</h3>
+<p><code>std.debug.print</code> sends formatted text to stderr. The same format engine can send it to the heap, to a buffer you own, to any writer, or run at compile time.</p>
+<p class="file">e_targets.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    // 1. allocPrint: heap string, caller frees.
+    const heap = try std.fmt.allocPrint(gpa, "unit-{d:0&gt;3}", .{7});
+    defer gpa.free(heap);
+    std.debug.print("allocPrint: {s}\n", .{heap});
+
+    // 2. bufPrint: into a buffer you provide; returns the slice actually used.
+    var buf: [16]u8 = undefined;
+    const fixed = try std.fmt.bufPrint(&amp;buf, "{d}%", .{95});
+    std.debug.print("bufPrint:   {s} ({d} of {d} bytes)\n", .{ fixed, fixed.len, buf.len });
+
+    // 3. bufPrint fails, it does not truncate.
+    const too_long = std.fmt.bufPrint(buf[0..4], "{d}", .{123456});
+    std.debug.print("too long:   {!s}\n", .{too_long});
+
+    // 4. bufPrintZ: same, with a trailing zero byte for C.
+    const z = try std.fmt.bufPrintZ(&amp;buf, "{s}", .{"cstr"});
+    std.debug.print("bufPrintZ:  {s} len {d}, byte after is {d}\n", .{ z, z.len, z[z.len] });
+
+    // 5. A fixed Writer: many prints into one buffer.
+    var w = std.Io.Writer.fixed(&amp;buf);
+    try w.print("{d}", .{1});
+    try w.print("+{d}", .{2});
+    try w.writeAll("=3");
+    std.debug.print("fixed:      {s}\n", .{w.buffered()});
+
+    // 6. comptimePrint: the string is built by the compiler.
+    const version = std.fmt.comptimePrint("zig {d}.{d}", .{ 0, 16 });
+    std.debug.print("comptime:   {s} ({s})\n", .{ version, @typeName(@TypeOf(version)) });
+
+    // 7. count: how many bytes would it take?
+    std.debug.print("count:      {d}\n", .{std.fmt.count("{d}-{s}", .{ 12, "ab" })});
+}</code></pre>
+<pre class="term">allocPrint: unit-007
+bufPrint:   95% (3 of 16 bytes)
+too long:   error.NoSpaceLeft
+bufPrintZ:  cstr len 4, byte after is 0
+fixed:      1+2=3
+comptime:   zig 0.16 (*const [8:0]u8)
+count:      5</pre>
+<ul>
+<li><code>allocPrint(gpa, fmt, args)</code> returns a <code>[]u8</code> you must free. It is the most common in IRON LEDGER (over five hundred calls), always with an arena so the frees are one <code>deinit</code>.</li>
+<li><code>bufPrint(buf, fmt, args)</code> writes into your buffer and returns the slice that was written. If the result does not fit, it returns <code>error.NoSpaceLeft</code> and writes nothing useful. It never truncates silently, which is a deliberate contrast with C's <code>snprintf</code>.</li>
+<li><code>bufPrintZ</code> is the same with a zero byte appended, returning <code>[:0]u8</code>, for handing to C (<a href="#ch35">Chapter 35</a>).</li>
+<li><code>std.Io.Writer.fixed(&amp;buf)</code> makes a writer backed by your buffer; you can <code>print</code> to it repeatedly and read back <code>buffered()</code>. This is how you build a line from several pieces without an allocator. The growable version is <code>std.Io.Writer.Allocating</code> from <a href="#ch21">Chapter 21</a>.</li>
+<li><code>comptimePrint</code> produces the string at compile time. The result's type, <code>*const [8:0]u8</code>, tells you it is a pointer to a constant array baked into the binary. Use it for building names, error messages and <code>@compileError</code> text in generic code.</li>
+<li><code>count</code> tells you how long the output would be, useful to size a buffer.</li>
+</ul>
+
+<h3 id="ch23-6">23.6 Parsing numbers</h3>
+<p>Going the other way, from text to a value, is <code>std.fmt.parseInt(T, text, base)</code>, <code>parseUnsigned</code> and <code>parseFloat</code>. They return error unions, and the errors are specific.</p>
+<p class="file">f_parse.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("{!d}\n", .{std.fmt.parseInt(i32, "-12", 10)});
+    std.debug.print("{!d}\n", .{std.fmt.parseInt(u8, "ff", 16)});
+    std.debug.print("{!d}\n", .{std.fmt.parseInt(u8, "1010", 2)});
+    std.debug.print("{!d}  (base 0: prefix decides)\n", .{std.fmt.parseInt(i32, "0x1F", 0)});
+    std.debug.print("{!d}  (underscores allowed)\n", .{std.fmt.parseInt(i32, "1_000", 10)});
+    std.debug.print("{!d}  (256 does not fit u8)\n", .{std.fmt.parseInt(u8, "256", 10)});
+    std.debug.print("{!d}  (trailing junk)\n", .{std.fmt.parseInt(u8, "12a", 10)});
+    std.debug.print("{!d}  (empty)\n", .{std.fmt.parseInt(i32, "", 10)});
+    std.debug.print("{!d}  (spaces are junk too)\n", .{std.fmt.parseInt(i32, " 5", 10)});
+    std.debug.print("{!d}  (parseUnsigned rejects a sign)\n", .{std.fmt.parseUnsigned(u16, "-1", 10)});
+    std.debug.print("{!d}\n", .{std.fmt.parseFloat(f64, "1.5")});
+    std.debug.print("{!d}\n", .{std.fmt.parseFloat(f64, "1e3")});
+    std.debug.print("{!d}\n", .{std.fmt.parseFloat(f64, "inf")});
+    std.debug.print("{!d}\n", .{std.fmt.parseFloat(f32, "abc")});
+}</code></pre>
+<pre class="term">-12
+255
+10
+31  (base 0: prefix decides)
+1000  (underscores allowed)
+error.Overflow  (256 does not fit u8)
+error.InvalidCharacter  (trailing junk)
+error.InvalidCharacter  (empty)
+error.InvalidCharacter  (spaces are junk too)
+error.InvalidCharacter  (parseUnsigned rejects a sign)
+1.5
+1000
+inf
+error.InvalidCharacter</pre>
+<p>The rules: the whole string must be a number (no leading or trailing spaces, no trailing junk); an optional sign is accepted by <code>parseInt</code> but not <code>parseUnsigned</code>; underscores between digits are fine; base 0 means "look at the prefix" (<code>0x</code>, <code>0o</code>, <code>0b</code>, or decimal). The value must fit in <code>T</code> or you get <code>error.Overflow</code>. Everything else is <code>error.InvalidCharacter</code>. <code>parseFloat</code> understands exponents, <code>inf</code> and <code>nan</code>.</p>
+<p>Because the error set of <code>parseInt</code> is exactly <code>{ Overflow, InvalidCharacter }</code>, you can switch on it exhaustively and give the user a precise message:</p>
+<p class="file">g_handle.zig</p>
+<pre><code>const std = @import("std");
+
+/// Parse "name=value" into a number, explaining any problem.
+fn readSetting(line: []const u8) ?i32 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
+        std.debug.print("  no '=' in {s}\n", .{line});
+        return null;
+    };
+    const text = std.mem.trim(u8, line[eq + 1 ..], " ");
+    return std.fmt.parseInt(i32, text, 10) catch |err| switch (err) {
+        error.InvalidCharacter =&gt; {
+            std.debug.print("  '{s}' is not a number\n", .{text});
+            return null;
+        },
+        error.Overflow =&gt; {
+            std.debug.print("  '{s}' does not fit in an i32\n", .{text});
+            return null;
+        },
+    };
+}
+
+pub fn main() void {
+    const lines = [_][]const u8{ "seed = 42", "seed=-1", "seed", "seed = forty", "seed = 99999999999" };
+    for (lines) |l| {
+        std.debug.print("{s}:\n", .{l});
+        if (readSetting(l)) |v| std.debug.print("  -&gt; {d}\n", .{v});
+    }
+}</code></pre>
+<pre class="term">seed = 42:
+  -&gt; 42
+seed=-1:
+  -&gt; -1
+seed:
+  no '=' in seed
+seed = forty:
+  'forty' is not a number
+seed = 99999999999:
+  '99999999999' does not fit in an i32</pre>
+<p>Notice the <code>trim</code> before the parse. Users type spaces; <code>parseInt</code> does not forgive them; so you strip them. This pairs with the tokenizers of <a href="#ch24">Chapter 24</a>, which is how command lines are chopped into words before each word is parsed.</p>
+
+<h3 id="ch23-7">23.7 Bytes as hex</h3>
+<p>Older Zig had <code>std.fmt.fmtSliceHexLower</code>. In 0.16 it is gone, and the job is done by the plain <code>{x}</code> specifier applied to a byte slice, or by <code>bytesToHex</code> when you want an array back:</p>
+<p class="file">i_hex.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const bytes = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    std.debug.print("{x}\n", .{&amp;bytes}); // a byte slice with {x}: hex, no separators
+    std.debug.print("{X}\n", .{&amp;bytes});
+    std.debug.print("{s}\n", .{&amp;std.fmt.bytesToHex(bytes, .lower)}); // comptime-sized array
+    std.debug.print("{any}\n", .{&amp;bytes}); // {any} prints decimal elements
+    var out: [4]u8 = undefined;
+    const back = std.fmt.hexToBytes(&amp;out, "deadbeef") catch unreachable;
+    std.debug.print("{any}\n", .{back});
+}</code></pre>
+<pre class="term">deadbeef
+DEADBEEF
+deadbeef
+{ 222, 173, 190, 239 }
+{ 222, 173, 190, 239 }</pre>
+<p><code>bytesToHex</code> takes an array (not a slice) so it can size its result at compile time; <code>hexToBytes</code> reverses it into a buffer you provide.</p>
+
+<h3 id="ch23-8">23.8 Giving your type a format method</h3>
+<p>Any struct, union or enum can declare a public <code>format</code> method, and the <code>{f}</code> specifier calls it. The 0.16 signature is small: the value, and a pointer to the writer.</p>
+<p class="file">h_custom.zig</p>
+<pre><code>const std = @import("std");
+
+const CBills = struct {
+    amount: i64,
+
+    /// Called for the {f} specifier. Writes to any writer.
+    pub fn format(self: CBills, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.amount &lt; 0) try w.writeByte('-');
+        var digits: [24]u8 = undefined;
+        const raw = std.fmt.bufPrint(&amp;digits, "{d}", .{@abs(self.amount)}) catch unreachable;
+        for (raw, 0..) |ch, i| {
+            if (i &gt; 0 and (raw.len - i) % 3 == 0) try w.writeByte(',');
+            try w.writeByte(ch);
+        }
+        try w.writeAll(" C-bills");
+    }
+};
+
+const Hex = struct { q: i16, r: i16 };
+
+pub fn main() !void {
+    const pay: CBills = .{ .amount = 1234567 };
+    const debt: CBills = .{ .amount = -950 };
+    std.debug.print("{f}\n{f}\n", .{ pay, debt });
+    std.debug.print("{any}\n", .{pay}); // {any} ignores format(): prints the fields
+
+    const h: Hex = .{ .q = 2, .r = -1 };
+    std.debug.print("{any}\n", .{h});
+
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&amp;buf, "balance: {f}", .{pay});
+    std.debug.print("{s}\n", .{line});
+}</code></pre>
+<pre class="term">1,234,567 C-bills
+-950 C-bills
+.{ .amount = 1234567 }
+.{ .q = 2, .r = -1 }
+balance: 1,234,567 C-bills</pre>
+<p>Inside <code>format</code> you have a full <code>*std.Io.Writer</code>: <code>print</code>, <code>writeAll</code>, <code>writeByte</code>. The error type is fixed as <code>std.Io.Writer.Error</code>, so anything that can fail for other reasons (here, <code>bufPrint</code> into a buffer we know is big enough) is handled locally, with <code>catch unreachable</code>. Once written, the type works everywhere the format engine does: <code>debug.print</code>, <code>allocPrint</code>, <code>bufPrint</code>, file writers.</p>
+<div class="warn">You must write <code>{f}</code>. In 0.16 the plain <code>{}</code> and <code>{any}</code> do <em>not</em> call <code>format</code>; they print the fields:
+<p class="file">h_nof.zig</p>
+<pre><code>const std = @import("std");
+const CBills = struct { amount: i64,
+    pub fn format(self: CBills, w: *std.Io.Writer) std.Io.Writer.Error!void { try w.print("{d} C-bills", .{self.amount}); } };
+pub fn main() void { std.debug.print("{}\n", .{CBills{ .amount = 5 }}); }</code></pre>
+<pre class="term">.{ .amount = 5 }</pre>
+Older code relied on <code>{}</code> calling <code>format</code> with a four-argument signature (<code>fmt</code>, <code>options</code>, <code>writer</code>). That signature is gone. If you port such code, change the method to <code>format(self, w: *std.Io.Writer) std.Io.Writer.Error!void</code> and the call sites to <code>{f}</code>.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> Every screen is a format string. The People query in <code>game/src/sim/queries.zig</code> lays out a row with widths alone:
+<pre><code>"{d: &lt;4} {s: &lt;20} {s: &lt;15} {s: &lt;7} {s: &lt;5} {d: &gt;3} {s} {s} {s: &lt;11} {d: &gt;3} {d: &gt;3} {s: &gt;7}"</code></pre>
+The colour markup that the terminal renders, <code>{g}active{/}</code>, has to be written <code>{{g}}active{{/}}</code> inside format strings, which is where most brace confusion in the code base comes from. The <code>money</code> function is Exercise 23.5 almost verbatim: <code>bufPrint</code> the magnitude with <code>{d}</code>, then walk the digits inserting commas. And the console parser in <code>game/src/sim/cli.zig</code> wraps <code>parseInt</code> in a tiny generic helper that turns both of its errors into the command layer's own <code>error.BadNumber</code>:
+<pre><code>pub fn num(comptime T: type, tok: ?[]const u8) ParseError!T {
+    return std.fmt.parseInt(T, tok orelse return error.BadArguments, 10) catch return error.BadNumber;
+}</code></pre>
+The terminal's status line uses <code>bufPrint</code> into a fixed buffer and falls back to the whole buffer on <code>NoSpaceLeft</code> rather than failing a frame (<code>tui/app.zig</code>, <code>say</code>).</div>
+
+<h3 id="ch23-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 23.1 · Table row and clock <span class="level">warm-up</span></h4>
+  <p>Write <code>formatRow(buf, name, tons, bv)</code> producing <code>name</code> left in 10, <code>tons</code> right in 5, <code>bv</code> right in 6 with single spaces between, and <code>formatClock(buf, h, m)</code> producing <code>07:05</code>. Both use <code>bufPrint</code>. Name the file: <code>exercises/23-formatting/ex1_table.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 23, exercise 1: fixed-width table rows.
+//! Run with:  zig test ex1_table.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// name left-aligned in 10, tons right-aligned in 5, bv right-aligned in 6, single spaces between.
+fn formatRow(buf: []u8, name: []const u8, tons: u32, bv: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s: &lt;10} {d: &gt;5} {d: &gt;6}", .{ name, tons, bv });
+}
+
+/// "07:05" style, zero padded.
+fn formatClock(buf: []u8, hours: u8, minutes: u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{d:0&gt;2}:{d:0&gt;2}", .{ hours, minutes });
+}
+
+test "row" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Atlas        100   1897", try formatRow(&amp;buf, "Atlas", 100, 1897));
+    try std.testing.expectEqualStrings("Locust        20    432", try formatRow(&amp;buf, "Locust", 20, 432));
+}
+
+test "clock" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("07:05", try formatClock(&amp;buf, 7, 5));
+    try std.testing.expectEqualStrings("23:59", try formatClock(&amp;buf, 23, 59));
+}
+
+test "a buffer that is too small is an error, not a truncation" {
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, formatClock(&amp;tiny, 7, 5));
+}</code></pre>
+  <p>Unsigned arguments, so no stray plus signs. The third test shows that <code>bufPrint</code> refuses rather than truncates.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 23.2 · Coordinates <span class="level">practice</span></h4>
+  <p>Parse <code>"3,-2"</code> (spaces allowed around the numbers) into a <code>Hex{ q, r }</code> of <code>i16</code>, with your own error set <code>{ MissingComma, BadNumber }</code>. Name the file: <code>exercises/23-formatting/ex2_coords.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 23, exercise 2: parse "q,r" hex coordinates.
+//! Run with:  zig test ex2_coords.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Hex = struct { q: i16, r: i16 };
+const ParseError = error{ MissingComma, BadNumber };
+
+/// "3,-2" -&gt; Hex{ .q = 3, .r = -2 }. Spaces around the numbers are allowed.
+fn parseHex(text: []const u8) ParseError!Hex {
+    const comma = std.mem.indexOfScalar(u8, text, ',') orelse return error.MissingComma;
+    const q_text = std.mem.trim(u8, text[0..comma], " ");
+    const r_text = std.mem.trim(u8, text[comma + 1 ..], " ");
+    const q = std.fmt.parseInt(i16, q_text, 10) catch return error.BadNumber;
+    const r = std.fmt.parseInt(i16, r_text, 10) catch return error.BadNumber;
+    return .{ .q = q, .r = r };
+}
+
+test "good input" {
+    try std.testing.expectEqual(Hex{ .q = 3, .r = -2 }, try parseHex("3,-2"));
+    try std.testing.expectEqual(Hex{ .q = 0, .r = 7 }, try parseHex(" 0 , 7 "));
+}
+
+test "bad input" {
+    try std.testing.expectError(error.MissingComma, parseHex("3 -2"));
+    try std.testing.expectError(error.BadNumber, parseHex("3,x"));
+    try std.testing.expectError(error.BadNumber, parseHex(",2"));
+    try std.testing.expectError(error.BadNumber, parseHex("40000,0")); // overflow of i16
+}</code></pre>
+  <p><code>indexOfScalar</code> finds the comma, <code>trim</code> removes spaces, and <code>catch return error.BadNumber</code> folds both parse errors into one domain error, the way the game's <code>num</code> helper does.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 23.3 · Hex colours <span class="level">practice</span></h4>
+  <p>Write <code>parseColor("#ff8800")</code> using <code>parseUnsigned</code> with base 16 on two-character slices, and <code>formatColor</code> that prints <code>#0a0b0c</code> with zero-padded hex. Name the file: <code>exercises/23-formatting/ex3_color.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 23, exercise 3: parse and print hex colours.
+//! Run with:  zig test ex3_color.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Rgb = struct { r: u8, g: u8, b: u8 };
+
+/// "#ff8800" or "ff8800" -&gt; Rgb. Case-insensitive.
+fn parseColor(text: []const u8) !Rgb {
+    const hex = if (text.len &gt; 0 and text[0] == '#') text[1..] else text;
+    if (hex.len != 6) return error.WrongLength;
+    return .{
+        .r = try std.fmt.parseUnsigned(u8, hex[0..2], 16),
+        .g = try std.fmt.parseUnsigned(u8, hex[2..4], 16),
+        .b = try std.fmt.parseUnsigned(u8, hex[4..6], 16),
+    };
+}
+
+/// Rgb -&gt; "#ff8800", lower case, always six digits.
+fn formatColor(buf: []u8, c: Rgb) ![]u8 {
+    return std.fmt.bufPrint(buf, "#{x:0&gt;2}{x:0&gt;2}{x:0&gt;2}", .{ c.r, c.g, c.b });
+}
+
+test "parse" {
+    try std.testing.expectEqual(Rgb{ .r = 255, .g = 136, .b = 0 }, try parseColor("#ff8800"));
+    try std.testing.expectEqual(Rgb{ .r = 255, .g = 136, .b = 0 }, try parseColor("FF8800"));
+    try std.testing.expectError(error.WrongLength, parseColor("#fff"));
+    try std.testing.expectError(error.InvalidCharacter, parseColor("#gg0000"));
+}
+
+test "format round trip" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("#0a0b0c", try formatColor(&amp;buf, .{ .r = 10, .g = 11, .b = 12 }));
+    const c = try parseColor("#12abEF");
+    try std.testing.expectEqualStrings("#12abef", try formatColor(&amp;buf, c));
+}</code></pre>
+  <p><code>{x:0&gt;2}</code> is fill <code>0</code>, right-aligned, width 2. The parse error set is inferred (<code>!Rgb</code>) and includes both your <code>WrongLength</code> and <code>parseUnsigned</code>'s errors.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 23.4 · Duration <span class="level">challenge</span></h4>
+  <p>Give a <code>Duration { seconds: u64 }</code> a <code>format</code> method that renders <code>2d 3h 4m 5s</code>, dropping leading zero units (<code>2m 5s</code>, <code>45s</code>, and <code>0s</code> for zero, but <code>1h 0m 0s</code> for exactly an hour). Test it through <code>bufPrint</code> and <code>allocPrint</code> with <code>{f}</code>. Name the file: <code>exercises/23-formatting/ex4_duration.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 23, exercise 4: a custom format method.
+//! Run with:  zig test ex4_duration.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+const Duration = struct {
+    seconds: u64,
+
+    /// "2d 3h 4m 5s", omitting any leading zero units; "0s" for zero.
+    pub fn format(self: Duration, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var rest = self.seconds;
+        const days = rest / 86_400;
+        rest %= 86_400;
+        const hours = rest / 3_600;
+        rest %= 3_600;
+        const mins = rest / 60;
+        rest %= 60;
+        var started = false;
+        if (days &gt; 0) {
+            try w.print("{d}d", .{days});
+            started = true;
+        }
+        if (started or hours &gt; 0) {
+            if (started) try w.writeByte(' ');
+            try w.print("{d}h", .{hours});
+            started = true;
+        }
+        if (started or mins &gt; 0) {
+            if (started) try w.writeByte(' ');
+            try w.print("{d}m", .{mins});
+            started = true;
+        }
+        if (started) try w.writeByte(' ');
+        try w.print("{d}s", .{rest});
+    }
+};
+
+fn render(buf: []u8, d: Duration) ![]u8 {
+    return std.fmt.bufPrint(buf, "{f}", .{d});
+}
+
+test "format" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0s", try render(&amp;buf, .{ .seconds = 0 }));
+    try std.testing.expectEqualStrings("45s", try render(&amp;buf, .{ .seconds = 45 }));
+    try std.testing.expectEqualStrings("2m 5s", try render(&amp;buf, .{ .seconds = 125 }));
+    try std.testing.expectEqualStrings("1h 0m 0s", try render(&amp;buf, .{ .seconds = 3600 }));
+    try std.testing.expectEqualStrings("2d 3h 4m 5s", try render(&amp;buf, .{ .seconds = 2 * 86400 + 3 * 3600 + 4 * 60 + 5 }));
+}
+
+test "works with allocPrint too" {
+    const s = try std.fmt.allocPrint(std.testing.allocator, "eta {f}", .{Duration{ .seconds = 90 }});
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("eta 1m 30s", s);
+}</code></pre>
+  <p>The <code>started</code> flag does the "once a bigger unit has printed, print all the smaller ones" logic. The method takes <code>self</code> by value because the struct is tiny and it does not mutate.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 23.5 · Money <span class="level">challenge</span></h4>
+  <p>Write <code>money(gpa, v: i64) ![]u8</code> that prints thousands separators and a leading minus (<code>-1,234,567</code>), and <code>parseMoney(text) !i64</code> that accepts the same form (commas optional). The tests round-trip. Name the file: <code>exercises/23-formatting/ex5_money.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 23, exercise 5: money with thousands separators, like IRON LEDGER's.
+//! Run with:  zig test ex5_money.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+/// -1234567 -&gt; "-1,234,567". The caller owns the result.
+fn money(gpa: std.mem.Allocator, v: i64) ![]u8 {
+    var digits: [24]u8 = undefined;
+    const raw = try std.fmt.bufPrint(&amp;digits, "{d}", .{@abs(v)});
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (v &lt; 0) try out.append(gpa, '-');
+    for (raw, 0..) |c, i| {
+        if (i &gt; 0 and (raw.len - i) % 3 == 0) try out.append(gpa, ',');
+        try out.append(gpa, c);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// "1,234,567" or "-1,234,567" -&gt; i64. Commas are optional; anything else is an error.
+fn parseMoney(text: []const u8) !i64 {
+    var clean: [32]u8 = undefined;
+    var n: usize = 0;
+    for (text) |c| {
+        if (c == ',') continue;
+        if (n == clean.len) return error.Overflow;
+        clean[n] = c;
+        n += 1;
+    }
+    return std.fmt.parseInt(i64, clean[0..n], 10);
+}
+
+fn check(expected: []const u8, v: i64) !void {
+    const s = try money(std.testing.allocator, v);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings(expected, s);
+    try std.testing.expectEqual(v, try parseMoney(s));
+}
+
+test "money" {
+    try check("0", 0);
+    try check("999", 999);
+    try check("1,000", 1000);
+    try check("1,234,567", 1234567);
+    try check("-950", -950);
+    try check("-1,234,567", -1234567);
+}
+
+test "parse rejects junk" {
+    try std.testing.expectError(error.InvalidCharacter, parseMoney("1,2x3"));
+    try std.testing.expectEqual(@as(i64, 5000), try parseMoney("5000"));
+}</code></pre>
+  <p>The comma goes before digit <code>i</code> whenever the number of digits remaining, <code>raw.len - i</code>, is a multiple of three. <code>@abs</code> on an <code>i64</code> gives a <code>u64</code>, which sidesteps the "minus the most negative value" overflow. This is the game's <code>money</code> function.</p></details>
+</div>
+
+<h3 id="ch23-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>What does <code>{d:0&gt;6}</code> mean, character by character? <details class="answer"><summary>Answer</summary>Specifier <code>d</code>; fill character <code>0</code>; alignment <code>&gt;</code> (right); width 6. The value <code>20</code> prints as <code>000020</code>.</details></li>
+  <li>How do you print a literal <code>{</code>? <details class="answer"><summary>Answer</summary>Double it: <code>{{</code>. Likewise <code>}}</code> for <code>}</code>.</details></li>
+  <li>Why does <code>bufPrint</code> return an error union? <details class="answer"><summary>Answer</summary>The buffer may be too small; it returns <code>error.NoSpaceLeft</code> rather than truncating.</details></li>
+  <li>What is the difference between <code>parseInt(u8, "-1", 10)</code> and <code>parseUnsigned(u8, "-1", 10)</code>? <details class="answer"><summary>Answer</summary>Both fail, but for different reasons: <code>parseInt</code> reads the minus sign and then finds <code>-1</code> does not fit <code>u8</code> (<code>Overflow</code>); <code>parseUnsigned</code> does not accept a sign at all (<code>InvalidCharacter</code>).</details></li>
+  <li>What are the two errors <code>parseInt</code> can return? <details class="answer"><summary>Answer</summary><code>error.Overflow</code> (does not fit the type) and <code>error.InvalidCharacter</code> (anything else: junk, empty string, spaces, bad sign).</details></li>
+  <li>You gave a struct a <code>format</code> method but <code>{}</code> still prints the fields. Why? <details class="answer"><summary>Answer</summary>In 0.16 only <code>{f}</code> calls a <code>format</code> method. <code>{}</code> and <code>{any}</code> use the built-in rendering.</details></li>
+  <li>Why does <code>{d: &gt;5}</code> print <code>+42</code> for an <code>i32</code> but <code>42</code> for a <code>u32</code>? <details class="answer">
+<summary>Answer</summary>The integer printer adds an explicit sign to signed values whenever a width is given. Unsigned values have no sign to show. Cast, or format then align the string.</details></li>
+  <li>What replaced <code>std.fmt.fmtSliceHexLower</code>? <details class="answer"><summary>Answer</summary>The <code>{x}</code> specifier on a byte slice (and <code>{X}</code> for upper case), or <code>std.fmt.bytesToHex</code> for an array result.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>A placeholder is <code>{[arg]spec:[fill][align][width][.prec]}</code>; format strings are checked at compile time.</li>
+<li>Specifiers: <code>d x X b o c u s e any * f t</code>, with <code>?</code> and <code>!</code> prefixes for optionals and error unions.</li>
+<li>Width and alignment build tables; signed integers with a width print a <code>+</code>.</li>
+<li><code>{{</code> escapes a brace; <code>{0}</code> and <code>{[name]}</code> select arguments.</li>
+<li>Targets: <code>allocPrint</code> (heap), <code>bufPrint</code>/<code>bufPrintZ</code> (buffer, errors rather than truncates), <code>Writer.fixed</code>, <code>comptimePrint</code>.</li>
+<li><code>parseInt(T, text, base)</code>, <code>parseUnsigned</code>, <code>parseFloat</code>: whole-string, specific errors, base 0 reads prefixes.</li>
+<li>A <code>pub fn format(self, w: *std.Io.Writer) std.Io.Writer.Error!void</code> method is invoked by <code>{f}</code>.</li>
+</ul></div>
+</section>

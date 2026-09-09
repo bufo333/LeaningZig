@@ -1,0 +1,689 @@
+<section id="ch32">
+<h2>32. Command-line programs</h2>
+<p class="goals"><strong>In this chapter</strong> you will write programs that behave well in a terminal: they read arguments and flags, read standard input line by line or all at once, write results to standard output and complaints to standard error, look at environment variables, and exit with a status that scripts can trust. You will finish with a small read-eval-print loop of the kind IRON LEDGER offers behind <code>--repl</code>.</p>
+
+<h3 id="ch32-1">32.1 What main receives</h3>
+<p>Since <a href="#ch01">Chapter 1</a> you have seen two shapes of <code>main</code>: <code>pub fn main() void</code> for programs that only print with <code>std.debug.print</code>, and <code>pub fn main(init: std.process.Init) !void</code> for everything else. In 0.16 that <code>init</code> parameter is how a program receives everything the operating system gave it. Its fields, from the standard library:</p>
+<table>
+<tr><th>Field</th><th>What it is</th></tr>
+<tr><td><code>init.io</code></td><td>the <code>std.Io</code> instance every file, clock and process operation needs</td></tr>
+<tr><td><code>init.gpa</code></td><td>a general purpose allocator, leak-checked in Debug</td></tr>
+<tr><td><code>init.arena</code></td><td>a pointer to an arena that lives as long as the process; use <code>init.arena.allocator()</code></td></tr>
+<tr><td><code>init.minimal.args</code></td><td>the command-line arguments</td></tr>
+<tr><td><code>init.minimal.environ</code></td><td>the raw environment block</td></tr>
+<tr><td><code>init.environ_map</code></td><td>the environment as a map you can query by name</td></tr>
+<tr><td><code>init.preopens</code></td><td>files handed over by a parent process (mostly WASI)</td></tr>
+</table>
+<p>Nothing is global. A function that wants to read a file must be handed an <code>io</code>; a function that wants the arguments must be handed them. This is the same discipline as allocators, and it has the same benefit: you can see from a signature what a function is able to do.</p>
+
+<h3 id="ch32-2">32.2 Arguments</h3>
+<p><code>init.minimal.args</code> is not a slice; it is an opaque handle that works the same on every platform. You either iterate it with <code>std.process.Args.Iterator</code>, or turn it into a slice with <code>toSlice</code> and an allocator. The first entry is always the program itself.</p>
+<p class="file">args.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    const prog = it.next().?;
+    std.debug.print("program: {s}\n", .{prog});
+    var n: usize = 0;
+    while (it.next()) |arg| : (n += 1) {
+        std.debug.print("arg[{d}] = \"{s}\"\n", .{ n, arg });
+    }
+    std.debug.print("{d} argument(s)\n", .{n});
+
+    // The same list as a slice, allocated once from the process arena.
+    const all = try init.minimal.args.toSlice(init.arena.allocator());
+    std.debug.print("as a slice: {d} entries, last = {s}\n", .{ all.len, all[all.len - 1] });
+}</code></pre>
+<pre class="term">$ zig run args.zig -- one "two words" 3
+program: /Users/john/.cache/zig/o/0550ef7316e5d2796521459761bbf628/args
+arg[0] = "one"
+arg[1] = "two words"
+arg[2] = "3"
+3 argument(s)
+as a slice: 4 entries, last = 3</pre>
+<p>Two habits to note. <code>it.next()</code> returns an optional, so the program name comes out with <code>.?</code> (it always exists) and the loop uses <code>while (it.next()) |arg|</code>. And the shell, not Zig, split the command line: <code>"two words"</code> arrived as one argument because of the quotes. The <code>--</code> after <code>zig run args.zig</code> separates the compiler's arguments from the program's, exactly as <code>zig build run --</code> does.</p>
+<p>The arena allocator is the right choice for <code>toSlice</code>: the argument list is needed for the whole run and freed automatically at exit.</p>
+
+<h3 id="ch32-3">32.3 Parsing flags by hand</h3>
+<p>Zig's standard library has no flag-parsing framework, and for most programs you do not want one. A loop, <code>std.mem.eql</code>, <code>std.mem.startsWith</code> and an options struct with defaults handle <code>-v</code>, <code>--days 30</code>, <code>--name=Kell</code> and positional arguments in twenty lines, and the result is a plain struct the rest of the program can use.</p>
+<p class="file">flags.zig</p>
+<pre><code>const std = @import("std");
+
+const Options = struct {
+    verbose: bool = false,
+    days: u32 = 1,
+    name: []const u8 = "campaign",
+    files: std.ArrayList([]const u8) = .empty,
+};
+
+const usage =
+    \\usage: flags [-v] [--days N] [--name NAME] FILE...
+    \\
+;
+
+fn parse(gpa: std.mem.Allocator, args: std.process.Args) !Options {
+    var opts = Options{};
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next();
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            opts.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--days")) {
+            const value = it.next() orelse return error.MissingValue;
+            opts.days = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.startsWith(u8, arg, "--name=")) {
+            opts.name = arg["--name=".len..];
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return error.HelpRequested;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            std.debug.print("unknown flag: {s}\n", .{arg});
+            return error.UnknownFlag;
+        } else {
+            try opts.files.append(gpa, arg);
+        }
+    }
+    if (opts.files.items.len == 0) return error.NoFiles;
+    return opts;
+}
+
+pub fn main(init: std.process.Init) u8 {
+    var opts = parse(init.gpa, init.minimal.args) catch |err| switch (err) {
+        error.HelpRequested =&gt; {
+            std.debug.print("{s}", .{usage});
+            return 0;
+        },
+        else =&gt; {
+            std.debug.print("error: {s}\n{s}", .{ @errorName(err), usage });
+            return 2;
+        },
+    };
+    defer opts.files.deinit(init.gpa);
+    std.debug.print("verbose={} days={d} name={s} files={d}\n", .{ opts.verbose, opts.days, opts.name, opts.files.items.len });
+    for (opts.files.items) |f| std.debug.print("  {s}\n", .{f});
+    return 0;
+}</code></pre>
+<pre class="term">$ zig run flags.zig -- -v --days 30 --name=Kell a.txt b.txt
+verbose=true days=30 name=Kell files=2
+  a.txt
+  b.txt
+$ zig run flags.zig -- --help
+usage: flags [-v] [--days N] [--name NAME] FILE...
+$ zig run flags.zig -- --bogus x
+unknown flag: --bogus
+error: UnknownFlag
+usage: flags [-v] [--days N] [--name NAME] FILE...
+$ echo $?
+2</pre>
+<p>The structure is worth copying. <code>parse</code> is a pure function from arguments to an <code>Options</code> struct or an error, so it can be tested without a terminal (Exercise 32.3 does exactly that). Values that follow a flag are pulled with another <code>it.next()</code>, and a missing one is an error, not a crash. The usage text is a multi-line string literal with <code>\\</code>, kept in one place. And <code>main</code> is the only function that talks to the user: it maps <code>error.HelpRequested</code> to a clean exit and everything else to a message plus a non-zero status.</p>
+
+<h3 id="ch32-4">32.4 Exit codes</h3>
+<p>Every process ends with a small integer, and shells, scripts and CI systems read it: zero means success, anything else means failure. Zig gives you three ways to set it.</p>
+<ul>
+<li>Declare <code>pub fn main(…) u8</code> and <code>return</code> the code. This is the clearest.</li>
+<li>Declare <code>main</code> as returning an error union and let an error escape: the runtime prints <code>error: Name</code> with a stack trace and exits with 1.</li>
+<li>Call <code>std.process.exit(code)</code> from anywhere. It never returns and runs no <code>defer</code>s, so use it only for "stop right now" situations.</li>
+</ul>
+<p class="file">exit.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) u8 {
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.next();
+    const arg = it.next() orelse {
+        std.debug.print("usage: exit &lt;code&gt;\n", .{});
+        return 64;
+    };
+    if (std.mem.eql(u8, arg, "now")) {
+        std.debug.print("leaving immediately\n", .{});
+        std.process.exit(3);
+    }
+    const code = std.fmt.parseInt(u8, arg, 10) catch {
+        std.debug.print("not a number: {s}\n", .{arg});
+        return 1;
+    };
+    std.debug.print("returning {d}\n", .{code});
+    return code;
+}</code></pre>
+<pre class="term">$ zig build-exe exit.zig
+$ ./exit; echo "status $?"
+usage: exit &lt;code&gt;
+status 64
+$ ./exit 7; echo "status $?"
+returning 7
+status 7
+$ ./exit now; echo "status $?"
+leaving immediately
+status 3
+$ ./exit zzz; echo "status $?"
+not a number: zzz
+status 1</pre>
+<p>And the error-union version, which is what most of your programs have used so far:</p>
+<p class="file">exit_err.zig</p>
+<pre><code>const std = @import("std");
+
+fn risky() !void {
+    return error.DiskFull;
+}
+
+pub fn main() !void {
+    try risky();
+}</code></pre>
+<pre class="term">$ ./exit_err; echo "status $?"
+error: DiskFull
+/…/exit_err.zig:4:5: 0x100b8594b in risky (exit_err)
+    return error.DiskFull;
+    ^
+…
+status 1</pre>
+<p>The stack trace is wonderful while developing and unpleasant for users. Programs meant for other people catch errors in <code>main</code>, print one line, and return a code. The traditional values from <code>sysexits.h</code> are a good vocabulary: 0 success, 1 general failure, 2 bad usage (many tools), 64 usage error, 65 bad input data, 70 internal error, 74 I/O error. Exercise 32.5 uses them.</p>
+<div class="warn"><strong><code>std.process.exit</code> skips cleanup.</strong> Buffered output that has not been flushed is lost, files are not closed by your <code>defer</code>s, and the leak checker does not run. Prefer <code>return code;</code> from <code>main</code>, which unwinds normally.</div>
+
+<h3 id="ch32-5">32.5 Reading standard input line by line</h3>
+<p>Standard input is a file, <code>std.Io.File.stdin()</code>, and like every file in 0.16 you read it through a reader with a buffer you provide. The reader's <code>interface</code> is a <code>*std.Io.Reader</code>, and its <code>takeDelimiter('\n')</code> method returns the next line without the newline, or <code>null</code> at end of input. A line longer than your buffer is <code>error.StreamTooLong</code>, so the buffer size is a real decision.</p>
+<p class="file">lines.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var rbuf: [4096]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(init.io, &amp;rbuf);
+    const in = &amp;stdin.interface;
+
+    var wbuf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;wbuf);
+    const out = &amp;stdout.interface;
+
+    var lines: u32 = 0;
+    var words: u32 = 0;
+    var bytes: u64 = 0;
+    while (try in.takeDelimiter('\n')) |line| {
+        lines += 1;
+        bytes += line.len + 1;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        while (it.next()) |_| words += 1;
+        try out.print("{d:&gt;4}: {s}\n", .{ lines, line });
+    }
+    try out.print("{d} lines, {d} words, {d} bytes\n", .{ lines, words, bytes });
+    try out.flush();
+}</code></pre>
+<pre class="term">$ printf 'alpha beta\ngamma\n\ndelta epsilon zeta\n' | zig run lines.zig
+   1: alpha beta
+   2: gamma
+   3:
+   4: delta epsilon zeta
+4 lines, 6 words, 37 bytes
+$ printf 'one\ntwo' | zig run lines.zig
+   1: one
+   2: two
+2 lines, 2 words, 8 bytes</pre>
+<p>Two things to check against your intuition. An empty line comes back as an empty slice, not as <code>null</code>; only the true end of input is <code>null</code>. And a final line with no trailing newline is still returned, so <code>"one\ntwo"</code> counts as two lines. The slice you get points into the reader's buffer and is only valid until the next call, so copy it if you need to keep it.</p>
+<p>Notice also that the program never blocks waiting for a terminal when its input is a pipe or a file; it simply reads until the end. Run it with no pipe and it waits for you to type, line by line, until you press Ctrl-D.</p>
+
+<h3 id="ch32-6">32.6 Reading all of standard input</h3>
+<p>When the input is small and you want it whole, <code>allocRemaining</code> reads everything into one allocated slice. The <code>Limit</code> argument is a ceiling that turns a runaway input into <code>error.StreamTooLong</code> rather than an out-of-memory condition.</p>
+<p class="file">readall.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var rbuf: [1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(init.io, &amp;rbuf);
+    const text = try stdin.interface.allocRemaining(init.gpa, .limited(1 &lt;&lt; 20));
+    defer init.gpa.free(text);
+    var upper: u32 = 0;
+    for (text) |c| if (std.ascii.isUpper(c)) {
+        upper += 1;
+    };
+    std.debug.print("read {d} bytes, {d} upper-case letters\n", .{ text.len, upper });
+}</code></pre>
+<pre class="term">$ printf 'Hello World\nBig Mek\n' | zig run readall.zig
+read 20 bytes, 4 upper-case letters</pre>
+<p><code>.limited(1 &lt;&lt; 20)</code> is one megabyte; <code>.unlimited</code> exists but think twice before using it on input you do not control. The result belongs to you: <code>defer init.gpa.free(text)</code>.</p>
+
+<h3 id="ch32-7">32.7 stdout for results, stderr for everything else</h3>
+<p>A terminal program has two output streams, and the distinction matters as soon as someone pipes your output into another program. Standard output is for the result; standard error is for diagnostics, progress, warnings. Both are files with buffered writers, and both must be flushed. <code>std.debug.print</code> writes to standard error, unbuffered, which is why it has been fine for teaching and is wrong for the main output of a real tool.</p>
+<p class="file">streams.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var obuf: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;obuf);
+    const out = &amp;stdout.interface;
+    var ebuf: [256]u8 = undefined;
+    var stderr = std.Io.File.stderr().writer(init.io, &amp;ebuf);
+    const err = &amp;stderr.interface;
+
+    try out.print("day,funds\n", .{});
+    var funds: i64 = 1000;
+    for (1..4) |day| {
+        funds -= 150;
+        try out.print("{d},{d}\n", .{ day, funds });
+        if (funds &lt; 700) try err.print("warning: day {d} funds low ({d})\n", .{ day, funds });
+    }
+    try out.flush();
+    try err.flush();
+}</code></pre>
+<pre class="term">$ zig run streams.zig 2&gt;/dev/null
+day,funds
+1,850
+2,700
+3,550
+$ zig run streams.zig &gt;/dev/null
+warning: day 3 funds low (550)</pre>
+<p>The CSV goes to stdout and survives <code>2&gt;/dev/null</code>; the warning goes to stderr and survives <code>&gt;/dev/null</code>. Someone can now write <code>streams &gt; report.csv</code> and still see the warning on their screen.</p>
+<div class="note"><strong>Flush before you block.</strong> Output sits in your buffer until <code>flush()</code>. If you print a prompt and then wait for input, flush the prompt first or the user will stare at a blank line. The REPL in section 32.9 does this on every turn.</div>
+
+<h3 id="ch32-8">32.8 Environment variables</h3>
+<p><code>init.environ_map</code> is a pointer to a map from names to values, built from the process environment. <code>get</code> returns an optional slice; <code>contains</code> and <code>count</code> do what they say.</p>
+<p class="file">env.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const env = init.environ_map;
+    const home = env.get("HOME") orelse "(unset)";
+    std.debug.print("HOME = {s}\n", .{home});
+    const seed_text = env.get("LEDGER_SEED") orelse "3025";
+    const seed = try std.fmt.parseInt(u64, seed_text, 10);
+    std.debug.print("seed = {d}\n", .{seed});
+    std.debug.print("has PATH? {}\n", .{env.contains("PATH")});
+    std.debug.print("{d} variables in the environment\n", .{env.count()});
+}</code></pre>
+<pre class="term">$ LEDGER_SEED=99 zig run env.zig
+HOME = /Users/john
+seed = 99
+has PATH? true
+59 variables in the environment</pre>
+<p>The value is a plain <code>[]const u8</code> owned by the map, so it is valid for the life of the program and you do not free it. Parse it as you would any string. The <code>orelse "3025"</code> idiom gives a default without a branch, and is the usual way to let an environment variable override a built-in setting.</p>
+
+<h3 id="ch32-9">32.9 A read-eval-print loop</h3>
+<p>Everything so far combines into a small interactive shell: print a prompt, flush, read a line, split off the command word, act, repeat, until <code>quit</code> or end of input. This is a miniature of the game's <code>--repl</code> mode, which drives the whole simulation from typed commands.</p>
+<p class="file">repl.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var rbuf: [1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(init.io, &amp;rbuf);
+    const in = &amp;stdin.interface;
+    var wbuf: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;wbuf);
+    const out = &amp;stdout.interface;
+
+    var funds: i64 = 1000;
+    var day: u32 = 1;
+    try out.print("ledger repl. commands: day, pay N, earn N, status, quit\n", .{});
+    while (true) {
+        try out.print("day {d}&gt; ", .{day});
+        try out.flush();
+        const raw = try in.takeDelimiter('\n') orelse break;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        const cmd = it.next().?;
+        if (std.mem.eql(u8, cmd, "quit")) break;
+        if (std.mem.eql(u8, cmd, "day")) {
+            day += 1;
+            funds -= 50;
+        } else if (std.mem.eql(u8, cmd, "pay") or std.mem.eql(u8, cmd, "earn")) {
+            const n = std.fmt.parseInt(i64, it.next() orelse "", 10) catch {
+                try out.print("  usage: {s} N\n", .{cmd});
+                continue;
+            };
+            funds += if (cmd[0] == 'p') -n else n;
+        } else if (std.mem.eql(u8, cmd, "status")) {
+            try out.print("  day {d}, {d} C-bills\n", .{ day, funds });
+        } else {
+            try out.print("  unknown command: {s}\n", .{cmd});
+        }
+    }
+    try out.print("\nbye. final balance {d}\n", .{funds});
+    try out.flush();
+}</code></pre>
+<pre class="term">$ printf 'status\nearn 500\nday\nday\npay abc\nfly\nstatus\nquit\n' | zig run repl.zig
+ledger repl. commands: day, pay N, earn N, status, quit
+day 1&gt;   day 1, 1000 C-bills
+day 1&gt; day 1&gt; day 2&gt; day 3&gt;   usage: pay N
+day 3&gt;   unknown command: fly
+day 3&gt;   day 3, 1400 C-bills
+day 3&gt;
+bye. final balance 1400</pre>
+<p>Piping input in shows the prompts jammed together, because the input is not echoed; type the same commands by hand and it reads naturally. The shape to remember: <code>trim</code> the raw line, skip empty lines, <code>tokenizeScalar</code> to get the command and its arguments, <code>parseInt</code> with a <code>catch</code> that prints usage and <code>continue</code>s, and <code>orelse break</code> on the read so end of input ends the loop cleanly.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The executable's entry point, <code>game/src/main.zig</code>, is the flag loop from section 32.3 in the real world:
+<pre><code>pub fn main(init: std.process.Init) !void {
+    var gs = game.state.GameState.init(init.gpa, .{ .seed = 3025 });
+    defer gs.deinit();
+
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.next(); // exe name
+    var tui = false;
+    var store_path: [:0]const u8 = "campaigns.db";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--tui")) tui = true;
+        if (std.mem.eql(u8, arg, "--store")) store_path = args.next() orelse store_path;
+    }
+    if (tui) {
+        try @import("tui/app.zig").run(init.io, init.gpa, store_path, .{ /* … */ });
+    }
+    // …
+}</code></pre>
+<code>--store</code> takes a value with the same <code>args.next() orelse</code> pattern, and <code>init.io</code> is passed down explicitly to the one part of the program that does I/O. The simulation core never receives an <code>io</code>, so it structurally cannot print, read a file or check the clock; the guide calls this "purity as a parameter that is not there". The <code>--repl</code> mode in <code>game/src/sim/cli.zig</code> is the loop from section 32.9 with the game's command set behind it.</div>
+
+<h3 id="ch32-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 32.1 · echo <span class="level">warm-up</span></h4>
+  <p>Print the arguments separated by spaces to stdout, with <code>-n</code> suppressing the newline and <code>-u</code> upper-casing. File: <code>exercises/32-cli/ex1_echo.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 32, exercise 1: echo with options.
+//! Run with:  zig run ex1_echo.zig -- -n hello world
+//! Expected output (for the command above, on stdout):
+//!   hello world
+//! With no arguments it prints an empty line. `-n` suppresses the newline,
+//! `-u` upper-cases every word.
+const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var buf: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;stdout.interface;
+
+    var newline = true;
+    var upper = false;
+    var first = true;
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.next();
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-n")) {
+            newline = false;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-u")) {
+            upper = true;
+            continue;
+        }
+        if (!first) try out.writeByte(' ');
+        first = false;
+        if (upper) {
+            for (arg) |c| try out.writeByte(std.ascii.toUpper(c));
+        } else {
+            try out.writeAll(arg);
+        }
+    }
+    if (newline) try out.writeByte('\n');
+    try out.flush();
+}</code></pre>
+  <p>Flags are consumed with <code>continue</code> so they never reach the printing code. <code>writeByte</code> and <code>writeAll</code> on the buffered writer avoid formatting when there is nothing to format.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 32.2 · wc <span class="level">warm-up</span></h4>
+  <p>Read all of stdin line by line and print <code>N lines, N words, N bytes</code>. File: <code>exercises/32-cli/ex2_wc.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 32, exercise 2: a tiny `wc`.
+//! Run with:  printf 'a b\nc\n' | zig run ex2_wc.zig
+//! Expected output (for the command above):
+//!   2 lines, 3 words, 6 bytes
+//! Reads all of stdin line by line; prints one summary line to stdout.
+const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var rbuf: [4096]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(init.io, &amp;rbuf);
+    const in = &amp;stdin.interface;
+    var wbuf: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;wbuf);
+    const out = &amp;stdout.interface;
+
+    var lines: u64 = 0;
+    var words: u64 = 0;
+    var bytes: u64 = 0;
+    while (try in.takeDelimiter('\n')) |line| {
+        lines += 1;
+        bytes += line.len + 1;
+        var it = std.mem.tokenizeAny(u8, line, " \t\r");
+        while (it.next()) |_| words += 1;
+    }
+    try out.print("{d} lines, {d} words, {d} bytes\n", .{ lines, words, bytes });
+    try out.flush();
+}</code></pre>
+  <p>With no input at all the loop body never runs and the program prints zeros, which is what <code>wc</code> does.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 32.3 · A testable flag parser <span class="level">practice</span></h4>
+  <p>Write <code>parse(gpa, args: []const []const u8) !Options</code> supporting <code>-v</code>, <code>--days N</code>, <code>--name NAME</code>, <code>--name=NAME</code>, <code>-h</code>, and a bare <code>--</code> after which everything is positional. Positionals are returned as an owned slice. File: <code>exercises/32-cli/ex3_flags.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 32, exercise 3: a flag parser you can test.
+//! Run with:  zig test ex3_flags.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import("std");
+
+pub const Options = struct {
+    verbose: bool = false,
+    days: u32 = 1,
+    name: []const u8 = "campaign",
+    /// Positional arguments, in order.
+    files: []const []const u8 = &amp;.{},
+};
+
+pub const ParseError = error{ MissingValue, BadNumber, UnknownFlag, HelpRequested };
+
+/// Parse `args` (WITHOUT the program name). Positionals are copied into a
+/// slice allocated from `gpa`; the caller frees `options.files`.
+/// Supported: -v / --verbose, --days N, --name NAME, --name=NAME, -h / --help.
+/// Everything after a bare "--" is positional even if it starts with "-".
+pub fn parse(gpa: std.mem.Allocator, args: []const []const u8) (ParseError || std.mem.Allocator.Error)!Options {
+    var opts = Options{};
+    var files: std.ArrayList([]const u8) = .empty;
+    errdefer files.deinit(gpa);
+    var i: usize = 0;
+    var only_positional = false;
+    while (i &lt; args.len) : (i += 1) {
+        const arg = args[i];
+        if (only_positional or !std.mem.startsWith(u8, arg, "-")) {
+            try files.append(gpa, arg);
+        } else if (std.mem.eql(u8, arg, "--")) {
+            only_positional = true;
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            opts.verbose = true;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            return error.HelpRequested;
+        } else if (std.mem.eql(u8, arg, "--days")) {
+            i += 1;
+            if (i &gt;= args.len) return error.MissingValue;
+            opts.days = std.fmt.parseInt(u32, args[i], 10) catch return error.BadNumber;
+        } else if (std.mem.eql(u8, arg, "--name")) {
+            i += 1;
+            if (i &gt;= args.len) return error.MissingValue;
+            opts.name = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--name=")) {
+            opts.name = arg["--name=".len..];
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    opts.files = try files.toOwnedSlice(gpa);
+    return opts;
+}
+
+test "flags and positionals" {
+    const gpa = std.testing.allocator;
+    const o = try parse(gpa, &amp;.{ "-v", "--days", "30", "--name=Kell", "a.txt", "b.txt" });
+    defer gpa.free(o.files);
+    try std.testing.expect(o.verbose);
+    try std.testing.expectEqual(@as(u32, 30), o.days);
+    try std.testing.expectEqualStrings("Kell", o.name);
+    try std.testing.expectEqual(@as(usize, 2), o.files.len);
+    try std.testing.expectEqualStrings("b.txt", o.files[1]);
+}
+
+test "defaults" {
+    const gpa = std.testing.allocator;
+    const o = try parse(gpa, &amp;.{});
+    defer gpa.free(o.files);
+    try std.testing.expect(!o.verbose);
+    try std.testing.expectEqual(@as(u32, 1), o.days);
+    try std.testing.expectEqualStrings("campaign", o.name);
+    try std.testing.expectEqual(@as(usize, 0), o.files.len);
+}
+
+test "separate --name value and the -- separator" {
+    const gpa = std.testing.allocator;
+    const o = try parse(gpa, &amp;.{ "--name", "Ana", "--", "-not-a-flag" });
+    defer gpa.free(o.files);
+    try std.testing.expectEqualStrings("Ana", o.name);
+    try std.testing.expectEqualStrings("-not-a-flag", o.files[0]);
+}
+
+test "errors" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.MissingValue, parse(gpa, &amp;.{"--days"}));
+    try std.testing.expectError(error.BadNumber, parse(gpa, &amp;.{ "--days", "soon" }));
+    try std.testing.expectError(error.UnknownFlag, parse(gpa, &amp;.{"--bogus"}));
+    try std.testing.expectError(error.HelpRequested, parse(gpa, &amp;.{ "a", "-h" }));
+}</code></pre>
+  <p>Taking a slice of strings rather than <code>std.process.Args</code> is what makes the parser testable with <code>&amp;.{ "-v", "a" }</code> literals. The <code>errdefer</code> frees the growing list if a later argument is bad.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 32.4 · A calculator REPL <span class="level">practice</span></h4>
+  <p>Prompt with <code>&gt; </code>, read <code>A op B</code> lines, print the result or <code>error: Name</code>, stop on <code>quit</code> or end of input. Keep <code>eval</code> pure and test it. File: <code>exercises/32-cli/ex4_repl.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 32, exercise 4: a calculator REPL.
+//! Run with:  zig run ex4_repl.zig
+//! Then type lines such as  2 + 3  or  10 * 4 , and  quit  to leave.
+//! Expected output for  printf '2 + 3\n10 / 4\n7 % 0\nquit\n' | zig run ex4_repl.zig
+//!   &gt; 5
+//!   &gt; 2
+//!   &gt; error: DivisionByZero
+//!   &gt; bye
+//! Prompt goes to stdout and is flushed before each read. EOF ends the loop
+//! exactly like "quit".
+const std = @import("std");
+
+const Error = error{ BadSyntax, BadNumber, DivisionByZero, UnknownOperator };
+
+fn eval(line: []const u8) Error!i64 {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const a_text = it.next() orelse return error.BadSyntax;
+    const op = it.next() orelse return error.BadSyntax;
+    const b_text = it.next() orelse return error.BadSyntax;
+    if (it.next() != null) return error.BadSyntax;
+    const a = std.fmt.parseInt(i64, a_text, 10) catch return error.BadNumber;
+    const b = std.fmt.parseInt(i64, b_text, 10) catch return error.BadNumber;
+    if (op.len != 1) return error.UnknownOperator;
+    return switch (op[0]) {
+        '+' =&gt; a + b,
+        '-' =&gt; a - b,
+        '*' =&gt; a * b,
+        '/' =&gt; if (b == 0) error.DivisionByZero else @divTrunc(a, b),
+        '%' =&gt; if (b == 0) error.DivisionByZero else @rem(a, b),
+        else =&gt; error.UnknownOperator,
+    };
+}
+
+pub fn main(init: std.process.Init) !void {
+    var rbuf: [1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(init.io, &amp;rbuf);
+    const in = &amp;stdin.interface;
+    var wbuf: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;wbuf);
+    const out = &amp;stdout.interface;
+
+    while (true) {
+        try out.writeAll("&gt; ");
+        try out.flush();
+        const raw = try in.takeDelimiter('\n') orelse break;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "quit")) break;
+        if (eval(line)) |v| {
+            try out.print("{d}\n", .{v});
+        } else |err| {
+            try out.print("error: {s}\n", .{@errorName(err)});
+        }
+    }
+    try out.writeAll("bye\n");
+    try out.flush();
+}
+
+test "eval" {
+    try std.testing.expectEqual(@as(i64, 5), try eval("2 + 3"));
+    try std.testing.expectEqual(@as(i64, -8), try eval("2 * -4"));
+    try std.testing.expectError(error.DivisionByZero, eval("1 / 0"));
+    try std.testing.expectError(error.BadSyntax, eval("1 +"));
+    try std.testing.expectError(error.UnknownOperator, eval("1 ^ 2"));
+}</code></pre>
+  <p>The file both runs and tests: <code>zig run</code> uses <code>main</code>, <code>zig test</code> runs the <code>eval</code> test and ignores <code>main</code>. Division uses <code>@divTrunc</code> because <code>/</code> on signed integers is a compile error unless the sign is known.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 32.5 · Exit codes <span class="level">challenge</span></h4>
+  <p>Sum the arguments and print the total (no arguments prints <code>0</code>). <code>--help</code>: usage on stderr, status 0. Any other <code>--flag</code>: usage, status 64. A non-number: message, status 65. The word <code>abort</code>: <code>std.process.exit(70)</code> immediately. Output failures: 74. File: <code>exercises/32-cli/ex5_exitcodes.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+<pre><code>//! Chapter 32, exercise 5: exit codes that scripts can trust.
+//! Run with:  zig run ex5_exitcodes.zig -- 12 30
+//! Expected output (stdout): "42" and exit status 0. With no arguments: "0".
+//! Rules: --help          -&gt; usage on stderr, status 0;
+//!        any other --flag -&gt; usage on stderr, status 64 (EX_USAGE);
+//!        a non-number     -&gt; message on stderr, status 65 (EX_DATAERR);
+//!        the word "abort" anywhere -&gt; std.process.exit(70) immediately.
+const std = @import("std");
+
+pub fn main(init: std.process.Init) u8 {
+    var obuf: [128]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &amp;obuf);
+    const out = &amp;stdout.interface;
+
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.next();
+    var sum: i64 = 0;
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help")) {
+            std.debug.print("usage: exitcodes [--help] N [N...]\n", .{});
+            return 0;
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("unknown flag {s}\nusage: exitcodes [--help] N [N...]\n", .{arg});
+            return 64;
+        }
+        if (std.mem.eql(u8, arg, "abort")) {
+            std.debug.print("aborting on request\n", .{});
+            std.process.exit(70);
+        }
+        const n = std.fmt.parseInt(i64, arg, 10) catch {
+            std.debug.print("not a number: {s}\n", .{arg});
+            return 65;
+        };
+        sum += n;
+    }
+    out.print("{d}\n", .{sum}) catch return 74;
+    out.flush() catch return 74;
+    return 0;
+}</code></pre>
+<pre class="term">$ ./ex5_exitcodes 12 30; echo "status $?"
+42
+status 0
+$ ./ex5_exitcodes --bogus; echo "status $?"
+unknown flag --bogus
+usage: exitcodes [--help] N [N...]
+status 64
+$ ./ex5_exitcodes 1 x; echo "status $?"
+not a number: x
+status 65
+$ ./ex5_exitcodes 1 abort; echo "status $?"
+aborting on request
+status 70</pre>
+  <p>Because <code>main</code> returns <code>u8</code> it cannot use <code>try</code>; every failing call gets an explicit <code>catch return code</code>. That is the price of precise exit codes, and it is a small one.</p></details>
+</div>
+
+<h3 id="ch32-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>How do you get the command-line arguments in 0.16? <details class="answer"><summary>Answer</summary>From <code>init.minimal.args</code>, iterated with <code>std.process.Args.Iterator.init(…)</code> or converted with <code>toSlice(allocator)</code>. The first entry is the program name.</details></li>
+  <li>What are the three ways to set the exit status, and which one skips <code>defer</code>? <details class="answer"><summary>Answer</summary>Return a <code>u8</code> from <code>main</code>, let an error escape from <code>main</code> (status 1 with a trace), or call <code>std.process.exit(code)</code>, which never returns and runs no <code>defer</code>s.</details></li>
+  <li>What does <code>takeDelimiter('\n')</code> return for an empty line, and at the end of input? <details class="answer"><summary>Answer</summary>An empty slice for an empty line; <code>null</code> at end of input. A last line without a newline is still returned.</details></li>
+  <li>Why should a program's result go to stdout and its warnings to stderr? <details class="answer"><summary>Answer</summary>So the result can be piped or redirected into a file without the warnings, and the warnings still reach the terminal.</details></li>
+  <li>What happens if you print a prompt and read a line without flushing? <details class="answer"><summary>Answer</summary>The prompt stays in the buffer; the user sees nothing and the program appears to hang while waiting for input.</details></li>
+  <li>How do you read an environment variable with a default? <details class="answer"><summary>Answer</summary><code>init.environ_map.get("NAME") orelse "default"</code>. The returned slice is owned by the map and is not freed by you.</details></li>
+  <li>Why is <code>parse</code> in the flag examples written to take a slice of strings instead of reading <code>init</code> directly? <details class="answer"><summary>Answer</summary>So it can be called from tests with literal argument lists, and so the only code that touches the process is <code>main</code>.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li><code>std.process.Init</code> carries <code>io</code>, <code>gpa</code>, <code>arena</code>, <code>minimal.args</code>, <code>environ_map</code>; nothing is global.</li>
+<li>Iterate arguments with <code>std.process.Args.Iterator</code>; parse flags with a loop, <code>std.mem.eql</code>/<code>startsWith</code>, and an options struct.</li>
+<li>Return <code>u8</code> from <code>main</code> for exit codes; escaping errors give status 1; <code>std.process.exit</code> is immediate and skips cleanup.</li>
+<li>Read stdin with <code>std.Io.File.stdin().reader(io, &amp;buf)</code> and <code>takeDelimiter('\n')</code>, or all at once with <code>allocRemaining</code> and a limit.</li>
+<li>Write results to a buffered stdout writer and diagnostics to stderr; flush both, and flush prompts before reading.</li>
+<li>Environment variables come from <code>init.environ_map.get</code>.</li>
+<li>A REPL is prompt, flush, read, trim, tokenize, dispatch, repeat; end of input ends it.</li>
+</ul></div>
+</section>

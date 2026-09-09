@@ -1,0 +1,277 @@
+<section id="ch44">
+<h2>44. Queries: the only way out</h2>
+<p class="goals"><strong>In this chapter</strong> you read the other door. Frontends never walk <code>GameState</code> to draw a screen; they call a query, which returns rows of formatted text plus the IDs a key handler will need, allocated from an arena the caller throws away after drawing. You will read one query end to end, learn the colour markup that lets one query serve two frontends, meet a bug that taught the project a rule, and extend a query yourself.</p>
+
+<div class="note"><strong>What you need from earlier chapters.</strong> <a href="#ch23">Chapter 23</a> (format specifiers, especially width and alignment such as <code>{s: &lt;20}</code> and <code>{d: &gt;3}</code>, and <code>allocPrint</code>), <a href="#ch21">Chapter 21</a> (<code>ArrayListUnmanaged</code> and <code>toOwnedSlice</code>), <a href="#ch20">Chapter 20</a> (a per-call arena), <a href="#ch10">Chapter 10</a> and <a href="#ch11">Chapter 11</a> (slicing and searching strings), <a href="#ch13">Chapter 13</a> (an enum with a method, used as a filter) and <a href="#ch27">Chapter 27</a> (<code>inline for</code> over an enum's fields, in <code>personRecord</code>).</div>
+
+<h3 id="ch44-1">44.1 The contract</h3>
+<p>Every function in <code>src/sim/queries.zig</code> has the same first two parameters:</p>
+<pre><code>pub fn people(alloc: Alloc, gs: *GameState, filter: HallFilter) !People
+pub fn hqDetail(alloc: Alloc, gs: *GameState, id: types.HqId) ![]const []const u8
+pub fn manning(alloc: Alloc, gs: *GameState, company: types.ForceId) ![]ManningRow
+pub fn personRecord(alloc: Alloc, gs: *GameState, id: types.PersonId) ![]const []const u8</code></pre>
+<p>An allocator and the state, then whatever selects the view. The allocator is never the state's arena. In the terminal client it is a <em>frame arena</em> that is reset before every draw; in a test it is a small arena created for the call; in the REPL it is a temporary arena around one print. The query allocates freely into it (hundreds of small strings for a busy screen) and frees nothing, and the caller drops the whole arena when the screen has been drawn. This is the third lifetime from <a href="#ch20">Chapter 20</a>: not the process, not the campaign, but one frame.</p>
+<p>The return value is plain data with no methods and no pointers back into the state: strings already formatted, and typed IDs next to them. The file is 4,000 lines because there are many screens, not because any query is complicated.</p>
+
+<h3 id="ch44-2">44.2 One query, end to end</h3>
+<p>The People screen's query is a good first read because it is one loop:</p>
+<div class="file">src/sim/queries.zig</div>
+<pre><code>pub const PersonRow = struct {
+    id: types.PersonId,
+    text: []const u8,
+    // …
+};
+
+pub const People = struct {
+    header: []const u8,
+    rows: []PersonRow,
+    total: usize,
+    // …
+};
+
+/// Everyone on the payroll (active, wounded, missing), filtered by role group.
+pub fn people(alloc: Alloc, gs: *GameState, filter: HallFilter) !People {
+    var rows: std.ArrayListUnmanaged(PersonRow) = .empty;
+    var total: usize = 0;
+    var it = gs.people.iterator();
+    while (it.next()) |e| {
+        const p = e.value_ptr;
+        if (p.status == .kia or p.status == .retired or p.status == .resigned or p.status == .released) continue;
+        total += 1;
+        if (!filter.matches(p.role)) continue;
+        if (filter == .wounded and p.status != .wounded) continue;
+        if (filter == .unassigned and !isUnassigned(gs, p)) continue;
+        const name = try p.rankedName(alloc);
+        try rows.append(alloc, .{ .id = p.id, .text = try std.fmt.allocPrint(alloc, "{d: &lt;4} {s: &lt;20} {s: &lt;15} {s: &lt;7} {s: &lt;5} {d: &gt;3} {s} {s} {s: &lt;11} {d: &gt;3} {d: &gt;3} {s: &gt;7}", .{
+            @intFromEnum(p.id),                                                             clip(name, 20),
+            @tagName(p.role),                                                               @tagName(p.experience()),
+            try skillsText(alloc, p),                                                       p.xp,
+            try padMk(alloc, "", try stripMarkup(alloc, try statusText(alloc, gs, p)), 18), try padMk(alloc, "", try stripMarkup(alloc, try assignmentText(alloc, gs, p)), 22),
+            clip(locationText(gs, p), 11),                                                  p.fatigue,
+            p.morale,                                                                       try money(alloc, p.monthlySalary()),
+        }) });
+    }
+    return .{
+        .header = "id   name                 role            exp     skill  XP status             assignment             where       fat mor     pay",
+        .rows = try rows.toOwnedSlice(alloc),
+        .total = total,
+    };
+}</code></pre>
+<p>Walk it. The map iterator visits people in insertion order (<a href="#ch41">Chapter 41</a>), so the roster is stable from frame to frame. The departed are skipped before <code>total</code> is counted, so the header can say "12 of 30" when a filter is on. Then a row is one <code>allocPrint</code> with a long format string: <code>{d: &lt;4}</code> left-aligns the ID in four columns, <code>{s: &lt;20}</code> left-aligns the name in twenty, <code>{d: &gt;3}</code> right-aligns fatigue in three, <code>{s: &gt;7}</code> right-aligns the money. Everything the format string cannot do (clip a long name, strip colour codes before padding, format money with separators) is a small helper at the top of the file: <code>clip</code>, <code>stripMarkup</code>, <code>padMk</code>, <code>money</code>.</p>
+<p>The row carries <code>p.id</code> beside its text. That is the second half of the contract: when the cursor is on row seven and the user presses <code>D</code> to fire, the key handler reads <code>rows[7].id</code> and builds <code>.{ .fire = id }</code>. It never has to work out which person row seven was, because the query told it.</p>
+<p>The filter is an enum with a method, the pattern from <a href="#ch13">Chapter 13</a>:</p>
+<pre><code>pub const HallFilter = enum {
+    all,
+    combat, // mekwarriors, vehicle crews, aero pilots
+    techs, // tech_mek / tech_mechanic / tech_aero / tech_ba / astech
+    medical, // doctors, medics
+    admin_command,
+    admin_logistics,
+    admin_transport,
+    admin_hr,
+    admin_finance,
+    other, // infantry, battle armor, everything else
+    unassigned, // personnel screen only: no seat, no HQ posting, no company
+    wounded, // personnel screen only: anyone hurt, in the medbay or waiting
+
+    pub fn matches(self: HallFilter, role: person_mod.Role) bool {
+        return switch (self) {
+            .all, .unassigned, .wounded =&gt; true,
+            .combat =&gt; role == .mekwarrior or role == .vehicle_crew or role == .aero_pilot,
+            .techs =&gt; role == .tech_mek or role == .tech_mechanic or role == .tech_aero or role == .tech_ba or role == .astech,
+            .medical =&gt; role == .doctor or role == .medic,
+            // …
+        };
+    }
+};</code></pre>
+<p>The same enum serves the hiring hall and the people screen, and the client cycles it with a key. Because it is an exhaustive enum with a switch, adding a group is a two-line change and the compiler lists the switch.</p>
+
+<h3 id="ch44-3">44.3 Markup: one query, two frontends</h3>
+<p>Look at <code>statusText</code>'s output being passed through <code>stripMarkup</code> above. Query text carries lightweight colour markup: <code>{g}active{/}</code> means "green until the reset", <code>{c}</code> is critical red, <code>{a}</code> amber, <code>{d}</code> dim, <code>{p}</code> purple, <code>{s}</code> selected. The terminal client's screen renders the codes into styles (<a href="#ch48">Chapter 48</a>); the REPL strips them; and inside a fixed-width column they must be removed <em>before</em> padding, or the invisible codes would count as characters and the columns would drift. That is what <code>stripMarkup</code> is for:</p>
+<pre><code>/// Remove `{x}` markup tokens (for fixed-width columns).
+pub fn stripMarkup(alloc: Alloc, s: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i &lt; s.len) : (i += 1) {
+        if (s[i] == '{' and i + 2 &lt; s.len and s[i + 2] == '}' and std.mem.indexOfScalar(u8, "agcsdtp/", s[i + 1]) != null) {
+            i += 2;
+            continue;
+        }
+        try out.append(alloc, s[i]);
+    }
+    return out.toOwnedSlice(alloc);
+}</code></pre>
+<p>A hand-written scanner over a byte slice, the <a href="#ch11">Chapter 11</a> kind. There is a trap here that <a href="#ch23">Chapter 23</a> warned you about: a literal brace inside a <em>format string</em> must be doubled. So in a plain string literal the markup is <code>"{g}active{/}"</code>, but inside an <code>allocPrint</code> format it is <code>"{{g}}{s}{{/}}"</code>. You can see both forms in <code>personRecord</code> below. Get it wrong and the compiler complains about an invalid format specifier, which is a kinder failure than most template languages give you.</p>
+
+<h3 id="ch44-4">44.4 A longer query: the person record</h3>
+<p>The <code>r</code> key on the People screen opens a record, built by <code>personRecord</code>. It is eighty lines of <code>out.append(alloc, try std.fmt.allocPrint(alloc, …))</code>; here are the parts that teach something:</p>
+<pre><code>pub fn personRecord(alloc: Alloc, gs: *GameState, id: types.PersonId) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    const p = gs.person(id) orelse return out.toOwnedSlice(alloc);
+    const day = gs.clock.day_index;
+    try out.append(alloc, try std.fmt.allocPrint(alloc, "{{a}}{s} {s} {s}{{/}}{s}  ·  {s} · {s} · {s}{s}", .{
+        p.rank.abbrev(), p.first_name, p.last_name,
+        if (p.callsign) |c| try std.fmt.allocPrint(alloc, " \"{s}\"", .{c}) else "",
+        @tagName(p.role), @tagName(p.experience()), p.rank.name(),
+        if (p.rank_pinned) " (pinned — :promote &lt;id&gt; &lt;rank&gt; unpin lets seats decide)" else "",
+    }));
+    // … status, assignment, unit …
+    try out.append(alloc, "");
+    try out.append(alloc, "skill               level   next   XP cost");
+    inline for (@typeInfo(types.SkillType).@"enum".fields) |f| {
+        const st: types.SkillType = @enumFromInt(f.value);
+        if (p.skill(st)) |lvl| {
+            const primary = st == p.role.primarySkill();
+            if (lvl == 0) {
+                try out.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s: &lt;19} {d: &gt;5}   mastered{{/}}", .{ if (primary) "{a}" else "", f.name, lvl }));
+            } else {
+                const cost = person_mod.improveCost(lvl - 1);
+                try out.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s: &lt;19} {d: &gt;5} {d: &gt;6} {d: &gt;8}{s}{{/}}", .{ if (primary) "{a}" else "", f.name, lvl, lvl - 1, cost, if (p.xp &gt;= cost) "  {g}affordable{/}" else "" }));
+            }
+        }
+    }
+    // … training, abilities, age, loyalty, shares, record, awards, injuries …
+    try out.append(alloc, try std.fmt.allocPrint(alloc, "available   {s}", .{if (p.isAvailable(day)) "{g}yes{/}" else "{c}no{/}"}));
+    return out.toOwnedSlice(alloc);
+}</code></pre>
+<p>Three things. First, an unknown ID returns an empty list rather than an error; a screen with nothing to show is not a failure. Second, the skills table is an <code>inline for</code> over the <code>SkillType</code> enum's fields (<a href="#ch27">Chapter 27</a>): the loop is unrolled at compile time, one iteration per skill, and <code>f.name</code> is the skill's name as a compile-time string, so adding a skill to the enum adds a row here with no edit. Third, the <code>if … else ""</code> idiom inside argument tuples: an optional piece of text is an empty string when absent, which keeps every line a single <code>allocPrint</code>.</p>
+
+<h3 id="ch44-5">44.5 The bug that made a rule</h3>
+<p>The original guide records a bug worth retelling because its fix is a query. The HQ screen once mapped the cursor row to a facility by position, assuming the facility table started on row one. When the tier section above it grew (a field HQ explains how to become regional; a regional one does not), every row shifted and the <code>u</code> key upgraded the wrong facility. The fix:</p>
+<pre><code>/// Which facility a row of `hqDetail` names, or null. The tier section
+/// above the facility table varies in length (field HQs explain how to
+/// become regional), so the HQ screen's `u` reads the cursor through this
+/// rather than by position.
+pub fn hqFacilityAtRow(alloc: Alloc, gs: *GameState, id: types.HqId, row: usize) !?@import("../domain/hq.zig").FacilityKind {
+    const lines = try hqDetail(alloc, gs, id);
+    if (row &gt;= lines.len) return null;
+    // The table runs from the "facility" header to the next blank line.
+    var header: ?usize = null;
+    for (lines, 0..) |l, i| if (std.mem.startsWith(u8, l, "facility ")) {
+        header = i;
+        break;
+    };
+    const start = (header orelse return null) + 1;
+    if (row &lt; start) return null;
+    for (lines[start..row + 1]) |l| if (l.len == 0) return null;
+    var it = std.mem.tokenizeScalar(u8, lines[row], ' ');
+    const tag = it.next() orelse return null;
+    return std.meta.stringToEnum(@import("../domain/hq.zig").FacilityKind, tag);
+}</code></pre>
+<p>It reads the rendered rows back, finds the header, checks the row is inside the table, and parses the first word back into the enum with <code>std.meta.stringToEnum</code>. The return type <code>!?FacilityKind</code> is "may fail to allocate; may be no facility". A test builds an HQ, renders it, and checks that every row maps to the facility it names and the header maps to <code>null</code>. The rule of thumb the project took from it: if a key handler needs to know what a row means, ask a query, never count.</p>
+
+<h3 id="ch44-6">44.6 Queries that return structure</h3>
+<p>Not every query returns lines. When the client needs to act on numbers, the query returns a struct per row and lets the client format the numbers it needs:</p>
+<pre><code>pub const ManningRow = struct {
+    role: person_mod.Role,
+    have: u32,
+    need: u32,
+    text: []const u8,
+};
+
+pub fn manning(alloc: Alloc, gs: *GameState, company: types.ForceId) ![]ManningRow {
+    const personnel = @import("personnel.zig");
+    const needs = personnel.manningNeeds(gs, company);
+    var out: std.ArrayListUnmanaged(ManningRow) = .empty;
+    // … tech-hours needed against tech-hours available …
+    for (needs) |n| {
+        const have = personnel.manningHave(gs, company, n.role);
+        const open = n.need -| have;
+        const why = /* … */;
+        try out.append(alloc, .{ .role = n.role, .have = have, .need = n.need, .text = try std.fmt.allocPrint(alloc,
+            "{s: &lt;16} {d: &gt;5} {d: &gt;5} {s}{d: &gt;5}{{/}}   {{d}}{s}{{/}}",
+            .{ @tagName(n.role), have, n.need, if (open &gt; 0) "{c}" else "{g}", open, why }) });
+    }
+    return out.toOwnedSlice(alloc);
+}</code></pre>
+<p><code>n.need -| have</code> is saturating subtraction (<a href="#ch04">Chapter 4</a>): zero when the company has more than it needs, never negative. The row carries <code>have</code> and <code>need</code> as numbers as well as in the text, so the raise-a-company wizard can total them without parsing its own output. You will see this query again in <a href="#ch50">Chapter 50</a>, because it is what redraws after the <code>c</code> key crews a company.</p>
+
+<h3 id="ch44-reading">Guided reading</h3>
+<ol>
+<li><code>src/sim/queries.zig</code>, lines 1 to about 100: the helpers <code>money</code>, <code>padCells</code>, <code>padMk</code>, <code>clip</code>, <code>planetName</code>, <code>personName</code>. Each is a few lines and you will see them in every query.</li>
+<li><code>status</code> and <code>desk</code> (the status strip and the Desk screen), then <code>people</code>, then <code>personRecord</code>.</li>
+<li><code>hqDetail</code> and <code>hqFacilityAtRow</code>, and the test "the HQ screen's facility rows map back to facilities whatever sits above them" at the bottom of the file.</li>
+<li><code>manning</code>, <code>toe</code> and <code>toeFiltered</code>: the structured kind.</li>
+<li><code>summary</code> and <code>rating</code>: two queries that compute rather than list. <code>rating</code> is the game's reputation formula and is also called by the tick (<code>queries.ratingScore</code> in <code>runFinances</code>), an example of a query being pure enough to use as a rule.</li>
+</ol>
+
+<h3 id="ch44-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 44.1 · One more line on the record <span class="level">practice</span></h4>
+<p>Add a line to <code>personRecord</code> showing this person's salary as a percentage of the outfit's monthly payroll (<code>gs.monthlyPayroll()</code>). Only one file changes. Then write a test that hires a 1,500-a-month mekwarrior and a 400-a-month astech and checks the exact line for the mekwarrior.</p>
+<details class="answer"><summary>Solution</summary>
+<div class="file">src/sim/queries.zig, in <code>personRecord</code>, before the skills header</div>
+<pre><code>    {
+        const payroll = gs.monthlyPayroll();
+        if (payroll &gt; 0) try out.append(alloc, try std.fmt.allocPrint(alloc, "payroll     {d}% of the outfit's monthly payroll", .{@divTrunc(p.monthlySalary() * 100, payroll)}));
+    }</code></pre>
+<pre><code>test "the record shows the payroll share" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try gs.hirePerson("Lori", "Kalmar", .mekwarrior);
+    _ = try gs.hirePerson("Clay", "Cluny", .astech);
+    const rec = try personRecord(a, &amp;gs, id);
+    var found: ?[]const u8 = null;
+    for (rec) |line| if (std.mem.startsWith(u8, line, "payroll ")) {
+        found = line;
+    };
+    // 1500 of 1900: seventy-eight percent, truncated.
+    try std.testing.expectEqualStrings("payroll     78% of the outfit's monthly payroll", found.?);
+}</code></pre>
+<p>Integer arithmetic throughout: <code>@divTrunc</code> because <code>CBills</code> is signed (<a href="#ch45">Chapter 45</a>), multiply before dividing to keep the precision, and the <code>payroll > 0</code> guard because a state with nobody hired would divide by zero. 1500 × 100 / 1900 is 78.94, truncated to 78. Notice the block <code>{ … }</code> around the two lines: it scopes <code>payroll</code> so the name cannot collide with anything later in this long function, a habit worth copying in a codebase where shadowing is an error.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 44.2 · Test a filtered query <span class="level">practice</span></h4>
+<p>Write a test for <code>people</code>: hire one mekwarrior and one <code>tech_mek</code>, query with <code>.techs</code>, and assert one row, a <code>total</code> of two, the right <code>id</code> on the row, and that the row text contains the tech's last name. Then query with <code>.all</code> and assert the order matches hiring order.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "the people query filters by role group and keeps ids" {
+    var gs = GameState.init(std.testing.allocator, .{});
+    defer gs.deinit();
+    const pilot = try gs.hirePerson("Grayson", "Carlyle", .mekwarrior);
+    const tech = try gs.hirePerson("Clay", "Cluny", .tech_mek);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const techs = try people(a, &amp;gs, .techs);
+    try std.testing.expectEqual(@as(usize, 1), techs.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), techs.total);
+    try std.testing.expectEqual(tech, techs.rows[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, techs.rows[0].text, "Cluny") != null);
+    const everyone = try people(a, &amp;gs, .all);
+    try std.testing.expectEqual(@as(usize, 2), everyone.rows.len);
+    try std.testing.expectEqual(pilot, everyone.rows[0].id);
+}</code></pre>
+<p>The three-line arena setup is the one the original guide called out as appearing in every query test. <code>total</code> counts before the filter and <code>rows</code> after, which is the property the header relies on. The order assertion holds because <code>gs.people</code> is an ordered map.</p></details>
+</div>
+
+<div class="exercise"><h4>Exercise 44.3 · Markup round trip <span class="level">warm-up</span></h4>
+<p>Write a test that <code>stripMarkup</code> turns <code>"{g}ok{/} now"</code> into <code>"ok now"</code>. Then read <code>stripMarkup</code> again and say what it does with <code>"{x}"</code>, which is not a colour, and with a lone <code>"{"</code> at the end of a string.</p>
+<details class="answer"><summary>Solution</summary>
+<pre><code>test "markup strips to plain text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("ok now", try stripMarkup(arena.allocator(), "{g}ok{/} now"));
+}</code></pre>
+<p><code>"{x}"</code> is copied through unchanged, because <code>'x'</code> is not in <code>"agcsdtp/"</code>; only the eight known codes are treated as markup. A lone <code>'{'</code> at the end is also copied, because the check <code>i + 2 &lt; s.len</code> fails before any out-of-bounds index is attempted. The function is written so that it can never panic on any input, which matters for text that came from a data file or a player.</p></details>
+</div>
+
+<h3 id="ch44-quiz">Check your understanding</h3>
+<ol class="quiz">
+<li>Why does a query take an allocator rather than using <code>gs.allocator()</code>? <details class="answer"><summary>Answer</summary>Query results live for one frame, not for the campaign; allocating them from the campaign arena would leak a screen's worth of strings on every redraw. The caller passes a frame arena it resets after drawing.</details></li>
+<li>Why does <code>PersonRow</code> carry an <code>id</code>? <details class="answer"><summary>Answer</summary>So a key handler can act on the highlighted row (fire, admit, assign) by reading the ID beside the text instead of re-deriving which person the row was.</details></li>
+<li>What is <code>{{g}}</code> in a format string, and what is <code>{g}</code> in a plain literal? <details class="answer"><summary>Answer</summary>The same markup token: braces must be doubled inside a format string because <code>{</code> and <code>}</code> are format syntax, while a plain string literal needs no escaping.</details></li>
+<li>Why must markup be stripped before padding a column? <details class="answer"><summary>Answer</summary>The tokens are invisible when rendered but count as bytes in <code>{s: &lt;18}</code>, so padding a marked-up string yields columns that are too short by three bytes per token.</details></li>
+<li>What went wrong on the HQ screen, and what is the resulting rule? <details class="answer"><summary>Answer</summary>The key handler mapped cursor rows to facilities by position; when the section above the table changed length, the mapping was off by the difference. Rule: if a key handler needs to know what a row means, ask a query.</details></li>
+<li>How does <code>personRecord</code> list skills without naming any? <details class="answer"><summary>Answer</summary>With <code>inline for</code> over <code>@typeInfo(types.SkillType).@"enum".fields</code>, which unrolls one iteration per enum variant at compile time and provides each name as a string.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Every query takes an allocator and the state and returns plain data: formatted rows with typed IDs beside them, or small structs of numbers plus text.</li>
+<li>Callers pass a frame arena and reset it after drawing, so query results cost nothing to free.</li>
+<li>Row text carries <code>{g}…{/}</code> markup that the terminal renders and the REPL strips; braces are doubled inside format strings.</li>
+<li>A key handler that needs the meaning of a row asks a query (<code>hqFacilityAtRow</code>) rather than counting rows.</li>
+<li>Reflection (<code>inline for</code> over an enum) keeps tables in step with the types they display.</li>
+</ul></div>
+</section>

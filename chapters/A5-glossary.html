@@ -1,0 +1,78 @@
+<section id="appA5">
+<h2>Appendix A5. Glossary</h2>
+<p class="goals"><strong>This appendix</strong> defines the terms the course uses, in alphabetical order, with a link to the chapter that introduces each. Zig terms come first in a definition; where IRON LEDGER gives a term a specific meaning, that follows.</p>
+
+<dl>
+<dt id="g-allocator">allocator</dt><dd>A value of type <code>std.mem.Allocator</code> that hands out and takes back memory. Nothing in Zig allocates without being given one. <a href="#ch19">Chapter 19</a>.</dd>
+<dt>anonymous struct literal</dt><dd><code>.{ .x = 1 }</code>: a struct value whose type is inferred from where it is used. Also the syntax of ZON files. <a href="#ch12">Chapter 12</a>, <a href="#ch28">Chapter 28</a>.</dd>
+<dt>anytype</dt><dd>A parameter type meaning "whatever the caller passes"; the function is specialised per argument type at compile time. <a href="#ch26">Chapter 26</a>.</dd>
+<dt>arena</dt><dd><code>std.heap.ArenaAllocator</code>: an allocator that never frees individually and releases everything in one <code>deinit</code>. IRON LEDGER gives each campaign one and each frame another. <a href="#ch20">Chapter 20</a>, <a href="#ch41">Chapter 41</a>.</dd>
+<dt>array</dt><dd>A fixed number of elements known at compile time: <code>[3]u8</code>. Copied by value. <a href="#ch09">Chapter 9</a>.</dd>
+<dt>ArrayList</dt><dd>The standard growable list. In 0.16 it is unmanaged: it starts as <code>.empty</code> and every growing call takes an allocator. <a href="#ch21">Chapter 21</a>.</dd>
+<dt>basis points</dt><dd>Hundredths of a percent; 10,000 is a multiplier of one. IRON LEDGER's <code>Bp</code> type, applied by <code>applyBp</code> in integer arithmetic. <a href="#ch45">Chapter 45</a>.</dd>
+<dt>builtin</dt><dd>A function whose name starts with <code>@</code>, provided by the language rather than the standard library. <a href="#appA1">A1</a>.</dd>
+<dt>build.zig</dt><dd>The build script: an ordinary Zig program that describes modules, executables, tests and options as a graph of steps. <a href="#ch31">Chapter 31</a>.</dd>
+<dt>C-bill</dt><dd>The BattleTech currency. In IRON LEDGER, <code>CBills = i64</code>; there are no floats in money. <a href="#ch45">Chapter 45</a>.</dd>
+<dt>capture</dt><dd>The <code>|x|</code> after <code>if</code>, <code>while</code>, <code>for</code>, <code>catch</code> or a switch arm that binds the unwrapped value, the payload or the error. <a href="#ch06">Chapter 6</a>, <a href="#ch14">Chapter 14</a>.</dd>
+<dt>catch</dt><dd>Handle an error in place: <code>f() catch default</code>, <code>catch |err| { … }</code>, <code>catch unreachable</code>. <a href="#ch16">Chapter 16</a>.</dd>
+<dt>coercion</dt><dd>An implicit conversion the compiler allows because it cannot lose information: <code>u8</code> to <code>u32</code>, <code>*[3]u8</code> to <code>[]u8</code>, a literal to a typed value. Everything else needs a cast. <a href="#ch04">Chapter 4</a>, <a href="#ch10">Chapter 10</a>.</dd>
+<dt>command</dt><dd>In IRON LEDGER, a value of the <code>Command</code> tagged union; the only way to change a campaign is to pass one to <code>commands.execute</code>. <a href="#ch42">Chapter 42</a>.</dd>
+<dt>comptime</dt><dd>Code and values evaluated while compiling. A <code>comptime</code> parameter must be known at compile time; types are values only at compile time. <a href="#ch25">Chapter 25</a>.</dd>
+<dt>defer</dt><dd>Run a statement when the enclosing block exits by any path. <code>errdefer</code> runs only when it exits with an error. <a href="#ch17">Chapter 17</a>.</dd>
+<dt>determinism</dt><dd>The property that the same inputs produce the same outputs. IRON LEDGER's core is a pure function of a seed and a command history, tested by the golden master. <a href="#ch39">Chapter 39</a>, <a href="#ch49">Chapter 49</a>.</dd>
+<dt>doc comment</dt><dd><code>///</code> documents the next declaration; <code>//!</code> documents the file. <code>//</code> is an ordinary comment. <a href="#ch30">Chapter 30</a>.</dd>
+<dt>enum</dt><dd>A closed set of named values, optionally with an integer representation and methods. A non-exhaustive enum (<code>enum(u32) { none = 0, _ }</code>) also accepts every other integer; IRON LEDGER's typed IDs are these. <a href="#ch13">Chapter 13</a>.</dd>
+<dt>error set</dt><dd>A set of error names, <code>error{ A, B }</code>. Sets merge with <code>||</code>; <code>anyerror</code> is the set of all of them. <a href="#ch16">Chapter 16</a>.</dd>
+<dt>error union</dt><dd><code>E!T</code>: either an error from <code>E</code> or a <code>T</code>. <code>!T</code> lets the compiler infer <code>E</code>. <a href="#ch16">Chapter 16</a>.</dd>
+<dt>exhaustive switch</dt><dd>A <code>switch</code> that names every case of an enum, union or error set and therefore fails to compile when a case is added. IRON LEDGER uses this as a checklist. <a href="#ch14">Chapter 14</a>, <a href="#ch46">Chapter 46</a>.</dd>
+<dt>extern fn</dt><dd>A declaration of a function defined elsewhere, usually in a C library, with C-shaped parameter types. <a href="#ch35">Chapter 35</a>, <a href="#ch47">Chapter 47</a>.</dd>
+<dt>format string</dt><dd>The first argument of <code>print</code>: literal text with <code>{…}</code> placeholders, checked against the argument tuple at compile time. <a href="#ch23">Chapter 23</a>, <a href="#appA2">A2</a>.</dd>
+<dt>frame arena</dt><dd>In IRON LEDGER's client, the arena reset before each draw and each key; query results live in it. <a href="#ch44">Chapter 44</a>, <a href="#ch48">Chapter 48</a>.</dd>
+<dt>generic</dt><dd>A function that takes a <code>comptime T: type</code> and returns a value or type built from it, such as <code>std.ArrayList(u32)</code>. <a href="#ch26">Chapter 26</a>.</dd>
+<dt>golden master</dt><dd>A test that runs a fixed script from a fixed seed twice and compares a hash of the results. <a href="#ch49">Chapter 49</a>.</dd>
+<dt>hash map</dt><dd><code>std.AutoHashMapUnmanaged(K, V)</code> and relatives. The <code>ArrayHashMap</code> variants keep insertion order, which IRON LEDGER needs for determinism. <a href="#ch22">Chapter 22</a>, <a href="#ch41">Chapter 41</a>.</dd>
+<dt>inline for</dt><dd>A loop unrolled at compile time, one copy of the body per element; required to iterate a tuple or a type's fields. <a href="#ch27">Chapter 27</a>.</dd>
+<dt>io</dt><dd>A value of type <code>std.Io</code>, received in <code>main</code> as <code>init.io</code>, that every file, clock, process and sleep operation takes. Code without one cannot do I/O. <a href="#ch33">Chapter 33</a>, <a href="#ch39">Chapter 39</a>.</dd>
+<dt>labeled block</dt><dd><code>blk: { … break :blk value; }</code>: a block that yields a value. <a href="#ch06">Chapter 6</a>.</dd>
+<dt>ledger</dt><dd>In IRON LEDGER, the append-only list of tagged transactions from which every balance and report is computed. <a href="#ch45">Chapter 45</a>.</dd>
+<dt>many-item pointer</dt><dd><code>[*]T</code>: a pointer to an unknown number of elements, with no length. <code>[*:0]const u8</code> is a C string. <a href="#ch10">Chapter 10</a>, <a href="#ch35">Chapter 35</a>.</dd>
+<dt>markup</dt><dd>In IRON LEDGER's query text, <code>{g}…{/}</code> tokens naming a style, rendered by the terminal client and stripped by the REPL. <a href="#ch44">Chapter 44</a>.</dd>
+<dt>migration</dt><dd>A guarded schema change applied when an old save file is opened; in IRON LEDGER a row in <code>store.migrations</code>. <a href="#ch47">Chapter 47</a>.</dd>
+<dt>module</dt><dd>A tree of source files with one root, declared in <code>build.zig</code> and imported by name. IRON LEDGER has a library module <code>game</code> and an executable module. <a href="#ch30">Chapter 30</a>, <a href="#ch31">Chapter 31</a>.</dd>
+<dt>opaque</dt><dd><code>opaque {}</code>: a type with unknown contents that can only be pointed to; the type of a C handle. <a href="#ch35">Chapter 35</a>.</dd>
+<dt>optional</dt><dd><code>?T</code>: a <code>T</code> or <code>null</code>. Unwrapped with <code>orelse</code>, <code>if (x) |v|</code>, or <code>.?</code>. <a href="#ch15">Chapter 15</a>.</dd>
+<dt>orelse</dt><dd>Supply a fallback for a null optional, or exit early: <code>x orelse return error.Missing</code>. <a href="#ch15">Chapter 15</a>.</dd>
+<dt>packed struct</dt><dd>A struct with a specified bit layout, <code>packed struct(u8) { lo: u4, hi: u4 }</code>, convertible to its integer with <code>@bitCast</code>. <a href="#ch29">Chapter 29</a>.</dd>
+<dt>payload</dt><dd>The value carried by a union variant, an optional or an error union; bound by a capture. <a href="#ch14">Chapter 14</a>.</dd>
+<dt>phase</dt><dd>In IRON LEDGER, one function of the daily tick, called in a fixed order from <code>advanceDay</code>. <a href="#ch43">Chapter 43</a>.</dd>
+<dt>pointer</dt><dd><code>*T</code> is the address of one <code>T</code>; <code>*const T</code> cannot write through; <code>&amp;x</code> takes an address; <code>p.*</code> dereferences. Field access through a pointer needs no arrow. <a href="#ch18">Chapter 18</a>.</dd>
+<dt>PRNG</dt><dd>A pseudo-random number generator: <code>std.Random.DefaultPrng</code>, seeded so its sequence is repeatable. IRON LEDGER keeps eight in a bag with named streams. <a href="#ch34">Chapter 34</a>, <a href="#ch41">Chapter 41</a>.</dd>
+<dt>pub</dt><dd>Makes a declaration visible to importers. Without it, a declaration is private to its file. <a href="#ch30">Chapter 30</a>.</dd>
+<dt>pure</dt><dd>Of a function or module: its result depends only on its inputs, with no I/O, wall clock or global state. IRON LEDGER's <code>src/domain</code>, <code>sim</code>, <code>econ</code> and <code>gen</code> are pure. <a href="#ch39">Chapter 39</a>.</dd>
+<dt>query</dt><dd>In IRON LEDGER, a function in <code>queries.zig</code> that takes an allocator and the state and returns formatted rows with IDs; the only way a frontend reads the simulation. <a href="#ch44">Chapter 44</a>.</dd>
+<dt>refAllDecls</dt><dd><code>std.testing.refAllDecls(@This())</code> in a test: references every public declaration so that unreferenced code is still compiled. <a href="#ch08">Chapter 8</a>, <a href="#ch49">Chapter 49</a>.</dd>
+<dt>reflection</dt><dd>Inspecting types at compile time with <code>@typeInfo</code>, <code>@field</code>, <code>@hasDecl</code> and friends. <a href="#ch27">Chapter 27</a>.</dd>
+<dt>REPL</dt><dd>IRON LEDGER's line-oriented console (<code>--repl</code>): reads verbs, parses them with <code>cli.parseCommand</code>, executes, prints. <a href="#ch39">Chapter 39</a>.</dd>
+<dt>result type</dt><dd>The type the compiler infers for an expression from its surroundings; casts like <code>@intCast</code> rely on it. <a href="#appA1">A1</a>.</dd>
+<dt>saturating arithmetic</dt><dd><code>+|</code>, <code>-|</code>: clamp at the type's bounds instead of overflowing. <code>need -| have</code> is never negative. <a href="#ch04">Chapter 4</a>.</dd>
+<dt>seed</dt><dd>The integer a PRNG starts from; the same seed gives the same sequence. IRON LEDGER's campaign seed is part of <code>Config</code>. <a href="#ch34">Chapter 34</a>.</dd>
+<dt>sentinel</dt><dd>A terminating value in a pointer or slice type: <code>[:0]const u8</code> is guaranteed to end with a zero byte. <a href="#ch10">Chapter 10</a>, <a href="#ch35">Chapter 35</a>.</dd>
+<dt>shadowing</dt><dd>Reusing an outer name for an inner declaration. A compile error in Zig. <a href="#ch07">Chapter 7</a>, <a href="#appA4">A4</a>.</dd>
+<dt>slice</dt><dd><code>[]T</code>: a pointer plus a length. Strings are <code>[]const u8</code>. Made by slicing an array, <code>arr[a..b]</code>. <a href="#ch10">Chapter 10</a>.</dd>
+<dt>stream (RNG)</dt><dd>In IRON LEDGER, one of eight named generators (<code>.battle</code>, <code>.market</code>, …) so that adding rolls to one subsystem does not disturb another. <a href="#ch41">Chapter 41</a>.</dd>
+<dt>struct</dt><dd>A record of named fields, optionally with defaults and with functions declared inside. Every Zig file is one. <a href="#ch12">Chapter 12</a>, <a href="#ch30">Chapter 30</a>.</dd>
+<dt>tagged union</dt><dd><code>union(enum) { a: u32, b }</code>: a value that is exactly one of several alternatives and knows which. Consumed by <code>switch</code> with payload captures. <a href="#ch14">Chapter 14</a>.</dd>
+<dt>test block</dt><dd><code>test "name" { … }</code>, run by <code>zig test</code> or <code>zig build test</code>, using <code>std.testing</code>'s assertions and leak-checking allocator. <a href="#ch08">Chapter 8</a>.</dd>
+<dt>tick</dt><dd>In IRON LEDGER, one call of <code>tick.advanceDay</code>: the clock moves one day and every phase runs. <a href="#ch43">Chapter 43</a>.</dd>
+<dt>treasury</dt><dd>In IRON LEDGER, a tagged union naming which balance money moves in: the outfit, an HQ, or a deployed company. <a href="#ch45">Chapter 45</a>.</dd>
+<dt>try</dt><dd>Evaluate an error union; on an error, return it from the current function. <a href="#ch16">Chapter 16</a>.</dd>
+<dt>tuple</dt><dd>An anonymous struct with positional fields, <code>.{ 1, "x" }</code>; the argument list of <code>print</code>. Iterated with <code>inline for</code>. <a href="#ch23">Chapter 23</a>, <a href="#ch27">Chapter 27</a>.</dd>
+<dt>typed ID</dt><dd>In IRON LEDGER, a non-exhaustive enum over <code>u32</code> (<code>PersonId</code>, <code>UnitId</code>…) so that IDs of different kinds cannot be mixed up at no runtime cost. <a href="#ch13">Chapter 13</a>, <a href="#ch41">Chapter 41</a>.</dd>
+<dt>undefined</dt><dd>A value you promise to write before reading; <code>var buf: [64]u8 = undefined;</code>. Debug builds fill it with <code>0xAA</code>. <a href="#ch03">Chapter 3</a>.</dd>
+<dt>unmanaged</dt><dd>Of a container: it does not store an allocator, so you pass one to every call that may allocate. The 0.16 default for lists and maps. <a href="#ch21">Chapter 21</a>.</dd>
+<dt>unreachable</dt><dd>An expression asserting that control never gets here; a panic in safe builds, undefined behaviour in fast ones. <a href="#ch06">Chapter 6</a>.</dd>
+<dt>wrapping arithmetic</dt><dd><code>+%</code>, <code>*%</code>: overflow wraps around instead of panicking. Used where the wrap is intended, as in seeding RNG streams. <a href="#ch04">Chapter 4</a>.</dd>
+<dt>writer</dt><dd><code>*std.Io.Writer</code>: the interface <code>print</code>, <code>writeAll</code> and <code>flush</code> are called on; obtained from a file with a buffer, from a fixed buffer, or from an allocator. <a href="#ch02">Chapter 2</a>, <a href="#ch33">Chapter 33</a>.</dd>
+<dt>ZON</dt><dd>Zig Object Notation: a data file that is a single Zig literal, imported with <code>@import</code> and type-checked against the declaration that receives it. <a href="#ch28">Chapter 28</a>, <a href="#ch40">Chapter 40</a>.</dd>
+</dl>
+</section>

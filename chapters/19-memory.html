@@ -1,0 +1,491 @@
+<section id="ch19">
+<h2>19. Memory: stack, heap and allocators</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn where your program's bytes live, why some values need the heap, and how Zig hands out heap memory: not with a hidden <code>new</code>, but through an <em>allocator</em> you pass around like any other value. You will allocate and free, watch the testing allocator catch a leak, and learn the ownership conventions that tell you, for any slice, whether you must free it.</p>
+
+<h3 id="ch19-1">19.1 Two places to keep a value</h3>
+<p>Every value your program makes has to live somewhere. Zig gives you two places, and it matters which one you choose.</p>
+<p>The <strong>stack</strong> is a region of memory that grows and shrinks as functions are called and return. When a function starts, it gets a <em>frame</em> on the stack, and every local variable lives in that frame. When the function returns, the frame is discarded, all at once, for free. That is why locals are so cheap and why <a href="#ch18">Chapter 18</a> warned you never to return a pointer to one: the memory is reclaimed the instant the function ends. Stack frames are also small; a few kilobytes each, a few megabytes in total.</p>
+<p>The <strong>heap</strong> is everything else: a large pool of memory from which you can request a block of any size, keep it as long as you like, across as many function calls as you like, and give it back when you are done. The price is that <em>you</em> have to give it back. Nothing does it for you.</p>
+<p class="file">mem2.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn stackBuffer() void {
+    var buf: [8]u8 = undefined; // lives in this function&#x27;s frame
+    @memset(&amp;buf, &#x27;z&#x27;);
+    std.debug.print(&quot;stack: {s}\n&quot;, .{buf});
+} // buf is gone here, for free
+
+fn heapBuffer(a: std.mem.Allocator) ![]u8 {
+    const buf = try a.alloc(u8, 8); // lives until someone frees it
+    @memset(buf, &#x27;h&#x27;);
+    return buf; // fine: the memory outlives this function
+}
+
+pub fn main(init: std.process.Init) !void {
+    stackBuffer();
+    const b = try heapBuffer(init.gpa);
+    defer init.gpa.free(b);
+    std.debug.print(&quot;heap:  {s}\n&quot;, .{b});
+}</code></pre>
+<pre class="term">stack: zzzzzzzz
+heap:  hhhhhhhh</pre>
+<p><code>stackBuffer</code>'s array is created and destroyed inside the function. <code>heapBuffer</code>'s slice comes from an allocator, is returned to the caller, and the caller frees it. The rule of thumb: use the stack when the size is known at compile time and the value does not need to outlive the function. Use the heap when the size depends on run-time data (a list of pilots read from a file), when the value must outlive the function that made it, or when it is too big for a frame.</p>
+
+<h3 id="ch19-2">19.2 Why Zig has no <code>new</code></h3>
+<p>In most languages, heap allocation is invisible. Python makes a list and you never think about where it went. C++ has <code>new</code> and Go has <code>make</code>, but the standard library allocates behind your back all the time. Zig's rule is that <em>nothing allocates unless you hand it an allocator</em>. There is no global heap function. If a function needs heap memory, it takes a parameter of type <code>std.mem.Allocator</code>, and every call site shows it.</p>
+<p>This buys three things. You can always see which lines might allocate (and therefore might fail with <code>OutOfMemory</code>, which is an ordinary error you handle with <code>try</code>). You can choose a different strategy for different parts of the program, because the allocator is just a value; <a href="#ch20">Chapter 20</a> is about that choice. And a library you use can never surprise you with allocation, because it has nowhere to get memory except from you.</p>
+<p>The allocator is small, two pointers:</p>
+<p class="file">mem9.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    std.debug.print(&quot;Allocator is {d} bytes: a data pointer and a vtable pointer\n&quot;, .{@sizeOf(std.mem.Allocator)});
+    inline for (@typeInfo(std.mem.Allocator).@&quot;struct&quot;.fields) |f| {
+        std.debug.print(&quot;  field {s}: {s}\n&quot;, .{ f.name, @typeName(f.type) });
+    }
+}</code></pre>
+<pre class="term">Allocator is 16 bytes: a data pointer and a vtable pointer
+  field ptr: *anyopaque
+  field vtable: *const mem.Allocator.VTable</pre>
+<p><code>ptr</code> is the concrete allocator's own state, as an untyped pointer. <code>vtable</code> points at its four functions (allocate, resize, remap, free). Every allocator in the standard library, and any you write, is something that can produce this two-pointer value. Passing it by value is cheap, so you pass it everywhere.</p>
+
+<h3 id="ch19-3">19.3 <code>alloc</code>, <code>free</code>, <code>create</code>, <code>destroy</code>, <code>dupe</code></h3>
+<p>The allocator interface has a handful of methods you will use constantly. Where does the allocator itself come from? For now, from the <code>init</code> parameter of <code>main</code>: <code>init.gpa</code> is a general-purpose allocator the runtime prepares for you, leak-checked in Debug builds. Section 19.6 shows how to make your own.</p>
+<p class="file">mem1.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main(init: std.process.Init) !void {
+    const a = init.gpa; // std.mem.Allocator
+
+    // alloc: n values of T, returned as a slice you own
+    const hp = try a.alloc(u16, 4);
+    defer a.free(hp);
+    @memset(hp, 100);
+    hp[2] = 37;
+    std.debug.print(&quot;hp = {any}\n&quot;, .{hp});
+
+    // create: one T on the heap, returned as *T
+    const Pilot = struct { name: []const u8, skill: u8 };
+    const p = try a.create(Pilot);
+    defer a.destroy(p);
+    p.* = .{ .name = &quot;Ada&quot;, .skill = 4 };
+    std.debug.print(&quot;{s} skill {d}\n&quot;, .{ p.name, p.skill });
+
+    // dupe: copy a slice into fresh memory you own
+    const greeting = try a.dupe(u8, &quot;hello, commander&quot;);
+    defer a.free(greeting);
+    greeting[0] = &#x27;H&#x27;;
+    std.debug.print(&quot;{s}\n&quot;, .{greeting});
+}</code></pre>
+<pre class="term">hp = { 100, 100, 37, 100 }
+Ada skill 4
+Hello, commander</pre>
+<ul>
+<li><code>a.alloc(T, n)</code> gives you <code>n</code> values of <code>T</code> as a slice <code>[]T</code>. The bytes are uninitialised; write before you read. Release with <code>a.free(slice)</code>.</li>
+<li><code>a.create(T)</code> gives you one <code>T</code> as a pointer <code>*T</code>. Release with <code>a.destroy(ptr)</code>.</li>
+<li><code>a.dupe(T, slice)</code> allocates a copy of a slice. Release with <code>a.free</code>. This is the way to make a string you own from one you were only lent.</li>
+</ul>
+<p>Every one of them can fail with <code>error.OutOfMemory</code>, so every call has a <code>try</code>. And every one of them is paired with a <code>defer</code> on the next line, as <a href="#ch17">Chapter 17</a> taught. Free with the <em>same</em> allocator you allocated from; mixing allocators is a bug the DebugAllocator will catch loudly.</p>
+<div class="note"><strong>Free takes the slice, not just the pointer.</strong> <code>a.free(hp)</code> receives the whole slice, pointer and length. That is how the allocator knows how much to release without keeping its own size table. Consequently you must free exactly the slice you were given, not a sub-slice of it.</div>
+
+<h3 id="ch19-4">19.4 The testing allocator catches leaks</h3>
+<p>Forgetting a <code>free</code> is the classic manual-memory bug, and Zig's answer is to make the tests find it. <code>std.testing.allocator</code> is a debug allocator that records every allocation with the stack trace of where it happened; at the end of each test, anything not freed fails the test and prints where it came from. Here is a function that leaks, and the report.</p>
+<p class="file">mem3.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+fn makeGreeting(a: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, &quot;welcome, {s}&quot;, .{name});
+}
+
+test &quot;greeting&quot; {
+    const a = std.testing.allocator;
+    const g = try makeGreeting(a, &quot;commander&quot;);
+    // oops: no free
+    try std.testing.expectEqualStrings(&quot;welcome, commander&quot;, g);
+}</code></pre>
+<pre class="term">1/1 mem3.test.greeting...OK
+[DebugAllocator] (err): memory address 0x… leaked: 
+&lt;zig&gt;/lib/std/fmt.zig:636:27: 0x… in allocPrint__anon_36363 (test)
+    return aw.toOwnedSlice();
+                          ^
+ch19/mem3.zig:4:30: 0x… in makeGreeting (test)
+    return std.fmt.allocPrint(a, &quot;welcome, {s}&quot;, .{name});
+                             ^
+ch19/mem3.zig:9:31: 0x… in test.greeting (test)
+    const g = try makeGreeting(a, &quot;commander&quot;);
+                              ^
+&lt;zig&gt;/lib/compiler/test_runner.zig:291:25: 0x… in mainTerminal (test)
+        if (test_fn.func()) |_| {
+                        ^
+&lt;zig&gt;/lib/compiler/test_runner.zig:73:28: 0x… in main (test)
+        return mainTerminal(init);
+                           ^
+&lt;zig&gt;/lib/std/start.zig:699:88: 0x… in callMain (test)
+    if (fn_info.params[0].type.? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                       ^
+???:?:?: 0x… in start (/usr/lib/dyld)
+
+…</pre>
+<p>Read it from the top. The test's assertions all passed ("OK"), and then the allocator spoke: one block was never freed, allocated inside <code>allocPrint</code>, called from <code>makeGreeting</code>, called from the test. That is the exact call chain of the leaked allocation. The final lines say the test run failed. The fix is one line: <code>defer a.free(g);</code> after the call. Use the testing allocator in every test that allocates; it is free insurance.</p>
+
+<h3 id="ch19-5">19.5 Ownership: who frees this?</h3>
+<p>When a function returns a slice, a question arises that never comes up in Python: does the caller now have to free it? Zig has no runtime answer; the answer is a <em>convention</em>, written in the function's doc comment and followed by everyone. Two conventions cover nearly everything.</p>
+<p><strong>Caller owns.</strong> The function allocates the result with the allocator it was given, and the caller must free it with the same allocator. Any function that takes an <code>Allocator</code> and returns a slice or pointer is almost certainly this. <code>allocPrint</code>, <code>dupe</code>, <code>readFileAlloc</code>: all caller-owns.</p>
+<p><strong>Borrowed.</strong> The function returns a slice <em>into</em> memory the caller already has. Nothing was allocated; there is nothing to free; the result is only valid as long as the original is. Any function that takes no allocator and returns a slice is this. <code>std.mem.trim</code>, <code>tokenizer.next()</code>, slicing with <code>s[a..b]</code>: all borrowed.</p>
+<p class="file">mem6.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+/// Caller owns the returned slice and must free it with `a`.
+fn upperCopy(a: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try a.alloc(u8, s.len);
+    for (s, out) |c, *o| o.* = std.ascii.toUpper(c);
+    return out;
+}
+
+/// Borrows `s`: returns a slice INTO the caller&#x27;s memory. Nothing to free.
+fn firstWord(s: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, s, &#x27; &#x27;) orelse s.len;
+    return s[0..end];
+}
+
+test &quot;owned vs borrowed&quot; {
+    const a = std.testing.allocator;
+    const line = &quot;hire steiner now&quot;;
+
+    const w = firstWord(line); // borrowed: points into `line`
+    try std.testing.expectEqualStrings(&quot;hire&quot;, w);
+
+    const up = try upperCopy(a, line); // owned: we must free
+    defer a.free(up);
+    try std.testing.expectEqualStrings(&quot;HIRE STEINER NOW&quot;, up);
+}</code></pre>
+<pre class="term">1/1 mem6.test.owned vs borrowed...OK
+All 1 tests passed.</pre>
+<p>A useful habit: if a function returns a slice and takes an allocator, expect to <code>defer free</code> the result. If it does not take an allocator, it could not have allocated, so do not. When you write your own, say which it is in the doc comment; IRON LEDGER's are full of "caller owns" and "borrows from the arena".</p>
+<div class="warn"><strong>Trap: storing a borrowed slice.</strong> A borrowed slice is a pointer into someone else's buffer. If you keep it in a struct that outlives that buffer, you have a dangling pointer. When a function receives a <code>[]const u8</code> and needs to keep it, it should <code>dupe</code> it and own the copy. The next example shows the idiom.</div>
+<p class="file">mem8.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+const Roster = struct {
+    names: std.ArrayList([]u8),
+    a: std.mem.Allocator,
+
+    fn init(a: std.mem.Allocator) Roster {
+        return .{ .names = .empty, .a = a };
+    }
+
+    fn deinit(self: *Roster) void {
+        for (self.names.items) |n| self.a.free(n);
+        self.names.deinit(self.a);
+    }
+
+    /// Copies `name`, so the caller may reuse its buffer afterwards.
+    fn add(self: *Roster, name: []const u8) !void {
+        const copy = try self.a.dupe(u8, name);
+        errdefer self.a.free(copy);
+        try self.names.append(self.a, copy);
+    }
+};
+
+test &quot;roster owns copies of the names&quot; {
+    var r = Roster.init(std.testing.allocator);
+    defer r.deinit();
+
+    var scratch: [16]u8 = undefined;
+    const n1 = try std.fmt.bufPrint(&amp;scratch, &quot;pilot-{d}&quot;, .{1});
+    try r.add(n1);
+    const n2 = try std.fmt.bufPrint(&amp;scratch, &quot;pilot-{d}&quot;, .{2}); // overwrites scratch
+    try r.add(n2);
+
+    try std.testing.expectEqualStrings(&quot;pilot-1&quot;, r.names.items[0]);
+    try std.testing.expectEqualStrings(&quot;pilot-2&quot;, r.names.items[1]);
+}</code></pre>
+<pre class="term">1/1 mem8.test.roster owns copies of the names...OK
+All 1 tests passed.</pre>
+<p>The test deliberately reuses one scratch buffer for both names. If <code>add</code> had stored the slice it was handed instead of a copy, the first name would have been overwritten by the second, and the test would fail. Because <code>add</code> owns copies, <code>deinit</code> must free each one and then the list, which is why <code>Roster</code> remembers its allocator.</p>
+
+<h3 id="ch19-6">19.6 Making an allocator: <code>DebugAllocator</code></h3>
+<p><code>init.gpa</code> is convenient, but you should see what is behind it. <code>std.heap.DebugAllocator</code> is the general-purpose allocator for development. You create one as a variable, ask it for an <code>Allocator</code> value, and call <code>deinit()</code> at the end, which returns <code>.ok</code> or <code>.leak</code>.</p>
+<p class="file">mem4.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main() void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        const check = gpa_state.deinit();
+        std.debug.print(&quot;allocator says: {s}\n&quot;, .{@tagName(check)});
+    }
+    const a = gpa_state.allocator();
+
+    const kept = a.alloc(u8, 32) catch return;
+    _ = kept; // never freed on purpose, to see the report
+    const freed = a.alloc(u8, 8) catch return;
+    a.free(freed);
+}</code></pre>
+<pre class="term">error(DebugAllocator): memory address 0x… leaked: 
+ch19/mem4.zig:11:25: 0x… in main (mem4)
+    const kept = a.alloc(u8, 32) catch return;
+                        ^
+&lt;zig&gt;/lib/std/start.zig:698:59: 0x… in callMain (mem4)
+    if (fn_info.params.len == 0) return wrapMain(root.main());
+                                                          ^
+???:?:?: 0x… in start (/usr/lib/dyld)
+
+allocator says: leak</pre>
+<p>The three-line pattern is worth memorising, because you will type it at the top of most <code>main</code> functions that do not use <code>init.gpa</code>:</p>
+<pre><code>var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+defer _ = gpa_state.deinit();
+const a = gpa_state.allocator();</code></pre>
+<p>The <code>.{}</code> is a configuration struct with defaults. <code>.init</code> is the initial state. <code>deinit()</code> returns the check result, and <code>_ =</code> discards it when you only want the printed report. The testing allocator is a <code>DebugAllocator</code> underneath; so is <code>init.gpa</code>, which in Debug builds prints the same report if your program exits with something unfreed:</p>
+<p class="file">mem10.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+pub fn main(init: std.process.Init) !void {
+    const names = try init.gpa.alloc([]const u8, 3);
+    names[0] = &quot;Ada&quot;;
+    std.debug.print(&quot;{s}\n&quot;, .{names[0]});
+    // forgot: init.gpa.free(names)
+}</code></pre>
+<pre class="term">Ada
+error(DebugAllocator): memory address 0x… leaked: 
+ch19/mem10.zig:4:37: 0x… in main (mem10)
+    const names = try init.gpa.alloc([]const u8, 3);
+                                    ^
+&lt;zig&gt;/lib/std/start.zig:737:30: 0x… in callMain (mem10)
+…</pre>
+<p>In a release build, <code>init.gpa</code> switches to a fast allocator with no checking, so the leak reports cost you nothing in production while catching bugs in development.</p>
+
+<h3 id="ch19-7">19.7 <code>toOwnedSlice</code> and <code>errdefer</code> free</h3>
+<p>The common way to build a result of unknown length is to append to an <code>ArrayList</code> and then hand the buffer to the caller with <code>toOwnedSlice</code>. The list gives up its buffer, becomes empty, and the caller owns a plain slice. On the failure path, <code>errdefer</code> frees whatever was built so far. <a href="#ch21">Chapter 21</a> covers <code>ArrayList</code> in depth; here is the ownership shape.</p>
+<p class="file">mem7.zig</p>
+<pre><code>const std = @import(&quot;std&quot;);
+
+/// Builds a list of lines and hands the buffer to the caller.
+/// Caller owns the result: free each line, then the slice.
+fn summary(a: std.mem.Allocator, funds: u32, pilots: u32) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |line| a.free(line);
+        out.deinit(a);
+    }
+    try out.append(a, try std.fmt.allocPrint(a, &quot;  {d} c-bills in the treasury&quot;, .{funds}));
+    try out.append(a, try std.fmt.allocPrint(a, &quot;  {d} pilots on the roster&quot;, .{pilots}));
+    return out.toOwnedSlice(a);
+}
+
+test &quot;toOwnedSlice hands over ownership&quot; {
+    const a = std.testing.allocator;
+    const lines = try summary(a, 12_000, 4);
+    defer {
+        for (lines) |line| a.free(line);
+        a.free(lines);
+    }
+    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqualStrings(&quot;  4 pilots on the roster&quot;, lines[1]);
+}</code></pre>
+<pre class="term">1/1 mem7.test.toOwnedSlice hands over ownership...OK
+All 1 tests passed.</pre>
+<p>Notice the two levels of ownership: the outer slice, and each string inside it. The caller must free both, inner first. That is a lot of bookkeeping for the caller, which is exactly why the next chapter introduces the arena: with an arena, the caller frees everything with one call and the inner loop disappears.</p>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> <code>main</code> in <code>game/src/main.zig</code> takes <code>init.gpa</code> and hands it down: <code>var gs = game.state.GameState.init(init.gpa, .{ .seed = 3025 });</code> followed by <code>defer gs.deinit();</code>. Nothing in the 31,000 lines below allocates from anywhere else; every function that needs memory has an <code>alloc</code> or <code>a</code> parameter. The query layer's convention is "caller owns", implemented with <code>toOwnedSlice</code>, as in <code>dataProvenance</code> in <code>game/src/root.zig</code>:
+<pre><code>pub fn dataProvenance(alloc: std.mem.Allocator) ![]const u8 {
+    if (build_info.data_dir) |dir| {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "mod {s}: {d} file{s} overlaid", .{ … }));
+        // …
+        return out.toOwnedSlice(alloc);
+    }
+    // …
+}</code></pre>
+The <code>errdefer</code>-free idiom is in the PNG decoder, <code>game/src/tui/png.zig</code>: <code>const rgb = try alloc.alloc(u8, …); errdefer alloc.free(rgb);</code>, followed by a dozen <code>try</code>s that would otherwise leak it. And every test in the project that allocates uses <code>std.testing.allocator</code>, which is how the test suite doubles as a leak detector for the whole game.</div>
+
+<h3 id="ch19-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 19.1 · Allocate, fill, hand over, free <span class="level">warm-up</span></h4>
+  <p>Write <code>squares(a, n)</code>, which allocates and fills a <code>[]u32</code> the caller owns, and <code>shout(a, s)</code>, which returns an upper-cased copy via <code>dupe</code>. File: <code>exercises/19-memory/ex1_alloc.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 19, exercise 1: allocate, fill, hand over, free.
+//! Run with:  zig test ex1_alloc.zig
+//! Goal: make every test pass without changing the tests. The testing
+//! allocator fails the test if you leak.
+const std = @import(&quot;std&quot;);
+
+/// The first `n` square numbers. Caller owns the result and frees it with `a`.
+fn squares(a: std.mem.Allocator, n: usize) ![]u32 {
+    const out = try a.alloc(u32, n);
+    for (out, 0..) |*x, i| x.* = @intCast(i * i);
+    return out;
+}
+
+/// A fresh, upper-cased copy of `s`. Caller owns it.
+fn shout(a: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try a.dupe(u8, s);
+    for (out) |*c| c.* = std.ascii.toUpper(c.*);
+    return out;
+}
+
+test &quot;squares&quot; {
+    const a = std.testing.allocator;
+    const sq = try squares(a, 5);
+    defer a.free(sq);
+    try std.testing.expectEqualSlices(u32, &amp;.{ 0, 1, 4, 9, 16 }, sq);
+}
+
+test &quot;shout&quot; {
+    const a = std.testing.allocator;
+    const s = try shout(a, &quot;contract signed&quot;);
+    defer a.free(s);
+    try std.testing.expectEqualStrings(&quot;CONTRACT SIGNED&quot;, s);
+}</code></pre>
+  <p>Both functions take an allocator and return a slice, so both are "caller owns", and the tests <code>defer a.free</code> each result. Delete one of those defers to see the leak report.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 19.2 · One struct on the heap <span class="level">practice</span></h4>
+  <p>Implement <code>Pilot.create</code>, which uses <code>a.create</code> and then <code>dupe</code>s the name, and <code>Pilot.destroy</code>, which frees both. The second test uses a failing allocator to make the <code>dupe</code> fail, so the struct must be released by an <code>errdefer</code>. File: <code>exercises/19-memory/ex2_create.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 19, exercise 2: one struct on the heap with create/destroy.
+//! Run with:  zig test ex2_create.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+const Pilot = struct {
+    name: []u8,
+    skill: u8,
+
+    /// Heap-allocate a Pilot that owns a copy of `name`.
+    fn create(a: std.mem.Allocator, name: []const u8, skill: u8) !*Pilot {
+        const p = try a.create(Pilot);
+        errdefer a.destroy(p);
+        p.* = .{ .name = try a.dupe(u8, name), .skill = skill };
+        return p;
+    }
+
+    /// Free the name, then the struct itself.
+    fn destroy(self: *Pilot, a: std.mem.Allocator) void {
+        a.free(self.name);
+        a.destroy(self);
+    }
+};
+
+test &quot;create and destroy&quot; {
+    const a = std.testing.allocator;
+    const p = try Pilot.create(a, &quot;Ada&quot;, 4);
+    defer p.destroy(a);
+    try std.testing.expectEqualStrings(&quot;Ada&quot;, p.name);
+    p.skill -= 1;
+    try std.testing.expectEqual(@as(u8, 3), p.skill);
+}
+
+test &quot;a failing allocator leaks nothing&quot; {
+    // failing_allocator fails the 2nd allocation: the dupe. The errdefer
+    // must destroy the already-created struct.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, Pilot.create(failing.allocator(), &quot;Bo&quot;, 5));
+}</code></pre>
+  <p><code>std.testing.FailingAllocator</code> wraps another allocator and fails the allocation at a chosen index. With <code>fail_index = 1</code>, the <code>create</code> succeeds and the <code>dupe</code> fails, exercising exactly the path the <code>errdefer</code> protects. Free in reverse order in <code>destroy</code>: the name, then the struct holding it.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 19.3 · Find and fix the leak <span class="level">practice</span></h4>
+  <p>The starter's <code>parseEntry</code> leaks on one error path. Run the tests, read the report, and add the one missing line. File: <code>exercises/19-memory/ex3_leak.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 19, exercise 3: find and fix the leak.
+//! Run with:  zig test ex3_leak.zig
+//! Goal: make every test pass without changing the tests. In the
+//! starter, one error path forgets to free; the testing allocator
+//! reports it.
+const std = @import(&quot;std&quot;);
+
+/// Reads &quot;name:skill&quot; into a heap copy of the name and a number.
+const Entry = struct { name: []u8, skill: u8 };
+
+fn parseEntry(a: std.mem.Allocator, text: []const u8) !Entry {
+    const colon = std.mem.indexOfScalar(u8, text, &#x27;:&#x27;) orelse return error.NoColon;
+    const name = try a.dupe(u8, text[0..colon]);
+    errdefer a.free(name); // the fix: without this, a bad number leaks `name`
+    const skill = try std.fmt.parseInt(u8, text[colon + 1 ..], 10);
+    return .{ .name = name, .skill = skill };
+}
+
+test &quot;good entry&quot; {
+    const a = std.testing.allocator;
+    const e = try parseEntry(a, &quot;Ada:4&quot;);
+    defer a.free(e.name);
+    try std.testing.expectEqualStrings(&quot;Ada&quot;, e.name);
+    try std.testing.expectEqual(@as(u8, 4), e.skill);
+}
+
+test &quot;bad entries leak nothing&quot; {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.NoColon, parseEntry(a, &quot;Ada&quot;));
+    try std.testing.expectError(error.InvalidCharacter, parseEntry(a, &quot;Ada:four&quot;));
+}</code></pre>
+  <p>The name is duplicated before the number is parsed; if the parse fails, the function returns an error and the caller never sees the name. The <code>errdefer a.free(name)</code> right after the <code>dupe</code> fixes it. This is the constructor pattern from Chapter 17 in its smallest form.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 19.4 · An owned list of borrowed slices <span class="level">challenge</span></h4>
+  <p>Write <code>lines(a, text)</code>, which returns a caller-owned slice of slices that each borrow from <code>text</code>, using an <code>ArrayList</code> and <code>toOwnedSlice</code>. File: <code>exercises/19-memory/ex4_owned.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 19, exercise 4: an owned list of borrowed slices.
+//! Run with:  zig test ex4_owned.zig
+//! Goal: make every test pass without changing the tests.
+const std = @import(&quot;std&quot;);
+
+/// Split `text` on newlines. The outer slice is OWNED by the caller
+/// (free it with `a`); each inner slice BORROWS from `text`, so there
+/// is nothing else to free. Empty lines are skipped.
+fn lines(a: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(a);
+    var it = std.mem.splitScalar(u8, text, &#x27;\n&#x27;);
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try out.append(a, line);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Total length of all lines. Borrows everything, allocates nothing.
+fn totalLen(ls: []const []const u8) usize {
+    var n: usize = 0;
+    for (ls) |l| n += l.len;
+    return n;
+}
+
+test &quot;lines&quot; {
+    const a = std.testing.allocator;
+    const text = &quot;hire Ada\n\nadvance 3\nquit\n&quot;;
+    const ls = try lines(a, text);
+    defer a.free(ls);
+    try std.testing.expectEqual(@as(usize, 3), ls.len);
+    try std.testing.expectEqualStrings(&quot;advance 3&quot;, ls[1]);
+    try std.testing.expectEqual(@as(usize, 21), totalLen(ls));
+    // borrowed: the line points into `text`
+    try std.testing.expect(ls[0].ptr == text.ptr);
+}
+
+test &quot;empty text&quot; {
+    const a = std.testing.allocator;
+    const ls = try lines(a, &quot;&quot;);
+    defer a.free(ls);
+    try std.testing.expectEqual(@as(usize, 0), ls.len);
+}</code></pre>
+  <p>Only the outer slice is allocated; the test proves the inner slices are borrowed by checking that <code>ls[0].ptr == text.ptr</code>. The caller frees one thing. Contrast with <code>summary</code> in section 19.7, where the inner strings were owned too and needed a loop to free.</p></details>
+</div>
+
+<h3 id="ch19-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>When must a value go on the heap rather than the stack? <details class="answer"><summary>Answer</summary>When its size is only known at run time, when it must outlive the function that creates it, or when it is too large for a stack frame.</details></li>
+  <li>Why does Zig have no global <code>new</code> or <code>malloc</code>? <details class="answer"><summary>Answer</summary>So that every allocation is visible at the call site (it needs an allocator argument), can fail with an ordinary error, and can use whatever strategy the caller chose.</details></li>
+  <li>What does <code>a.free</code> need, and why? <details class="answer"><summary>Answer</summary>The whole slice, pointer and length, so it knows how much to release. Free exactly what <code>alloc</code> returned, with the same allocator.</details></li>
+  <li>How do you know whether to free a slice a function returned? <details class="answer"><summary>Answer</summary>By convention: if the function took an allocator, the caller owns the result and frees it; if not, the result borrows existing memory and must not be freed.</details></li>
+  <li>What does <code>std.testing.allocator</code> do at the end of a test? <details class="answer"><summary>Answer</summary>Reports every allocation that was not freed, with the stack trace of where it was allocated, and fails the test.</details></li>
+  <li>What does <code>DebugAllocator.deinit()</code> return? <details class="answer"><summary>Answer</summary><code>.ok</code> if everything was freed, <code>.leak</code> otherwise, having printed a report for each leaked block.</details></li>
+  <li>What does <code>list.toOwnedSlice(a)</code> do? <details class="answer"><summary>Answer</summary>Hands the list's buffer to the caller as a plain slice the caller now owns and must free; the list becomes empty.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>Stack memory is per function frame, automatic and short-lived; heap memory is requested and must be returned.</li>
+<li>Nothing allocates without a <code>std.mem.Allocator</code> parameter; the allocator is two pointers passed by value.</li>
+<li><code>alloc</code>/<code>free</code> for slices, <code>create</code>/<code>destroy</code> for single values, <code>dupe</code> to own a copy; all can fail with <code>OutOfMemory</code>.</li>
+<li><code>std.testing.allocator</code> fails a test that leaks and shows where the leak was allocated.</li>
+<li><code>DebugAllocator(.{})</code> is <code>.init</code>, <code>.allocator()</code>, <code>.deinit()</code> returning <code>.ok</code> or <code>.leak</code>; <code>init.gpa</code> is one, ready made.</li>
+<li>"Caller owns" when a function takes an allocator and returns a slice; "borrowed" when it does not. <code>dupe</code> what you need to keep.</li>
+<li><code>toOwnedSlice</code> transfers a list's buffer to the caller; <code>errdefer</code> frees partial work on failure.</li>
+</ul></div>
+</section>

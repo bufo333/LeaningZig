@@ -1,0 +1,342 @@
+<section id="ch02">
+<h2>2. Printing to the screen</h2>
+<p class="goals"><strong>In this chapter</strong> you will learn the two ways a Zig program writes text to the terminal and when to use each, how format strings and their placeholders work, how to line values up in columns, and how to write strings that contain quotes, braces, and line breaks.</p>
+
+<h3 id="ch02-1">2.1 Two streams</h3>
+<p>Every program started from a terminal has two output channels. <em>Standard output</em> (stdout) is for the program's real product: the thing a user would save to a file or pipe into another program. <em>Standard error</em> (stderr) is for messages about the program: progress, diagnostics, complaints. Both appear on your screen by default, which is why beginners rarely notice the difference, but the shell can redirect them separately, and tools that consume output only read stdout.</p>
+<p>Zig gives you a different function for each, and they look very different.</p>
+<div class="file">two_streams.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    std.debug.print("this goes to stderr\n", .{});
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+    try out.print("this goes to stdout\n", .{});
+    try out.flush();
+}</code></pre>
+<pre class="term">$ zig run two_streams.zig
+this goes to stdout</pre>
+<p>On screen the two lines look the same. Ask the shell to hide stderr and only one survives:</p>
+<pre class="term">$ zig run two_streams.zig 2&gt;/dev/null
+this goes to stdout
+$ zig run two_streams.zig &gt;out.txt
+this goes to stderr
+$ cat out.txt
+this goes to stdout</pre>
+<p><code>2&gt;/dev/null</code> throws away stderr; <code>&gt;out.txt</code> sends stdout to a file. This is how you will confirm, in the exercises, that your program is writing where you think it is.</p>
+
+<h3 id="ch02-2">2.2 std.debug.print</h3>
+<p><code>std.debug.print(fmt, args)</code> writes to stderr, immediately, with no buffer and no possibility of failure. It needs no setup and no <code>init</code> parameter, which is why it works from a <code>main() void</code>. Its name says what it is for: debugging, progress messages, and, in this book, every example whose output is meant for your eyes rather than for another program. Its cost is that each call is a separate write to the operating system, which is slow if you print ten thousand lines, and that its output is on the wrong stream for a tool whose text someone wants to capture.</p>
+
+<h3 id="ch02-3">2.3 The stdout writer, and flush</h3>
+<p>Writing to stdout takes four lines, and each one is there for a reason.</p>
+<pre><code>    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+    try out.print("this goes to stdout\n", .{});
+    try out.flush();</code></pre>
+<p><code>var buf: [1024]u8 = undefined;</code> declares an array of 1024 bytes and leaves its contents unset. This is the buffer: text you print is collected here and sent to the operating system in one piece instead of one call per line. You choose the size; 1024 is fine for a few lines and 4096 is common.</p>
+<p><code>std.Io.File.stdout()</code> is the file handle for standard output. Calling <code>.writer(init.io, &amp;buf)</code> on it makes a <em>writer</em>, an object that knows how to push bytes into that file, using your buffer and the I/O context that came in through <code>init</code>. The <code>&amp;</code> means "the address of": the writer keeps a pointer to your buffer rather than a copy. Pointers are <a href="#ch18">Chapter 18</a>; for now, <code>&amp;buf</code> is simply how you lend the buffer out.</p>
+<p><code>const out = &amp;w.interface;</code> takes the generic writer interface out of the file-specific writer. It is the <code>interface</code> field that has the <code>print</code> method, and taking its address once saves writing <code>w.interface.print</code> every time.</p>
+<p><code>try out.print(…)</code> formats into the buffer. It can fail (the disk could be full, the pipe could be closed), so it returns an error union and you must <code>try</code> it, which is why this <code>main</code> returns <code>!void</code>.</p>
+<p><code>try out.flush();</code> pushes whatever is in the buffer to the file. Forget it and your program prints nothing:</p>
+<div class="file">noflush.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &amp;buf);
+    const out = &amp;w.interface;
+    try out.print("you will never see this\n", .{});
+    // no flush!
+}</code></pre>
+<pre class="term">$ zig run noflush.zig
+</pre>
+<p>The transcript is empty on purpose. The text went into <code>buf</code>, <code>main</code> returned, and the buffer was discarded with the rest of the stack frame. Nothing in Zig runs at scope exit unless you write it, so nothing flushed. This is the "no hidden control flow" rule in action, and it is the single most common mistake in Zig printing.</p>
+<div class="note"><strong>Why so much ceremony?</strong> Python's <code>print</code> hides a buffer, a stream, an encoding, and an implicit flush at exit. Zig shows you all of them because each is a decision: the buffer is memory you own, the stream is chosen explicitly, and flushing is a moment you pick. When a program writes a million lines, the buffer size and flush points are where its speed lives. Until then, the recipe above is fixed and you can copy it.</div>
+<p>For the rest of Part 0 the examples use <code>std.debug.print</code>, because it is shorter and the output is for you. Everything said below about format strings applies identically to <code>out.print</code>.</p>
+
+<h3 id="ch02-4">2.4 Placeholders</h3>
+<p>The first argument to <code>print</code> is a <em>format string</em>. Inside it, each pair of braces is a placeholder that will be replaced by the next value from the bundle. The letter inside the braces says how to render the value.</p>
+<div class="file">placeholders.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const name = "Atlas";
+    const tonnage: u32 = 100;
+    const grade: u8 = 'A';
+    const price: i64 = 9_626_000;
+
+    std.debug.print("{s} weighs {d} tons\n", .{ name, tonnage });
+    std.debug.print("rating {c}\n", .{grade});
+    std.debug.print("price {d} C-bills\n", .{price});
+    std.debug.print("hex {x}, HEX {X}, binary {b}\n", .{ tonnage, tonnage, tonnage });
+    std.debug.print("octal {o}\n", .{tonnage});
+}</code></pre>
+<pre class="term">$ zig run placeholders.zig
+Atlas weighs 100 tons
+rating A
+price 9626000 C-bills
+hex 64, HEX 64, binary 1100100
+octal 144</pre>
+<table>
+<tr><th>Placeholder</th><th>Renders</th><th>Works on</th></tr>
+<tr><td><code>{s}</code></td><td>text</td><td>strings (byte slices and string literals)</td></tr>
+<tr><td><code>{d}</code></td><td>decimal number</td><td>integers and floats</td></tr>
+<tr><td><code>{c}</code></td><td>a single character</td><td>a <code>u8</code></td></tr>
+<tr><td><code>{x}</code> / <code>{X}</code></td><td>hexadecimal, lower / upper case</td><td>integers</td></tr>
+<tr><td><code>{b}</code></td><td>binary</td><td>integers</td></tr>
+<tr><td><code>{o}</code></td><td>octal</td><td>integers</td></tr>
+<tr><td><code>{e}</code></td><td>scientific notation</td><td>floats</td></tr>
+<tr><td><code>{any}</code></td><td>whatever the type's default looks like</td><td>anything</td></tr>
+<tr><td><code>{}</code></td><td>the default for simple types</td><td>numbers, booleans</td></tr>
+</table>
+<p>The values come from the bundle in order. <code>.{ name, tonnage }</code> feeds <code>name</code> to the first placeholder and <code>tonnage</code> to the second. When there is one value you can write <code>.{grade}</code> without spaces; <code>zig fmt</code> adds the spaces inside the braces when there are two or more.</p>
+<p><code>{any}</code> is the escape hatch. It prints any value in a debugging-friendly form and is what you reach for when you do not know or care about the exact type, such as an array or a struct:</p>
+<div class="file">any.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnage: u32 = 100;
+    const ratio: f64 = 2.5;
+    const flag = true;
+    const point = .{ 3, 4 };
+    std.debug.print("{any} {any} {any} {any}\n", .{ tonnage, ratio, flag, point });
+    std.debug.print("{d} {d} {}\n", .{ tonnage, ratio, flag });
+}</code></pre>
+<pre class="term">$ zig run any.zig
+100 2.5 true .{ 3, 4 }
+100 2.5 true</pre>
+<p>The second line shows that <code>{d}</code> also works on floats, and that a bare <code>{}</code> is fine for a boolean. You will see <code>{}</code> used for numbers in other people's code; it means the same as <code>{d}</code> for integers. This book prefers the explicit letter.</p>
+<p>The compiler checks the format string against the bundle at compile time. Use the wrong letter for a type and the program does not build:</p>
+<div class="file">wrongspec.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const tonnage: u32 = 100;
+    std.debug.print("{s}\n", .{tonnage});
+}</code></pre>
+<pre class="term">$ zig run wrongspec.zig
+&lt;zig&gt;/lib/std/Io/Writer.zig:1803:5: error: invalid format string 's' for type 'u32'
+    @compileError("invalid format string '" ++ fmt ++ "' for type '" ++ @typeName(@TypeOf(value)) ++ "'");
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~</pre>
+<p>The error is reported inside the standard library's <code>Writer.zig</code>, because that is where the check runs, but the message names your mistake exactly: <code>{s}</code> on a <code>u32</code>. Give it too few values and you get a similarly blunt message:</p>
+<pre class="term">$ zig run toomany.zig
+&lt;zig&gt;/lib/std/Io/Writer.zig:717:13: error: too few arguments
+            @compileError("too few arguments");
+            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~</pre>
+<p>This is worth pausing on. In C, a wrong <code>printf</code> specifier is a runtime crash or silent garbage. In Python it is a runtime exception. In Zig it is a compile error, because the format string is a compile-time constant and <code>print</code> is checked against it while the program is built. Your first encounter with <code>comptime</code> is a printf that cannot be wrong.</p>
+
+<h3 id="ch02-5">2.5 Width, alignment and precision</h3>
+<p>After the letter, a colon introduces options. The most useful three are a fill-and-alignment, a width, and a precision.</p>
+<div class="file">width.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const pi: f64 = 3.14159265;
+    std.debug.print("[{d:.2}]\n", .{pi});
+    std.debug.print("[{d:8.3}]\n", .{pi});
+    std.debug.print("[{d:&gt;6}]\n", .{42});
+    std.debug.print("[{d:&lt;6}]\n", .{42});
+    std.debug.print("[{d:^6}]\n", .{42});
+    std.debug.print("[{d:0&gt;6}]\n", .{42});
+    std.debug.print("[{s:&lt;10}]|\n", .{"Atlas"});
+    std.debug.print("[{s:&gt;10}]|\n", .{"Atlas"});
+    std.debug.print("[{x:0&gt;4}]\n", .{255});
+}</code></pre>
+<pre class="term">$ zig run width.zig
+[3.14]
+[   3.142]
+[    42]
+[42    ]
+[  42  ]
+[000042]
+[Atlas     ]|
+[     Atlas]|
+[00ff]</pre>
+<p>Read <code>{d:0&gt;6}</code> from left to right: render as decimal, then pad with <code>0</code>, aligned to the right (<code>&gt;</code>), in a field 6 wide. The alignment characters are <code>&lt;</code> for left, <code>&gt;</code> for right, and <code>^</code> for centred. If you give a width without an alignment, numbers align right and strings align left. The fill character goes just before the alignment character and defaults to a space.</p>
+<p>A precision comes after a dot: <code>{d:.2}</code> shows two digits after the decimal point, rounding. Width and precision combine as <code>{d:8.3}</code>, meaning width 8, three decimals. <a href="#ch23">Chapter 23</a> and <a href="#appA2">Appendix A2</a> have the complete grammar; these five forms cover nearly all real use.</p>
+<p>Put together, they make tables:</p>
+<div class="file">table.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("{s:&lt;12}{s:&gt;6}{s:&gt;12}\n", .{ "Unit", "Tons", "Price" });
+    std.debug.print("{s:&lt;12}{d:&gt;6}{d:&gt;12}\n", .{ "Locust", 20, 1_512_000 });
+    std.debug.print("{s:&lt;12}{d:&gt;6}{d:&gt;12}\n", .{ "Shadow Hawk", 55, 4_701_000 });
+    std.debug.print("{s:&lt;12}{d:&gt;6}{d:&gt;12}\n", .{ "Atlas", 100, 9_626_000 });
+}</code></pre>
+<pre class="term">$ zig run table.zig
+Unit          Tons       Price
+Locust          20     1512000
+Shadow Hawk     55     4701000
+Atlas          100     9626000</pre>
+<div class="warn"><strong>Trap: a plus sign appears.</strong> When you give a width to a <em>signed</em> integer, 0.16 prints positive values with a leading <code>+</code>: <code>{d:8}</code> on an <code>i64</code> holding 75000 gives <code>&nbsp;&nbsp;+75000</code>. Unsigned types never do this, and a signed value with no width does not either. If you want a padded column of signed numbers without the sign, cast to an unsigned type when you know the value is not negative, or format into a buffer first (<a href="#ch23">Chapter 23</a>).</div>
+
+<h3 id="ch02-6">2.6 Escapes and literal braces</h3>
+<p>A string literal is written between double quotes. Some characters cannot be typed directly inside it, so a backslash introduces an <em>escape</em>:</p>
+<table>
+<tr><th>Escape</th><th>Meaning</th></tr>
+<tr><td><code>\n</code></td><td>newline</td></tr>
+<tr><td><code>\t</code></td><td>tab</td></tr>
+<tr><td><code>\"</code></td><td>a double quote</td></tr>
+<tr><td><code>\\</code></td><td>one backslash</td></tr>
+<tr><td><code>\r</code></td><td>carriage return (Windows line endings are <code>\r\n</code>)</td></tr>
+<tr><td><code>\x41</code></td><td>the byte with hex value 41 (the letter A)</td></tr>
+<tr><td><code>\u{2588}</code></td><td>the Unicode character with that code point, encoded as UTF-8</td></tr>
+</table>
+<p>Braces are special in a format string, so to print one you double it: <code>{{</code> and <code>}}</code>.</p>
+<div class="file">escapes.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("tab:\there\n", .{});
+    std.debug.print("quote: \"IRON LEDGER\"\n", .{});
+    std.debug.print("backslash: C:\\games\\ledger\n", .{});
+    std.debug.print("unicode: \u{2588}\u{2588} 100%\n", .{});
+    std.debug.print("braces: {{d}} prints literally, {d} does not\n", .{7});
+}</code></pre>
+<pre class="term">$ zig run escapes.zig
+tab:	here
+quote: "IRON LEDGER"
+backslash: C:\games\ledger
+unicode: ██ 100%
+braces: {d} prints literally, 7 does not</pre>
+<p>Strings in Zig are sequences of bytes, not characters, and the source file is UTF-8, so you can also type <code>█</code> directly into the literal and it prints correctly. The <code>\u{…}</code> form is for when you want the code to be readable on any keyboard. <a href="#ch11">Chapter 11</a> goes into what a string really is.</p>
+
+<h3 id="ch02-7">2.7 Multi-line strings</h3>
+<p>For text with several lines, escapes get tiresome. Zig has a second string syntax: each line starts with <code>\\</code>, and the string is everything after the two backslashes on each line, joined with newlines. Nothing inside is escaped, so quotes and backslashes are literal.</p>
+<div class="file">multiline.zig</div>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const banner =
+        \\==============================
+        \\   IRON LEDGER   day {d}
+        \\   "no plan survives contact"
+        \\==============================
+        \\
+    ;
+    std.debug.print(banner, .{1});
+}</code></pre>
+<pre class="term">$ zig run multiline.zig
+==============================
+   IRON LEDGER   day 1
+   "no plan survives contact"
+==============================</pre>
+<p>Three details. There is no newline after the last line unless you add an empty <code>\\</code> line, which the example does. The string is still a format string when you pass it to <code>print</code>, so <code>{d}</code> inside it is a placeholder and braces must still be doubled. And the closing semicolon goes on its own line after the last <code>\\</code>, because anything on a <code>\\</code> line is part of the string.</p>
+<div class="try"><strong>Try it.</strong> Remove the final empty <code>\\</code> line and run the program; the shell prompt lands on the same line as the bottom border. Then change <code>{d}</code> to <code>{d:0&gt;3}</code> to get <code>day 001</code>.</div>
+
+<div class="ledger"><strong>In IRON LEDGER.</strong> The game uses both streams for exactly the reasons above. Diagnostic messages and the scripted demo go through <code>std.debug.print</code>, as in <code>game/src/main.zig</code> where the saved-campaign list is reported (three of the messages, trimmed):
+<pre><code>std.debug.print("could not read the campaign registry\n", .{});
+// …
+std.debug.print("no saved campaigns.\n", .{});
+// …
+std.debug.print("campaigns (most recently saved first):\n", .{});</code></pre>
+The terminal client, on the other hand, draws the whole screen into a large buffer and writes it to stdout in one flush per frame, because a screen redraw is one product, not a series of messages (see <code>game/src/tui/term.zig</code> and <a href="#ch48">Chapter 48</a>). Every <code>{s}</code>, <code>{d}</code> and column width you learn here is used there, many thousands of times.</div>
+
+<h3 id="ch02-ex">Exercises</h3>
+<div class="exercise"><h4>Exercise 2.1 · Five placeholders <span class="level">warm-up</span></h4>
+  <p>The starter declares a name, a grade character, and a tonnage. Produce the single line shown in its header with one <code>print</code> call, using <code>{s}</code>, <code>{c}</code>, <code>{d}</code>, <code>{x}</code> and <code>{b}</code>. The tonnage appears three times, in three bases. Name the file: <code>exercises/02-printing/ex1_placeholders.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 02, exercise 1: one line, five placeholders.
+//! Run with:  zig run ex1_placeholders.zig
+//! Expected output (on stderr):
+//!   Atlas (grade A) weighs 100 tons, hex 64, binary 1100100
+const std = @import("std");
+
+pub fn main() void {
+    const name = "Atlas";
+    const grade: u8 = 'A';
+    const tonnage: u32 = 100;
+    std.debug.print("{s} (grade {c}) weighs {d} tons, hex {x}, binary {b}\n", .{
+        name, grade, tonnage, tonnage, tonnage,
+    });
+}</code></pre>
+  <p>A value can be passed more than once; the bundle just lists it again. When the bundle gets long, <code>zig fmt</code> breaks it one item per line if you leave a trailing comma after the last item, which is what the solution does.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 2.2 · An aligned table <span class="level">practice</span></h4>
+  <p>Print the four-row unit table shown in the starter's header. The name column is 12 wide and left-aligned, tons is 4 wide and right-aligned, price is 7 wide and right-aligned, with one space between columns. The header row is strings; the others mix strings and numbers. Name the file: <code>exercises/02-printing/ex2_table.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 02, exercise 2: an aligned table.
+//! Run with:  zig run ex2_table.zig
+//! Expected output (on stderr):
+//!   Unit         Tons   Price
+//!   Locust         20 1512000
+//!   Shadow Hawk    55 4701000
+//!   Atlas         100 9626000
+const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("{s:&lt;12} {s:&gt;4} {s:&gt;7}\n", .{ "Unit", "Tons", "Price" });
+    std.debug.print("{s:&lt;12} {d:&gt;4} {d:&gt;7}\n", .{ "Locust", 20, 1_512_000 });
+    std.debug.print("{s:&lt;12} {d:&gt;4} {d:&gt;7}\n", .{ "Shadow Hawk", 55, 4_701_000 });
+    std.debug.print("{s:&lt;12} {d:&gt;4} {d:&gt;7}\n", .{ "Atlas", 100, 9_626_000 });
+}</code></pre>
+  <p>The header row uses <code>{s:&gt;4}</code> to right-align the word <code>Tons</code> over a numeric column; the same width spec works for strings and numbers. The number literals with underscores are just readable integers; underscores are ignored by the compiler.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 2.3 · A banner <span class="level">practice</span></h4>
+  <p>Build the five-line box in the starter's header as one multi-line string literal, with the day number substituted through a <code>{d}</code> placeholder, then print it. The third line contains braces that must print literally and the fourth contains double quotes. Name the file: <code>exercises/02-printing/ex3_banner.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 02, exercise 3: a multi-line banner with a placeholder inside.
+//! Run with:  zig run ex3_banner.zig
+//! Expected output (on stderr):
+//!   +----------------------+
+//!   | IRON LEDGER   day 12 |
+//!   | funds: {not a hole}  |
+//!   | "trust the ledger"   |
+//!   +----------------------+
+const std = @import("std");
+
+pub fn main() void {
+    const day: u32 = 12;
+    const banner =
+        \\+----------------------+
+        \\| IRON LEDGER   day {d} |
+        \\| funds: {{not a hole}}  |
+        \\| "trust the ledger"   |
+        \\+----------------------+
+        \\
+    ;
+    std.debug.print(banner, .{day});
+}</code></pre>
+  <p>Inside a <code>\\</code> string nothing is escaped, so the quotes are typed as they are. But the string is still a format string when handed to <code>print</code>, so the literal braces are doubled. Note the trailing empty <code>\\</code> line for the final newline.</p></details>
+</div>
+<div class="exercise"><h4>Exercise 2.4 · One number, six ways <span class="level">warm-up</span></h4>
+  <p>Print the value 255 as plain decimal, zero-padded to five places, space-padded to five places, lowercase hex, uppercase hex with a <code>0x</code> prefix, and binary, each in square brackets, all on one line. Name the file: <code>exercises/02-printing/ex4_padding.zig</code>.</p>
+  <details class="answer"><summary>Solution</summary>
+  <pre><code>//! Chapter 02, exercise 4: the same number, five ways.
+//! Run with:  zig run ex4_padding.zig
+//! Expected output (on stderr):
+//!   [255] [00255] [  255] [ff] [0xFF] [11111111]
+const std = @import("std");
+
+pub fn main() void {
+    const n: u8 = 255;
+    std.debug.print("[{d}] [{d:0&gt;5}] [{d:&gt;5}] [{x}] [0x{X}] [{b}]\n", .{ n, n, n, n, n, n });
+}</code></pre>
+  <p>The <code>0x</code> is ordinary text in the format string, not part of the specifier. <code>{d:0&gt;5}</code> reads: decimal, fill with zeros, right-aligned, width five.</p></details>
+</div>
+
+<h3 id="ch02-quiz">Check your understanding</h3>
+<ol class="quiz">
+  <li>Which stream does <code>std.debug.print</code> write to, and does it buffer? <details class="answer"><summary>Answer</summary>Standard error, and no: each call writes immediately and cannot fail.</details></li>
+  <li>A stdout program prints nothing at all. What is the most likely cause? <details class="answer"><summary>Answer</summary>A missing <code>try out.flush();</code> before <code>main</code> returns. The text is still in the buffer when the program exits.</details></li>
+  <li>What happens if you write <code>{s}</code> for an integer? <details class="answer"><summary>Answer</summary>A compile error: <code>invalid format string 's' for type 'u32'</code>. Format strings are checked at compile time.</details></li>
+  <li>What does <code>{d:0&gt;6}</code> mean, piece by piece? <details class="answer"><summary>Answer</summary>Decimal; fill character <code>0</code>; right-aligned; width 6.</details></li>
+  <li>How do you print a literal <code>{</code> in a format string? <details class="answer"><summary>Answer</summary>Double it: <code>{{</code>. Likewise <code>}}</code> for a closing brace.</details></li>
+  <li>In a multi-line string, how do you get a newline after the last line? <details class="answer"><summary>Answer</summary>Add an empty <code>\\</code> line at the end. Without it the string ends right after the last character.</details></li>
+  <li>Why does <code>{d:8}</code> on a positive <code>i64</code> show a plus sign? <details class="answer"><summary>Answer</summary>In 0.16 a width on a signed integer renders an explicit sign for positive values. Unsigned types and unpadded signed values do not show it.</details></li>
+</ol>
+
+<div class="summary"><strong>What you learned.</strong><ul>
+<li>stderr is for messages, stdout is for output; <code>std.debug.print</code> writes to stderr with no setup, the stdout writer needs a buffer, <code>init.io</code>, and a <code>flush</code>.</li>
+<li>Placeholders: <code>{s}</code> text, <code>{d}</code> number, <code>{c}</code> character, <code>{x}</code>/<code>{X}</code> hex, <code>{b}</code> binary, <code>{any}</code> anything.</li>
+<li>Options after a colon: fill, alignment (<code>&lt;</code> <code>&gt;</code> <code>^</code>), width, and <code>.precision</code>.</li>
+<li>Format strings are checked at compile time; a wrong specifier or a missing value is a compile error.</li>
+<li>Escapes use a backslash; literal braces are doubled; multi-line strings start each line with <code>\\</code>.</li>
+</ul></div>
+</section>
