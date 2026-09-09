@@ -7,7 +7,9 @@ BattleTech mercenary-company simulator in `../game/`
 
 This course lives at [bufo333/LeaningZig](https://github.com/bufo333/LeaningZig).
 
-Open **`index.html`** in a browser. That is the whole book: 57 chapters,
+**Read it online: <https://bufo333.github.io/LeaningZig/>**
+
+Or open **`index.html`** in a browser. That is the whole book: 57 chapters,
 208 exercises with hidden solutions (167 of them runnable files checked against Zig 0.16, the rest done inside the game repo in Part 5), a quiz per chapter, and five appendices.
 
 ## Layout
