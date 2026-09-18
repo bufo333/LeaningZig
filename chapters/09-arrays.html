@@ -242,11 +242,11 @@ pub fn main() void {
     const c = [_]u8{ 1, 2, 4 };
     std.debug.print("a == b: {}\n", .{std.mem.eql(u8, &amp;a, &amp;b)});
     std.debug.print("a == c: {}\n", .{std.mem.eql(u8, &amp;a, &amp;c)});
-    // Arrays of the same type can also be compared with == directly? Let's see.
+    // Note: a == b would not compile, which is why eql exists.
 }</code></pre>
 <pre class="term">a == b: true
 a == c: false</pre>
-<p>The <code>&amp;</code> matters: <code>std.mem.eql</code> takes slices, and <code>&amp;array</code> turns an array into a slice of the whole thing. That coercion is the bridge to the next chapter. In tests, <code>std.testing.expectEqual</code> compares two arrays element by element, so <code>expectEqual([3]u8{ 1, 2, 3 }, arr)</code> works there without <code>eql</code>.</p>
+<p>The <code>&amp;</code> matters, though not quite in the way it looks. <code>&amp;a</code> is a <em>pointer</em>: its type is <code>*const [3]u8</code>, a pointer to an array of exactly three bytes. What <code>std.mem.eql</code> wants is a slice, <code>[]const u8</code>. The bridge between them is an implicit coercion: a pointer to an array carries the length in its type, which is precisely what a slice needs, so Zig converts one into the other at the call site. You will lean on that coercion constantly in the next chapter. In tests, <code>std.testing.expectEqual</code> compares two arrays element by element, so <code>expectEqual([3]u8{ 1, 2, 3 }, arr)</code> works there without <code>eql</code>.</p>
 
 <h3 id="ch09-9">9.9 Passing arrays to functions</h3>
 <p>Because the length is part of the type, a function parameter of type <code>[4]u8</code> accepts exactly four-element arrays and nothing else. And because arrays are values, the function receives a copy.</p>

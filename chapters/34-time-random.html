@@ -400,7 +400,7 @@ test "different seeds usually differ" {
     };
     try std.testing.expect(!same);
 }</code></pre>
-  <p>Copying the array (<code>var copy = names;</code>) is what makes the function pure: the original is never touched. <code>shuffle</code> takes the element type and a slice, and <code>&amp;copy</code> turns the array into one. Returning the array by value is fine; it is six slices, 96 bytes.</p></details>
+  <p>Copying the array (<code>var copy = names;</code>) is what makes the function pure: the original is never touched. <code>shuffle</code> takes the element type and a slice, and <code>&amp;copy</code> is a pointer to the array, which coerces to that slice. Returning the array by value is fine; it is six slices, 96 bytes.</p></details>
 </div>
 <div class="exercise"><h4>Exercise 34.4 · Calendar arithmetic <span class="level">practice</span></h4>
   <p>Complete a <code>Date</code> struct with <code>isLeapYear</code>, <code>daysInMonth</code>, <code>next</code>, <code>addDays(n)</code> and <code>dayOfYear</code>. Tests include the century rules (1900 is not a leap year, 2000 is), month and year rollover, a 45-day jump, and day 366 of 3024. Name the file: <code>exercises/34-time-random/ex4_calendar.zig</code>.</p>
