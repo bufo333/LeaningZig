@@ -99,8 +99,8 @@ pub fn main() void {
     std.debug.print("sorted:   {any}\n", .{arr});
 
     var out: [32]u8 = undefined;
-    const n = std.mem.replace(u8, "a-b-c-d", "-", " + ", &amp;out);
     const needed = std.mem.replacementSize(u8, "a-b-c-d", "-", " + ");
+    const n = std.mem.replace(u8, "a-b-c-d", "-", " + ", &amp;out);
     std.debug.print("replace:  {d} replacements, [{s}] ({d} bytes)\n", .{ n, out[0..needed], needed });
 
     var word = "hello".*; // copy the literal into a mutable array

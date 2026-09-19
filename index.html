@@ -6174,18 +6174,39 @@ pub fn main() !void {
 &lt;zig&gt;/lib/std/Io/Writer.zig:2321:50: in fixedDrain (bufprint_small)
                 if (pattern.len &gt; remaining.len) return error.WriteFailed;</pre>
 <p><code>error: NoSpaceLeft</code>. No overflow, no truncation you did not ask for. When you cannot know the size in advance, the answer is an allocator and <code>std.fmt.allocPrint</code>, which returns a string of exactly the right length that you later free. That arrives in <a href="#ch21">Chapter 21</a> and <a href="#ch23">Chapter 23</a>; until then, buffers.</p>
-<p>Replacing a substring follows the same pattern, an output buffer you supply, with a helper to tell you how large it must be:</p>
+<p>Replacing a substring uses an output buffer in the same way, but it differs from <code>bufPrint</code> in one way that matters. Ask how large the result will be before you write it:</p>
 <p class="file">replace.zig</p>
 <pre><code>const std = @import("std");
 
-pub fn main() !void {
+pub fn main() void {
     const src = "1st Lance / 2nd Lance";
     var out: [64]u8 = undefined;
-    const n = std.mem.replace(u8, src, "Lance", "Company", &amp;out);
+
     const size = std.mem.replacementSize(u8, src, "Lance", "Company");
+    if (size &gt; out.len) {
+        std.debug.print("need {d} bytes, the buffer has {d}\n", .{ size, out.len });
+        return;
+    }
+    const n = std.mem.replace(u8, src, "Lance", "Company", &amp;out);
     std.debug.print("{d} replacements, {d} bytes: {s}\n", .{ n, size, out[0..size] });
 }</code></pre>
 <pre class="term">2 replacements, 25 bytes: 1st Company / 2nd Company</pre>
+<p>Nothing in the program computed that <code>64</code>. It is a round number chosen to sit comfortably above what this input needs, which is an honest description of most fixed buffers. <code>std.mem.replacementSize</code> is how you stop guessing, because it reports the exact length the result will occupy. Here that is 25 bytes: each <code>"Lance"</code> is five bytes and each <code>"Company"</code> is seven, so two replacements grow the 21-byte source by four. Call it before <code>replace</code> rather than after, since its purpose is to tell you whether the buffer can hold the answer.</p>
+<p>That check is yours to make. <code>bufPrint</code> returns <code>error.NoSpaceLeft</code> when the text will not fit, so the mistake reaches you as a value you can handle. <code>replace</code> returns only a count and verifies nothing, so a buffer that is too small sends it past the end of your array:</p>
+<p class="file">replace_small.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const src = "1st Lance / 2nd Lance";
+    var out: [16]u8 = undefined; // too small, and nothing says so
+    _ = std.mem.replace(u8, src, "Lance", "Company", &amp;out);
+    std.debug.print("{s}\n", .{out});
+}</code></pre>
+<pre class="term">thread 7517233 panic: index out of bounds: index 16, len 16
+&lt;zig&gt;/lib/std/mem.zig:4079:19 in replace (replace_small)
+            output[i] = input[slide];
+                  ^</pre>
+<p>Safety caught it, so nothing was corrupted, but the trace starts inside <code>std/mem.zig</code> instead of in your own file, which is an awkward place to begin reading. The <code>if</code> in the first program is what keeps you out of it.</p>
 
 <h3 id="ch11-7">11.7 Literals are read-only; copies are not</h3>
 <p>A literal lives in the program's read-only data. You cannot write into it:</p>
@@ -14225,8 +14246,8 @@ pub fn main() void {
     std.debug.print("sorted:   {any}\n", .{arr});
 
     var out: [32]u8 = undefined;
-    const n = std.mem.replace(u8, "a-b-c-d", "-", " + ", &amp;out);
     const needed = std.mem.replacementSize(u8, "a-b-c-d", "-", " + ");
+    const n = std.mem.replace(u8, "a-b-c-d", "-", " + ", &amp;out);
     std.debug.print("replace:  {d} replacements, [{s}] ({d} bytes)\n", .{ n, out[0..needed], needed });
 
     var word = "hello".*; // copy the literal into a mutable array
