@@ -160,7 +160,7 @@ Morgan Kell</pre>
 <p>The first loop copies each <code>Merc</code> into <code>m</code>, then into <code>copy</code>, and adds ten to the copy. The list is untouched. (The extra <code>copy</code> variable is there because the compiler rejects assigning to a by-value capture; it knows that would be a silent no-op.) The second loop captures <code>*m</code>, a <code>*Merc</code> pointing into the list's buffer, and <code>m.wounds += 1</code> writes through it. Zig auto-dereferences field access on pointers, so you write <code>m.wounds</code>, not <code>m.*.wounds</code>.</p>
 
 <h3 id="ch21-6">21.6 The stale-pointer trap</h3>
-<p>Now the trap. Because the list's buffer can move when it grows, a pointer into <code>items</code> is only valid until the next call that might grow the list.</p>
+<p>There is a trap here. Because the list's buffer can move when it grows, a pointer into <code>items</code> is only valid until the next call that might grow the list.</p>
 <p class="file">e_stale.zig</p>
 <pre><code>const std = @import("std");
 
@@ -250,7 +250,7 @@ pub fn main() !void {
 }</code></pre>
 <pre class="term">Atlas (100 tons) / Locust (20 tons)
 35 bytes</pre>
-<p><code>aw.writer</code> is the generic writer, <code>aw.written()</code> is the bytes so far, and <code>aw.toOwnedSlice()</code> hands you the buffer exactly like the list did. Under the hood it is an <code>ArrayList(u8)</code> with a writer interface on top.</p>
+<p><code>aw.writer</code> is the generic writer, <code>aw.written()</code> is the bytes so far, and <code>aw.toOwnedSlice()</code> hands you the buffer exactly like the list did. Internally it is an <code>ArrayList(u8)</code> with a writer interface on top.</p>
 
 <h3 id="ch21-8">21.8 A list of structs, returned as a slice</h3>
 <p>The pattern IRON LEDGER uses in every query: build a list of small structs inside a function, hand the buffer to the caller.</p>

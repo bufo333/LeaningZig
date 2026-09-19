@@ -141,7 +141,7 @@ could not parse: Overflow
 c=0
 d=75</pre>
 <ul>
-<li><code>expr catch value</code>: if it fails, use <code>value</code> instead. The most common shape after <code>try</code>.</li>
+<li><code>expr catch value</code>: if it fails, use <code>value</code> instead. It is the most common shape after <code>try</code>.</li>
 <li><code>expr catch |err| { … }</code>: capture the error and run a block. If the block must produce a value for the surrounding expression, use a labelled block with <code>break :blk value</code>, as in the third example. If the block returns or continues, no value is needed.</li>
 <li><code>expr catch {}</code>: swallow it. Legal, occasionally right, and always worth a comment. The game uses it for "if even the rollback fails there is nothing more to do".</li>
 <li><code>expr catch unreachable</code>: assert it cannot fail. Debug builds panic if you are wrong. Reach for it when the input is a compile-time constant you can see is valid, like <code>divCeil(u32, n, 30) catch unreachable</code> where the divisor is literally 30.</li>

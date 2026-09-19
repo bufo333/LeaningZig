@@ -111,7 +111,7 @@ All 3 tests passed.</pre>
 <p>Two details deserve a look. <code>monthlySalary</code> builds the multiplier as <code>10_000 + morale * 200</code>, so morale -10 is 8000 bp (80 percent) and +10 is 12000. And the cast <code>@as(Bp, self.morale)</code> widens the <code>i8</code> before multiplying, because <code>i8 * 200</code> would overflow. This is the game's <code>Person.monthlySalary</code> in miniature; the real one multiplies three factors, role, experience and rank, all in basis points.</p>
 
 <h3 id="ch38-3">38.3 Stage 2: a Company and its commands</h3>
-<p>Now the state. A <code>Company</code> owns a list of people, a running ID counter and a treasury. The question every stateful program must answer is <em>who frees the memory</em>, and the answer here is the same as the game's: an <strong>arena</strong>. The company creates one arena in <code>init</code>, every name and every list grows out of it, and <code>deinit</code> frees the lot in one call (<a href="#ch20">Chapter 20</a>). No per-person destructor, no double free, no forgotten free.</p>
+<p>The state comes next. A <code>Company</code> owns a list of people, a running ID counter and a treasury. The question every stateful program must answer is <em>who frees the memory</em>, and the answer here is the same as the game's: an <strong>arena</strong>. The company creates one arena in <code>init</code>, every name and every list grows out of it, and <code>deinit</code> frees the lot in one call (<a href="#ch20">Chapter 20</a>). No per-person destructor, no double free, no forgotten free.</p>
 <pre><code>pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
 
 pub const Company = struct {

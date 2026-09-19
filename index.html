@@ -1399,7 +1399,7 @@ pub fn main() void {
 assign_const.zig:5:5: error: cannot assign to constant
     funds -= 250_000;
     ^~~~~</pre>
-<p>The habit to build is the reverse of what most languages teach: <strong>start with <code>const</code>, and only write <code>var</code> when you have a line that assigns to the name a second time</strong>. This is not just style. The compiler enforces it, as you will see in section 3.5, and it makes code easier to read, because every <code>var</code> is a promise that the value changes somewhere below.</p>
+<p>The habit to build is the reverse of what most languages teach: <strong>start with <code>const</code>, and only write <code>var</code> when you have a line that assigns to the name a second time</strong>. This is not a matter of style. The compiler enforces it, as you will see in section 3.5, and it makes code easier to read, because every <code>var</code> is a promise that the value changes somewhere below.</p>
 
 <h3 id="ch03-2">3.2 Type annotations and inference</h3>
 <p>Every value in Zig has a type, and the type is fixed for the life of the name. You can write the type after a colon, or you can leave it out and let the compiler infer it from the value.</p>
@@ -5406,7 +5406,7 @@ pub fn main() void {
 window: { 99, 30 }
 same memory: true</pre>
 <p><code>window[0] = 99</code> wrote into <code>roster[1]</code>, because that is where the window starts. The last line proves it: the address of <code>window[0]</code> is the address of <code>roster[1]</code>. There are two names for one byte.</p>
-<p>Under the hood a slice is two machine words: a pointer to the first element and a <code>usize</code> length. You can look at them as <code>.ptr</code> and <code>.len</code>. Copying a slice copies those two words, not the elements. That makes slices cheap to pass around and dangerous in exactly one way: the array they point at must outlive them. Zig catches the most common version of that mistake at compile time:</p>
+<p>In memory a slice is two machine words: a pointer to the first element and a <code>usize</code> length. You can look at them as <code>.ptr</code> and <code>.len</code>. Copying a slice copies those two words, not the elements. That makes slices cheap to pass around and dangerous in exactly one way: the array they point at must outlive them. Zig catches the most common version of that mistake at compile time:</p>
 <p class="file">dangling.zig</p>
 <pre><code>const std = @import("std");
 
@@ -5508,7 +5508,7 @@ ch10/bounds.zig:10:40: in main (bounds)
 <p>Note also what the check is guarding. Slicing does not copy, so the check is the only thing standing between your program and reading memory it has no business with. In C the equivalent call quietly returns a pointer past the end of the buffer.</p>
 
 <h3 id="ch10-5">10.5 Why functions take slices</h3>
-<p>Now the payoff. Rewrite the average with a slice parameter and it works for four elements, twelve, a window of four in the middle of twelve, or none at all:</p>
+<p>The payoff comes now. Rewrite the average with a slice parameter and it works for four elements, twelve, a window of four in the middle of twelve, or none at all:</p>
 <p class="file">why.zig</p>
 <pre><code>const std = @import("std");
 
@@ -6055,11 +6055,11 @@ pub fn main() void {
 year=3025 month=7 day=14
 year=3025 month=[] day=14</pre>
 <p><code>tokenizeScalar</code> treats any run of the delimiter as a single break and never yields an empty piece, so <code>"hire   Kai  mekwarrior"</code> gives three words however many spaces sit between them.</p>
-<p><code>splitScalar</code> breaks at every delimiter separately. Count them in that line: five spaces, and the second output row has six pieces. The empty ones are the gaps between two adjacent spaces, which are real pieces with no bytes in them. The rule is that <em>n</em> delimiters always produce <em>n</em>+1 pieces, empties included, so a three-field record split on commas gives you three fields whatever they contain.</p>
-<p>That rule is what decides between them. When a human typed the line and a run of spaces is just loose typing, tokenize. When the format is fixed and position carries the meaning, split: in the last row above the month is blank, and split still reports three fields with the day in its proper place. Tokenize on <code>"3025,,14"</code> would hand back only <code>[3025]</code> and <code>[14]</code>, sliding the day silently into the month, which is the kind of bug that surfaces months later in one odd record.</p>
+<p><code>splitScalar</code> breaks at every delimiter separately. Count the delimiters in that line. There are five spaces, and the second output row has six pieces. The empty ones are the gaps between two adjacent spaces, which are real pieces with no bytes in them. The rule is that <em>n</em> delimiters always produce <em>n</em>+1 pieces, empties included, so a three-field record split on commas gives you three fields whatever they contain.</p>
+<p>That rule is what tells you which of the two to reach for. Use <code>tokenizeScalar</code> when a person typed the line, where a run of spaces is just loose typing and only the words matter. Use <code>splitScalar</code> when the format is fixed and a field's position carries its meaning. In the last output row above the month is blank, and <code>splitScalar</code> still reports three fields with the day in its proper place. <code>tokenizeScalar</code> on <code>"3025,,14"</code> would hand back only <code>[3025]</code> and <code>[14]</code>, sliding the day silently into the month.</p>
 <p>Both are driven by <code>while (it.next()) |piece|</code>, the same loop shape you will use for every iterator in the standard library.</p>
-<p>The <code>.?</code> deserves a word, because it is the first thing on this page that is not really about strings. <code>next()</code> does not return a slice. It returns <code>?[]const u8</code>, an <em>optional</em> slice, meaning either a slice or nothing at all. That is how an iterator reports that it has run out, and it is what <code>while (it.next()) |piece|</code> has been quietly doing in every loop above: the capture <code>|piece|</code> runs the body only while there is a value, and ends the loop the first time there is not.</p>
-<p>Calling <code>next()</code> outside a loop hands you that "or nothing" to deal with yourself. <code>.?</code> is the blunt answer: unwrap it, and assert there is a value. When the assertion is wrong the program stops and says so.</p>
+<p>The <code>.?</code> needs an explanation of its own, because it is the first thing on this page that is not about strings. <code>next()</code> does not return a slice. It returns <code>?[]const u8</code>, an <em>optional</em> slice, meaning either a slice or nothing at all. That is how an iterator reports that it has run out, and it is what <code>while (it.next()) |piece|</code> has been quietly doing in every loop above: the capture <code>|piece|</code> runs the body only while there is a value, and ends the loop the first time there is not.</p>
+<p>Calling <code>next()</code> outside a loop hands you that "or nothing" to deal with yourself. The <code>.?</code> operator is the blunt way to do that. It unwraps the optional and asserts that a value is there. When the assertion is wrong the program stops and says so.</p>
 <p class="file">unwrap.zig</p>
 <pre><code>const std = @import("std");
 
@@ -9581,7 +9581,7 @@ could not parse: Overflow
 c=0
 d=75</pre>
 <ul>
-<li><code>expr catch value</code>: if it fails, use <code>value</code> instead. The most common shape after <code>try</code>.</li>
+<li><code>expr catch value</code>: if it fails, use <code>value</code> instead. It is the most common shape after <code>try</code>.</li>
 <li><code>expr catch |err| { … }</code>: capture the error and run a block. If the block must produce a value for the surrounding expression, use a labelled block with <code>break :blk value</code>, as in the third example. If the block returns or continues, no value is needed.</li>
 <li><code>expr catch {}</code>: swallow it. Legal, occasionally right, and always worth a comment. The game uses it for "if even the rollback fails there is nothing more to do".</li>
 <li><code>expr catch unreachable</code>: assert it cannot fail. Debug builds panic if you are wrong. Reach for it when the input is a compile-time constant you can see is valid, like <code>divCeil(u32, n, 30) catch unreachable</code> where the divisor is literally 30.</li>
@@ -12354,7 +12354,7 @@ Morgan Kell</pre>
 <p>The first loop copies each <code>Merc</code> into <code>m</code>, then into <code>copy</code>, and adds ten to the copy. The list is untouched. (The extra <code>copy</code> variable is there because the compiler rejects assigning to a by-value capture; it knows that would be a silent no-op.) The second loop captures <code>*m</code>, a <code>*Merc</code> pointing into the list's buffer, and <code>m.wounds += 1</code> writes through it. Zig auto-dereferences field access on pointers, so you write <code>m.wounds</code>, not <code>m.*.wounds</code>.</p>
 
 <h3 id="ch21-6">21.6 The stale-pointer trap</h3>
-<p>Now the trap. Because the list's buffer can move when it grows, a pointer into <code>items</code> is only valid until the next call that might grow the list.</p>
+<p>There is a trap here. Because the list's buffer can move when it grows, a pointer into <code>items</code> is only valid until the next call that might grow the list.</p>
 <p class="file">e_stale.zig</p>
 <pre><code>const std = @import("std");
 
@@ -12444,7 +12444,7 @@ pub fn main() !void {
 }</code></pre>
 <pre class="term">Atlas (100 tons) / Locust (20 tons)
 35 bytes</pre>
-<p><code>aw.writer</code> is the generic writer, <code>aw.written()</code> is the bytes so far, and <code>aw.toOwnedSlice()</code> hands you the buffer exactly like the list did. Under the hood it is an <code>ArrayList(u8)</code> with a writer interface on top.</p>
+<p><code>aw.writer</code> is the generic writer, <code>aw.written()</code> is the bytes so far, and <code>aw.toOwnedSlice()</code> hands you the buffer exactly like the list did. Internally it is an <code>ArrayList(u8)</code> with a writer interface on top.</p>
 
 <h3 id="ch21-8">21.8 A list of structs, returned as a slice</h3>
 <p>The pattern IRON LEDGER uses in every query: build a list of small structs inside a function, hand the buffer to the caller.</p>
@@ -19156,7 +19156,7 @@ mod.linkSystemLibrary("sqlite3", .{});</code></pre>
 <p>The first links the C standard library into the module; the second asks the system linker for <code>libsqlite3</code>. <a href="#ch35">Chapter 35</a> shows what the Zig side of such a binding looks like. Both are set on the <em>module</em>, and any executable or test that uses the module inherits them, which is why IRON LEDGER's tests can open a database without repeating the linker flags.</p>
 
 <h3 id="ch31-8">31.8 Reading IRON LEDGER's build.zig</h3>
-<p>Now the real thing, <code>game/build.zig</code>. It is the <code>zig init</code> template grown up, and you can read it in the order the template used. Comments are trimmed.</p>
+<p>Now comes the real thing, <code>game/build.zig</code>. It is the <code>zig init</code> template grown up, and you can read it in the order the template used. Comments are trimmed.</p>
 <pre><code>pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -20804,7 +20804,7 @@ pub fn main(init: std.process.Init) !void {
 UTC now: 2026-09-09 14:42</pre>
 <p>But a simulation set in the year 3025 does not want the real date; it wants its own calendar, one it can advance a day at a time, forever, and render as "3025-02-01" when the player asks. This is a small and pleasant piece of code to write yourself, and IRON LEDGER does. There are two representations to keep straight:</p>
 <ul>
-<li>A <strong>day counter</strong>: an integer, "days since the campaign began". Perfect for arithmetic. "Was this person hired more than 90 days ago?" is a subtraction. Every transaction in the game's ledger is stamped with this integer.</li>
+<li>A <strong>day counter</strong>: an integer holding the days since the campaign began, which makes arithmetic easy. "Was this person hired more than 90 days ago?" is a subtraction. Every transaction in the game's ledger is stamped with this integer.</li>
 <li>A <strong>civil date</strong>: year, month, day. Perfect for humans and for rules that care about the calendar ("payday is the first of the month").</li>
 </ul>
 <p>The trick is to store both and advance both together, so you never convert. Advancing a civil date by one day needs only the length of the current month, and that needs only the leap year rule: divisible by 4, except years divisible by 100, except years divisible by 400.</p>
@@ -22932,7 +22932,7 @@ All 3 tests passed.</pre>
 <p>Two details deserve a look. <code>monthlySalary</code> builds the multiplier as <code>10_000 + morale * 200</code>, so morale -10 is 8000 bp (80 percent) and +10 is 12000. And the cast <code>@as(Bp, self.morale)</code> widens the <code>i8</code> before multiplying, because <code>i8 * 200</code> would overflow. This is the game's <code>Person.monthlySalary</code> in miniature; the real one multiplies three factors, role, experience and rank, all in basis points.</p>
 
 <h3 id="ch38-3">38.3 Stage 2: a Company and its commands</h3>
-<p>Now the state. A <code>Company</code> owns a list of people, a running ID counter and a treasury. The question every stateful program must answer is <em>who frees the memory</em>, and the answer here is the same as the game's: an <strong>arena</strong>. The company creates one arena in <code>init</code>, every name and every list grows out of it, and <code>deinit</code> frees the lot in one call (<a href="#ch20">Chapter 20</a>). No per-person destructor, no double free, no forgotten free.</p>
+<p>The state comes next. A <code>Company</code> owns a list of people, a running ID counter and a treasury. The question every stateful program must answer is <em>who frees the memory</em>, and the answer here is the same as the game's: an <strong>arena</strong>. The company creates one arena in <code>init</code>, every name and every list grows out of it, and <code>deinit</code> frees the lot in one call (<a href="#ch20">Chapter 20</a>). No per-person destructor, no double free, no forgotten free.</p>
 <pre><code>pub const Error = error{ UnknownPerson, EmptyName, OutOfMemory };
 
 pub const Company = struct {
@@ -26048,7 +26048,7 @@ pub const Result = struct {
 <p><code>Result</code> is the mirror image: every field has a default, so an arm that has nothing to report returns <code>.{}</code>, and an arm that created something fills one field. A caller that does not care writes <code>_ = try execute(…)</code>; a caller that does writes <code>(try execute(gs, .{ .new_company = "Alpha" })).created_force</code>. The doc comments on the fields name the command that fills each, which is how you find your way from a result field back to its arm.</p>
 
 <h3 id="ch42-3">42.3 The shape of an arm</h3>
-<p>Now the switch. The first arms are the simplest, and they show the mechanics of a payload capture:</p>
+<p>The switch itself is next. The first arms are the simplest, and they show the mechanics of a payload capture:</p>
 <pre><code>pub fn execute(gs: *GameState, cmd: Command) Error!Result {
     switch (cmd) {
         .advance_day =&gt; return advance(gs, 1),

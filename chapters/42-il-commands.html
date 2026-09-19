@@ -92,7 +92,7 @@ pub const Result = struct {
 <p><code>Result</code> is the mirror image: every field has a default, so an arm that has nothing to report returns <code>.{}</code>, and an arm that created something fills one field. A caller that does not care writes <code>_ = try execute(…)</code>; a caller that does writes <code>(try execute(gs, .{ .new_company = "Alpha" })).created_force</code>. The doc comments on the fields name the command that fills each, which is how you find your way from a result field back to its arm.</p>
 
 <h3 id="ch42-3">42.3 The shape of an arm</h3>
-<p>Now the switch. The first arms are the simplest, and they show the mechanics of a payload capture:</p>
+<p>The switch itself is next. The first arms are the simplest, and they show the mechanics of a payload capture:</p>
 <pre><code>pub fn execute(gs: *GameState, cmd: Command) Error!Result {
     switch (cmd) {
         .advance_day =&gt; return advance(gs, 1),

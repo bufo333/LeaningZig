@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
 UTC now: 2026-09-09 14:42</pre>
 <p>But a simulation set in the year 3025 does not want the real date; it wants its own calendar, one it can advance a day at a time, forever, and render as "3025-02-01" when the player asks. This is a small and pleasant piece of code to write yourself, and IRON LEDGER does. There are two representations to keep straight:</p>
 <ul>
-<li>A <strong>day counter</strong>: an integer, "days since the campaign began". Perfect for arithmetic. "Was this person hired more than 90 days ago?" is a subtraction. Every transaction in the game's ledger is stamped with this integer.</li>
+<li>A <strong>day counter</strong>: an integer holding the days since the campaign began, which makes arithmetic easy. "Was this person hired more than 90 days ago?" is a subtraction. Every transaction in the game's ledger is stamped with this integer.</li>
 <li>A <strong>civil date</strong>: year, month, day. Perfect for humans and for rules that care about the calendar ("payday is the first of the month").</li>
 </ul>
 <p>The trick is to store both and advance both together, so you never convert. Advancing a civil date by one day needs only the length of the current month, and that needs only the leap year rule: divisible by 4, except years divisible by 100, except years divisible by 400.</p>

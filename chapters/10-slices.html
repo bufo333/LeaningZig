@@ -64,7 +64,7 @@ pub fn main() void {
 window: { 99, 30 }
 same memory: true</pre>
 <p><code>window[0] = 99</code> wrote into <code>roster[1]</code>, because that is where the window starts. The last line proves it: the address of <code>window[0]</code> is the address of <code>roster[1]</code>. There are two names for one byte.</p>
-<p>Under the hood a slice is two machine words: a pointer to the first element and a <code>usize</code> length. You can look at them as <code>.ptr</code> and <code>.len</code>. Copying a slice copies those two words, not the elements. That makes slices cheap to pass around and dangerous in exactly one way: the array they point at must outlive them. Zig catches the most common version of that mistake at compile time:</p>
+<p>In memory a slice is two machine words: a pointer to the first element and a <code>usize</code> length. You can look at them as <code>.ptr</code> and <code>.len</code>. Copying a slice copies those two words, not the elements. That makes slices cheap to pass around and dangerous in exactly one way: the array they point at must outlive them. Zig catches the most common version of that mistake at compile time:</p>
 <p class="file">dangling.zig</p>
 <pre><code>const std = @import("std");
 
@@ -166,7 +166,7 @@ ch10/bounds.zig:10:40: in main (bounds)
 <p>Note also what the check is guarding. Slicing does not copy, so the check is the only thing standing between your program and reading memory it has no business with. In C the equivalent call quietly returns a pointer past the end of the buffer.</p>
 
 <h3 id="ch10-5">10.5 Why functions take slices</h3>
-<p>Now the payoff. Rewrite the average with a slice parameter and it works for four elements, twelve, a window of four in the middle of twelve, or none at all:</p>
+<p>The payoff comes now. Rewrite the average with a slice parameter and it works for four elements, twelve, a window of four in the middle of twelve, or none at all:</p>
 <p class="file">why.zig</p>
 <pre><code>const std = @import("std");
 

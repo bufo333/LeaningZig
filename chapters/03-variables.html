@@ -29,7 +29,7 @@ pub fn main() void {
 assign_const.zig:5:5: error: cannot assign to constant
     funds -= 250_000;
     ^~~~~</pre>
-<p>The habit to build is the reverse of what most languages teach: <strong>start with <code>const</code>, and only write <code>var</code> when you have a line that assigns to the name a second time</strong>. This is not just style. The compiler enforces it, as you will see in section 3.5, and it makes code easier to read, because every <code>var</code> is a promise that the value changes somewhere below.</p>
+<p>The habit to build is the reverse of what most languages teach: <strong>start with <code>const</code>, and only write <code>var</code> when you have a line that assigns to the name a second time</strong>. This is not a matter of style. The compiler enforces it, as you will see in section 3.5, and it makes code easier to read, because every <code>var</code> is a promise that the value changes somewhere below.</p>
 
 <h3 id="ch03-2">3.2 Type annotations and inference</h3>
 <p>Every value in Zig has a type, and the type is fixed for the life of the name. You can write the type after a colon, or you can leave it out and let the compiler infer it from the value.</p>

@@ -236,7 +236,7 @@ mod.linkSystemLibrary("sqlite3", .{});</code></pre>
 <p>The first links the C standard library into the module; the second asks the system linker for <code>libsqlite3</code>. <a href="#ch35">Chapter 35</a> shows what the Zig side of such a binding looks like. Both are set on the <em>module</em>, and any executable or test that uses the module inherits them, which is why IRON LEDGER's tests can open a database without repeating the linker flags.</p>
 
 <h3 id="ch31-8">31.8 Reading IRON LEDGER's build.zig</h3>
-<p>Now the real thing, <code>game/build.zig</code>. It is the <code>zig init</code> template grown up, and you can read it in the order the template used. Comments are trimmed.</p>
+<p>Now comes the real thing, <code>game/build.zig</code>. It is the <code>zig init</code> template grown up, and you can read it in the order the template used. Comments are trimmed.</p>
 <pre><code>pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
