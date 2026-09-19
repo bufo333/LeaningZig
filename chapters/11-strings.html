@@ -121,16 +121,65 @@ pub fn main() void {
     }
     std.debug.print("\n", .{});
 
-    var csv = std.mem.splitScalar(u8, "3025,1,1", ',');
+    // A fixed record: two commas, so always three fields.
+    var csv = std.mem.splitScalar(u8, "3025,7,14", ',');
     const year = csv.next().?;
     const month = csv.next().?;
-    std.debug.print("year={s} month={s} rest={s}\n", .{ year, month, csv.rest() });
+    const day = csv.next().?;
+    std.debug.print("year={s} month={s} day={s}\n", .{ year, month, day });
+
+    // The same record with the month left blank. The field is still there.
+    var blank = std.mem.splitScalar(u8, "3025,,14", ',');
+    const b_year = blank.next().?;
+    const b_month = blank.next().?;
+    const b_day = blank.next().?;
+    std.debug.print("year={s} month=[{s}] day={s}\n", .{ b_year, b_month, b_day });
 }</code></pre>
 <pre class="term">[hire] [Kai] [mekwarrior] 
 [hire] [] [] [Kai] [] [mekwarrior] 
-year=3025 month=1 rest=1</pre>
-<p><code>tokenizeScalar</code> treats any run of the delimiter as one break and never yields an empty piece: three words from <code>"hire   Kai  mekwarrior"</code>. <code>splitScalar</code> yields exactly one piece per delimiter, empty ones included, which is what you want for a fixed format like a comma-separated record, where an empty field means something. Both are used with <code>while (it.next()) |piece|</code>, the same loop shape you will use for every iterator in the standard library.</p>
-<p>The <code>.?</code> after <code>csv.next()</code> says "I know there is a value; crash if not". It is fine for a demonstration; real code checks. Two more useful methods:</p>
+year=3025 month=7 day=14
+year=3025 month=[] day=14</pre>
+<p><code>tokenizeScalar</code> treats any run of the delimiter as a single break and never yields an empty piece, so <code>"hire   Kai  mekwarrior"</code> gives three words however many spaces sit between them.</p>
+<p><code>splitScalar</code> breaks at every delimiter separately. Count them in that line: five spaces, and the second output row has six pieces. The empty ones are the gaps between two adjacent spaces, which are real pieces with no bytes in them. The rule is that <em>n</em> delimiters always produce <em>n</em>+1 pieces, empties included, so a three-field record split on commas gives you three fields whatever they contain.</p>
+<p>That rule is what decides between them. When a human typed the line and a run of spaces is just loose typing, tokenize. When the format is fixed and position carries the meaning, split: in the last row above the month is blank, and split still reports three fields with the day in its proper place. Tokenize on <code>"3025,,14"</code> would hand back only <code>[3025]</code> and <code>[14]</code>, sliding the day silently into the month, which is the kind of bug that surfaces months later in one odd record.</p>
+<p>Both are driven by <code>while (it.next()) |piece|</code>, the same loop shape you will use for every iterator in the standard library.</p>
+<p>The <code>.?</code> deserves a word, because it is the first thing on this page that is not really about strings. <code>next()</code> does not return a slice. It returns <code>?[]const u8</code>, an <em>optional</em> slice, meaning either a slice or nothing at all. That is how an iterator reports that it has run out, and it is what <code>while (it.next()) |piece|</code> has been quietly doing in every loop above: the capture <code>|piece|</code> runs the body only while there is a value, and ends the loop the first time there is not.</p>
+<p>Calling <code>next()</code> outside a loop hands you that "or nothing" to deal with yourself. <code>.?</code> is the blunt answer: unwrap it, and assert there is a value. When the assertion is wrong the program stops and says so.</p>
+<p class="file">unwrap.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    var csv = std.mem.splitScalar(u8, "3025", ',');
+    _ = csv.next().?; // fine, there is one field
+    const second = csv.next().?; // nothing left
+    std.debug.print("never reached: {s}\n", .{second});
+}</code></pre>
+<pre class="term">thread 7484770 panic: attempt to use null value
+ch11/unwrap.zig:6:30: in main (unwrap)
+    const second = csv.next().?; // nothing left
+                             ^</pre>
+<p>That is a safety check, not undefined behaviour: you get the file, line and column of the <code>.?</code> that was wrong. Use it where the value is guaranteed by something you already know, as with the three fields of a record your own code just built. When the text comes from outside the program, handle the nothing instead:</p>
+<p class="file">unwrap2.zig</p>
+<pre><code>const std = @import("std");
+
+pub fn main() void {
+    const input = "3025";  // a record that is missing its month and day
+    var csv = std.mem.splitScalar(u8, input, ',');
+
+    const year = csv.next() orelse "????";
+    const month = csv.next() orelse "??";
+    std.debug.print("year={s} month={s}\n", .{ year, month });
+
+    if (csv.next()) |day| {
+        std.debug.print("day={s}\n", .{day});
+    } else {
+        std.debug.print("no day field in \"{s}\"\n", .{input});
+    }
+}</code></pre>
+<pre class="term">year=3025 month=??
+no day field in "3025"</pre>
+<p><code>orelse</code> supplies a value to use when there is none; <code>if (opt) |v|</code> takes its branch only when there is a value and binds it to <code>v</code>. <a href="#ch15">Chapter 15</a> covers optionals properly. This is the minimum you need to read the rest of this chapter.</p>
+<p>Two more useful methods:</p>
 <p class="file">tokenize2.zig</p>
 <pre><code>const std = @import("std");
 
