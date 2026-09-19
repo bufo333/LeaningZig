@@ -6225,7 +6225,7 @@ referenced by:
     callMainWithArgs [inlined]: &lt;zig&gt;/lib/std/start.zig:638:20
     main: &lt;zig&gt;/lib/std/start.zig:663:28
     1 reference(s) hidden; use '-freference-trace=4' to see all references</pre>
-<p>To change text, copy it into an array you own first. <code>lit.*</code> dereferences the pointer-to-array, and assigning an array copies it:</p>
+<p>To change text, copy it into an array that you own. That takes one line, but three separate things happen in it:</p>
 <p class="file">mutate.zig</p>
 <pre><code>const std = @import("std");
 
@@ -6236,6 +6236,13 @@ pub fn main() void {
     std.debug.print("{s} {s}\n", .{ lit, &amp;copy });
 }</code></pre>
 <pre class="term">atlas Atlas</pre>
+<p>First, <code>lit</code> is not the text. A string literal is a pointer, and <code>@TypeOf(lit)</code> reports <code>*const [5:0]u8</code>, a pointer to a constant array of five bytes with a zero after them. The pointer occupies eight bytes on a 64-bit machine, and the letters themselves live elsewhere, in the program's read-only data.</p>
+<p>Second, <code>.*</code> is the dereference operator, and it means the value that the pointer refers to. So <code>lit.*</code> is the array itself, of type <code>[5:0]u8</code>, rather than its address. Leave the <code>.*</code> off and the line tries to put a pointer into an array variable, which the compiler refuses:</p>
+<pre class="term">mutate.zig:5:23: error: expected type '[5]u8', found '*const [5:0]u8'
+    var copy: [5]u8 = lit;
+                      ^~~</pre>
+<p>Third, an array in Zig is a value rather than a reference, so assigning one copies every byte. <code>copy</code> is a new array on the stack at its own address, and writing to it cannot reach the literal. That is why the program prints the original and the altered copy side by side.</p>
+<p>One detail is easy to miss. The type changes from <code>[5:0]u8</code> to <code>[5]u8</code> across the assignment, because the destination does not ask for a sentinel and the trailing zero is dropped. Write <code>var copy: [5:0]u8 = lit.*;</code> instead if you want to keep it, which matters when you pass the result to C (<a href="#ch35">Chapter 35</a>).</p>
 <p>This is the same const rule as for slices: a <code>[]const u8</code> may look at bytes, a <code>[]u8</code> may change them, and a literal only ever gives you the former.</p>
 
 <h3 id="ch11-8">11.8 Multi-line literals</h3>
