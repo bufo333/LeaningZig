@@ -179,6 +179,27 @@ pub fn main() void {
 <pre class="term">year=3025 month=??
 no day field in "3025"</pre>
 <p><code>orelse</code> supplies a value to use when there is none; <code>if (opt) |v|</code> takes its branch only when there is a value and binds it to <code>v</code>. <a href="#ch15">Chapter 15</a> covers optionals properly. This is the minimum you need to read the rest of this chapter.</p>
+<p>Neither of those is an error path, and that is worth saying plainly. An iterator running out, or a line arriving blank, is an ordinary thing for a program to meet. Handling it needs no error type, no <code>try</code> and no <code>catch</code>. You have in fact been handling it all along, because <code>while (it.next()) |piece|</code> ends the loop on exactly the same <code>null</code>.</p>
+<p>When there is no sensible value to substitute, <code>orelse</code> can run a block instead, which is the usual way to leave a function quietly:</p>
+<p class="file">blank.zig</p>
+<pre><code>const std = @import("std");
+
+fn firstWord(line: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const verb = it.next() orelse {
+        std.debug.print("blank line, nothing to do\n", .{});
+        return;
+    };
+    std.debug.print("verb={s}\n", .{verb});
+}
+
+pub fn main() void {
+    firstWord("newlance 1st Recon Lance");
+    firstWord("   ");
+}</code></pre>
+<pre class="term">verb=newlance
+blank line, nothing to do</pre>
+<p>So there are three positions to take, and only you can say which fits. <code>.?</code> claims the value is guaranteed. <code>orelse</code> and <code>if</code> treat its absence as normal and deal with it on the spot. Turning it into an error, which the next note describes, is for when the caller rather than this function should decide what happens.</p>
 <p>One thing you cannot reach for here is <code>try</code>. It works on errors, not on optionals, and the compiler turns it down:</p>
 <pre class="term">error: expected error union type, found '?[]const u8'
     const verb = try it.next();
