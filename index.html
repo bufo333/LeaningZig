@@ -6095,6 +6095,12 @@ pub fn main() void {
 <pre class="term">year=3025 month=??
 no day field in "3025"</pre>
 <p><code>orelse</code> supplies a value to use when there is none; <code>if (opt) |v|</code> takes its branch only when there is a value and binds it to <code>v</code>. <a href="#ch15">Chapter 15</a> covers optionals properly. This is the minimum you need to read the rest of this chapter.</p>
+<p>One thing you cannot reach for here is <code>try</code>. It works on errors, not on optionals, and the compiler turns it down:</p>
+<pre class="term">error: expected error union type, found '?[]const u8'
+    const verb = try it.next();
+                     ~~~~~~~^~
+note: consider omitting 'try'</pre>
+<p>Zig keeps the two ideas apart on purpose. Nothing found is an ordinary outcome, and an iterator reaching its end is not a failure, so it is an optional. Something went wrong is a different matter, and that is an error. <a href="#ch16">Chapter 16</a> covers errors, and 16.7 bridges the two with <code>orelse return error.EmptyLine</code> on this very iterator, which is how IRON LEDGER's parser turns a missing argument into a refusal the caller can report.</p>
 <p>Two more useful methods:</p>
 <p class="file">tokenize2.zig</p>
 <pre><code>const std = @import("std");
