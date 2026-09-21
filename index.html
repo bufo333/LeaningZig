@@ -228,6 +228,7 @@
 <a class="sub" href="#ch11-8">11.8 Multi-line literals</a>
 <a class="sub" href="#ch11-9">11.9 Bytes are not characters</a>
 <a class="sub" href="#ch11-10">11.10 Parsing numbers</a>
+<a class="sub" href="#ch11-11">11.11 The string toolkit at a glance</a>
 <a class="ch" href="#ch12">12. Structs and methods</a>
 <a class="sub" href="#ch12-1">12.1 Grouping values</a>
 <a class="sub" href="#ch12-2">12.2 Default values</a>
@@ -6310,6 +6311,50 @@ pub fn main() !void {
 <pre class="term">3026 3
 error.InvalidCharacter</pre>
 <p><code>parseInt</code> takes the target type, the text and the base. Invalid text is an error, not zero and not a crash; <code>{!}</code> prints either the value or the error name. <a href="#ch16">Chapter 16</a> shows how to handle these errors properly; <a href="#ch23">Chapter 23</a> covers the rest of <code>std.fmt</code>.</p>
+
+<h3 id="ch11-11">11.11 The string toolkit at a glance</h3>
+<p>Everything in this chapter, gathered for reference. Each of these takes <code>[]const u8</code> and returns a slice, a count, a <code>bool</code> or an optional, because there is no string type to return.</p>
+<table>
+<tr><th>Call</th><th>Gives you</th><th>Notes</th><th>Section</th></tr>
+
+<tr><td><code>std.mem.eql(u8, a, b)</code></td><td><code>bool</code></td><td>exact, byte for byte</td><td>11.2</td></tr>
+<tr><td><code>std.mem.order(u8, a, b)</code></td><td><code>.lt</code>, <code>.eq</code>, <code>.gt</code></td><td>for sorting</td><td>11.2</td></tr>
+<tr><td><code>std.ascii.eqlIgnoreCase(a, b)</code></td><td><code>bool</code></td><td>ASCII only</td><td>11.2</td></tr>
+
+<tr><td><code>std.mem.startsWith(u8, hay, needle)</code></td><td><code>bool</code></td><td></td><td>11.3</td></tr>
+<tr><td><code>std.mem.endsWith(u8, hay, needle)</code></td><td><code>bool</code></td><td></td><td>11.3</td></tr>
+<tr><td><code>std.mem.indexOf(u8, hay, needle)</code></td><td><code>?usize</code></td><td><code>null</code> when absent</td><td>11.3</td></tr>
+<tr><td><code>std.mem.indexOfScalar(u8, hay, byte)</code></td><td><code>?usize</code></td><td>one byte, from the front</td><td>11.3</td></tr>
+<tr><td><code>std.mem.lastIndexOfScalar(u8, hay, byte)</code></td><td><code>?usize</code></td><td>one byte, from the back</td><td>11.3</td></tr>
+<tr><td><code>std.mem.count(u8, hay, needle)</code></td><td><code>usize</code></td><td>how many times</td><td>11.3</td></tr>
+<tr><td><code>std.ascii.indexOfIgnoreCase(hay, needle)</code></td><td><code>?usize</code></td><td>ASCII only</td><td>11.3</td></tr>
+
+<tr><td><code>std.mem.trim(u8, s, " ")</code></td><td><code>[]const u8</code></td><td>a smaller slice, nothing copied</td><td>11.4</td></tr>
+<tr><td><code>std.mem.trimStart</code>, <code>trimEnd</code></td><td><code>[]const u8</code></td><td>one side only</td><td>11.4</td></tr>
+<tr><td><code>std.mem.tokenizeScalar(u8, s, ' ')</code></td><td>iterator</td><td>runs of the delimiter count once, never yields empty</td><td>11.4</td></tr>
+<tr><td><code>std.mem.tokenizeSequence(u8, s, ", ")</code></td><td>iterator</td><td>multi-byte delimiter</td><td>11.4</td></tr>
+<tr><td><code>std.mem.splitScalar(u8, s, ',')</code></td><td>iterator</td><td>one break per delimiter, <em>n</em> delimiters give <em>n</em>+1 pieces</td><td>11.4</td></tr>
+<tr><td><code>it.next()</code></td><td><code>?[]const u8</code></td><td><code>null</code> when the iterator runs out</td><td>11.4</td></tr>
+<tr><td><code>it.rest()</code></td><td><code>[]const u8</code></td><td>everything not yet consumed</td><td>11.4</td></tr>
+
+<tr><td><code>std.ascii.isDigit(byte)</code></td><td><code>bool</code></td><td>also <code>isAlphabetic</code>, <code>isAlphanumeric</code>, <code>isWhitespace</code></td><td>11.5</td></tr>
+<tr><td><code>std.ascii.toUpper(byte)</code>, <code>toLower</code></td><td><code>u8</code></td><td>one byte</td><td>11.5</td></tr>
+<tr><td><code>std.ascii.upperString(&amp;buf, s)</code></td><td><code>[]u8</code></td><td>writes into a buffer you own</td><td>11.5</td></tr>
+
+<tr><td><code>std.fmt.bufPrint(&amp;buf, fmt, args)</code></td><td><code>![]u8</code></td><td><code>error.NoSpaceLeft</code> when it will not fit</td><td>11.6</td></tr>
+<tr><td><code>std.mem.replacementSize(u8, src, needle, new)</code></td><td><code>usize</code></td><td>call this <em>before</em> replacing</td><td>11.6</td></tr>
+<tr><td><code>std.mem.replace(u8, src, needle, new, &amp;out)</code></td><td><code>usize</code> count</td><td>checks nothing; a short buffer panics</td><td>11.6</td></tr>
+
+<tr><td><code>lit.*</code></td><td>an array copy</td><td>literals are read-only; copy before you write</td><td>11.7</td></tr>
+
+<tr><td><code>std.unicode.utf8CountCodepoints(s)</code></td><td><code>!usize</code></td><td>characters, not bytes</td><td>11.9</td></tr>
+<tr><td><code>std.unicode.Utf8View</code></td><td>iterator</td><td>walks one code point at a time</td><td>11.9</td></tr>
+<tr><td><code>std.unicode.utf8Decode(bytes)</code></td><td><code>!u21</code></td><td>one character's number</td><td>11.9</td></tr>
+
+<tr><td><code>std.fmt.parseInt(T, s, 10)</code></td><td><code>!T</code></td><td><code>error.InvalidCharacter</code>, <code>error.Overflow</code></td><td>11.10</td></tr>
+<tr><td><code>std.fmt.parseFloat(T, s)</code></td><td><code>!T</code></td><td><code>error.InvalidCharacter</code></td><td>11.10</td></tr>
+</table>
+<p>Two of these allocate nothing and yet hand you text: <code>trim</code> and <code>it.rest()</code> both return a slice pointing into the string you passed in. That slice stays valid only as long as the original bytes do, which is the rule <a href="#ch10">Chapter 10</a> set out and the one worth carrying into the rest of the book.</p>
 
 <div class="ledger"><strong>In IRON LEDGER.</strong> The command-line parser is nothing but this chapter's functions applied in order. A line becomes a token iterator, the first token is compared against known verbs with <code>std.mem.eql</code>, the rest is parsed or trimmed:
 <pre><code>// src/sim/cli.zig
@@ -29210,7 +29255,7 @@ e33.zig:5:33: 0x1028d1c97 in main (e33)
 
 
 <hr>
-<p class="lead" style="margin-top:40px">Assembled 2026-09-19 from the chapter fragments in <code>chapters/</code>. Zig 0.16.0. The original guide this book expands is preserved in <code>reference/original-guide.html</code>.</p>
+<p class="lead" style="margin-top:40px">Assembled 2026-09-20 from the chapter fragments in <code>chapters/</code>. Zig 0.16.0. The original guide this book expands is preserved in <code>reference/original-guide.html</code>.</p>
 
 </main>
 </div>
